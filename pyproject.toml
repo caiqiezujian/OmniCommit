@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omnicommit"
+version = "0.1.0"
+description = "Data construction and SFT for multilingual speaker-attributed streaming ASR"
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.24,<3", "scipy>=1.10,<2", "soundfile>=0.12,<1", "requests>=2.31,<3"]
+
+[tool.setuptools.packages.find]
+include = ["omnicommit*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "Data-Scripts/tests", "SFT-Scripts"]
+addopts = "--import-mode=importlib"

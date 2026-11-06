@@ -1,0 +1,7 @@
+# Lightweight preparation, virtual audio loading, and CPU tests.
+numpy>=1.23,<3
+soundfile>=0.12,<1
+scipy>=1.9,<2
+# Training runs in the existing FLEX omni_ms environment (Python 3.11),
+# with ms-swift==3.12.1, Transformers==4.57.1 and its compatible Megatron stack.
+# Do not install/upgrade that CUDA training stack from this file.
