@@ -67,10 +67,21 @@ python /path/to/annotate_asr.py
 成功结果仍写入原记录的 **字符串字段** `output`：
 
 ```json
-{"segments":[{"source_text":"<zh><spk1>请联系","action":"DIRECT"},{"source_text":"张伟","action":"WAIT"},{"source_text":"确认方案。","action":"DIRECT"}],"flush":false,"error":null}
+{"segments":[{"source_text":"<zh><spk1>请联系","action":"DIRECT"},{"source_text":"张伟","action":"WAIT"},{"source_text":"<zh><spk1>确认方案。","action":"DIRECT"}],"flush":false,"error":null}
 ```
 
+**输入去重，输出每个 DIRECT 带完整前缀。** 同一归属也重复写；重复前缀不触发 WAIT。正文及真实归属逐项校验，允许输出补充这些正确的重复前缀。模型漏写冗余前缀时，程序在验证通过后按继承状态补齐，不再调用大模型。这里 `source_text` 只保存本片源内容；最终 SFT 的 DIRECT 才合并此前 WAIT 暂存的内容。
+
 错误、截断、正文不守恒或解析失败写 `output:""`，继续下一条。输出文件已有的成功行和失败行都会跳过，因此**换 prompt 后要使用新输出目录**；它不会自动重新处理旧版输出。没有备份步骤。
+
+若旧结果的正文、切分和动作已经正确，只是后续 DIRECT 缺少重复前缀，不需要重新调用模型：
+
+```bash
+python Data-Scripts/repair_direct_prefixes.py /data/old.annotations.jsonl \
+  --output /data/full-prefix.annotations.jsonl
+```
+
+这个离线工具校验原文和真实归属后补前缀，保留其余字段与切分动作；旧空结果仍为空，坏行写空并继续。
 
 ## 2. 得到真实字/词时间戳
 

@@ -1,4 +1,4 @@
-OmniCommit 文本标注 v2 与 SFT 输出约定
+OmniCommit 文本标注与 SFT 输出约定（DIRECT完整前缀修正版）
 
 一、单次调用脚本
 入口：Data-Scripts/annotate_asr.py。
@@ -31,10 +31,15 @@ ar、ja、ko、it、fr、pt、es、ru、th、en、zh、de。
 
 四、中间标注结果
 output仍然是JSON字符串。成功对象示意：
-{"segments":[{"source_text":"<zh><spk1>请联系","action":"DIRECT"},{"source_text":"张伟","action":"WAIT"},{"source_text":"确认方案。","action":"DIRECT"}],"flush":false,"error":null}
+{"segments":[{"source_text":"<zh><spk1>请联系","action":"DIRECT"},{"source_text":"张伟","action":"WAIT"},{"source_text":"<zh><spk1>确认方案。","action":"DIRECT"}],"flush":false,"error":null}
 每个片段只有source_text和action；不生成wait_reasons或重复的emit_text。
-所有source_text拼接后必须等于规范化后的transcript，而不是带冗余标签的原始字符串。
+输入去重不适用于DIRECT输出：每个DIRECT的source_text都以该片正确的完整<lang><spk>开头。
+同一人连续说同一种语言也重复声明前缀，不产生新的WAIT；实际切换后使用新归属。
+所有source_text去除元数据后的正文逐字符还原输入；真实语种/说话人变化也必须一致。
+补写的相同前缀可以重复，因此不再要求带标签的source_text直接拼接与输入字符串完全相同。
+模型偶尔省略重复前缀时，代码只在正文和实际归属校验通过后按已知状态补齐，不增加模型调用，不修复错误身份。
 WAIT暂存当前片段；后续DIRECT提交此前全部缓冲加当前片段，且每段只提交一次。
+WAIT的source_text仍是待对齐的源片段，最终模型的WAIT响应仍然只有<|WAIT|>，没有正文或归属前缀。
 真实切换必须WAIT；普通内容可以连续DIRECT，也允许遇到连续触发条件时连续WAIT。
 最后片段WAIT时flush=true，表示文本阶段还有待提交内容；不能构造空片段释放缓冲。
 代码校验格式、拼接、归属标签变化和flush；多语种实体边界及语义粒度仍依赖模型，不声称由机械校验完全保证。
@@ -73,6 +78,7 @@ WAIT事件处理状态与已经提交的归属状态分开维护，避免同一�
 12份独立prompt各有6个例子，包括多个连续DIRECT、保护表达、语种和说话人变化以及末尾WAIT。
 prompt单独文本放在Data-Scripts/prompts，仅供查看；实际云道脚本使用内置版本。
 既有续跑行为保持：当前输出文件中已经写出的成功或失败记录均跳过，不自动重新标注。
+最新脚本启动标识为OMNICOMMIT_ASR_DIRECT_FULL_PREFIX_2048_V3；旧文件不会因替换脚本自动补前缀，新格式输出使用新目录。
 旧版含wait_reasons的历史结果不会因为替换脚本而被自动改写；使用新版本时应区分已有结果的版本。
 已有输出损坏或与输入不对应时保留该文件并记录未完成，继续其他文件，不做备份或覆盖。
 固定max_tokens=2048仍可能截断较长记录；该条写空继续，不自动加调用、不改变参数、不默默截掉源文。

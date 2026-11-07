@@ -172,10 +172,12 @@ def test_all_prompt_examples_agree_with_runtime_validator(runner):
                     source = runner.get_source_text(inp)
                 source = runner.normalize_transcript(source)
                 try:
-                    runner.validate_annotation(value, source)
+                    assert runner.validate_annotation(value, source) == value
                 except Exception as exc:
                     pytest.fail(f"{language} example {example_index}: {exc}")
                 assert all(set(s) == {"source_text", "action"} for s in value["segments"])
+                assert all(re.match(r"^<[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*><spk[1-9][0-9]*>", s["source_text"])
+                           for s in value["segments"] if s["action"] == "DIRECT")
                 valid += 1
             else:
                 with pytest.raises(ValueError):
@@ -428,9 +430,9 @@ def test_request_uses_path_prompt_and_normalized_mixed_source_without_rewriting_
     expected = {
         "segments": [
             {"source_text": "<zh><spk1>可以。", "action": "DIRECT"},
-            {"source_text": "继续。", "action": "DIRECT"},
+            {"source_text": "<zh><spk1>继续。", "action": "DIRECT"},
             {"source_text": "<en><spk1>All right.", "action": "WAIT"},
-            {"source_text": "Go on.", "action": "DIRECT"},
+            {"source_text": "<en><spk1>Go on.", "action": "DIRECT"},
         ],
         "flush": False,
         "error": None,
@@ -453,7 +455,7 @@ def test_request_uses_path_prompt_and_normalized_mixed_source_without_rewriting_
     assert re.sub(r"<[^>]+>", "", sent["transcript"]) == re.sub(r"<[^>]+>", "", raw)
 
 
-def test_repeated_metadata_added_back_by_model_fails_normalized_source_check(runner):
+def test_repeated_correct_metadata_is_required_output_format_not_a_switch(runner):
     normalized = "<zh><spk1>请继续讨论。"
     value = {
         "segments": [
@@ -462,8 +464,7 @@ def test_repeated_metadata_added_back_by_model_fails_normalized_source_check(run
         ],
         "flush": False, "error": None,
     }
-    with pytest.raises(ValueError):
-        runner.validate_annotation(value, normalized)
+    assert runner.validate_annotation(value, normalized) == value
 
 
 def test_adjacent_ordinary_direct_segments_do_not_require_wait(runner):
@@ -474,7 +475,53 @@ def test_adjacent_ordinary_direct_segments_do_not_require_wait(runner):
         ],
         "flush": False, "error": None,
     }
-    runner.validate_annotation(value, SOURCE)
+    result = runner.validate_annotation(value, SOURCE)
+    assert result["segments"] == [
+        {"source_text": "<zh><spk1>请继续", "action": "DIRECT"},
+        {"source_text": "<zh><spk1>讨论。", "action": "DIRECT"},
+    ]
+    assert value["segments"][1]["source_text"] == "讨论。"  # no in-place mutation
+
+
+def test_missing_direct_prefix_is_rendered_from_verified_inherited_state(runner, args, monkeypatch):
+    source = "<zh><spk1>请联系张伟确认。<en><spk1>Please check the file.<en><spk2>I agree."
+    value = {"segments": [
+        {"source_text": "<zh><spk1>请联系", "action": "DIRECT"},
+        {"source_text": "张伟", "action": "WAIT"},
+        {"source_text": "确认。", "action": "DIRECT"},
+        {"source_text": "<en><spk1>Please check ", "action": "WAIT"},
+        {"source_text": "the file.", "action": "DIRECT"},
+        {"source_text": "<en><spk2>I ", "action": "WAIT"},
+        {"source_text": "agree.", "action": "DIRECT"},
+    ], "flush": False, "error": None}
+    calls = []
+    def post(*a, **kw):
+        calls.append(kw)
+        return FakeResponse(content=json.dumps(value, ensure_ascii=False))
+    monkeypatch.setattr(runner.requests, "post", post)
+    result = json.loads(runner.generate_one(record(source=source), args))
+    assert len(calls) == 1
+    assert [s["source_text"] for s in result["segments"] if s["action"] == "DIRECT"] == [
+        "<zh><spk1>请联系", "<zh><spk1>确认。", "<en><spk1>the file.", "<en><spk2>agree."]
+    assert runner.validate_annotation(result, source) == result
+
+
+@pytest.mark.parametrize("bad_prefix", ["<en><spk1>", "<zh><spk2>"])
+def test_wrong_repeated_direct_prefix_cannot_be_silently_repaired(runner, bad_prefix):
+    value = {"segments": [
+        {"source_text": "<zh><spk1>请继续", "action": "DIRECT"},
+        {"source_text": bad_prefix + "讨论。", "action": "DIRECT"},
+    ], "flush": False, "error": None}
+    with pytest.raises(ValueError):
+        runner.validate_annotation(value, SOURCE)
+
+
+def test_full_direct_header_preserves_initial_whitespace_and_roundtrips(runner):
+    source = " \n<en><spk1>Please confirm. "
+    value = {"segments": [{"source_text": source, "action": "DIRECT"}], "flush": False, "error": None}
+    result = runner.validate_annotation(value, source)
+    assert result["segments"][0]["source_text"] == "<en><spk1> \nPlease confirm. "
+    assert runner.validate_annotation(result, source) == result
 
 
 def test_long_complete_entity_is_not_rejected_by_old_translation_word_limit(runner):

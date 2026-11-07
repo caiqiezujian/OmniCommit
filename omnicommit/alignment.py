@@ -178,11 +178,21 @@ def annotation_units(row):
             raise ValueError("Empty source unit")
         if segment["action"] not in ("WAIT", "DIRECT"):
             raise ValueError("Unknown action")
-    if "".join(s["source_text"] for s in segments) != source:
-        raise ValueError("Annotation does not reconstruct normalized source exactly")
+        plain = TAG.sub("", segment["source_text"])
+        if "<" in plain or ">" in plain or not any(c.isalnum() for c in plain):
+            raise ValueError("Source unit cuts a tag or has no lexical content")
+        if re.search(r"<[^<>]+>\s*\Z", segment["source_text"]):
+            raise ValueError("Source unit ends with empty attribution")
+    joined = "".join(s["source_text"] for s in segments)
+    units = tagged_units(source)
+    # Teacher input has change-only headers; each DIRECT output carries its own
+    # complete header. Extra identical headers are metadata, not new speech or
+    # a switch. Compare attribution for EVERY character, not stripped text alone.
+    # This also admits a full header moved before preserved initial whitespace.
+    if TAG.sub("", joined) != TAG.sub("", source) or tagged_units(joined) != units:
+        raise ValueError("Annotation does not reconstruct source text and attribution exactly")
     if annotation["flush"] != (segments[-1]["action"] == "WAIT"):
         raise ValueError("Annotation flush disagrees with final action")
-    units = tagged_units(source)
     result, offset, previous_state = [], 0, None
     for segment in segments:
         plain = TAG.sub("", segment["source_text"])

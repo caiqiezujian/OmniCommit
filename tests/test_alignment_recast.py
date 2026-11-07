@@ -87,6 +87,67 @@ def test_many_consecutive_direct_and_one_second_mode(tmp_path):
     assert emitted(half) == emitted(whole) == "We can start now."
 
 
+def test_every_direct_header_does_not_create_switches_or_change_offsets(tmp_path):
+    row = source(tmp_path, [("<en><spk1>We ", "DIRECT"), ("<en><spk1>can ", "DIRECT"),
+                            ("<en><spk1>start ", "DIRECT"), ("<en><spk1>now.", "DIRECT")],
+                 2, raw="<en><spk1>We can start now.")
+    aligned = alignment.align_annotation(row, timed(("We", 10, 300), ("can", 510, 800),
+                                                   ("start", 1010, 1300), ("now", 1510, 1800)))
+    assert [(s["char_start"], s["char_end"]) for s in aligned["segments"]] == [(0, 3), (3, 7), (7, 13), (13, 17)]
+    assert not any(s["switched"] for s in aligned["segments"])
+    assert [t["action"] for t in recast.recast_row(aligned)["turns"]] == ["DIRECT"] * 4 + ["WAIT"]
+    assert emitted(recast.recast_row(aligned)) == "We can start now."
+
+
+def test_prefixed_direct_releases_previous_wait_without_repeating_source(tmp_path):
+    row = source(tmp_path, [("<zh><spk1>请联系", "DIRECT"), ("张伟", "WAIT"),
+                            ("<zh><spk1>确认方案。", "DIRECT")],
+                 1.5, raw="<zh><spk1>请联系张伟确认方案。")
+    aligned = alignment.align_annotation(row, timed(("请联系", 20, 300), ("张伟", 520, 800),
+                                                   ("确认方案", 1010, 1300)))
+    output = recast.recast_row(aligned)
+    assert [t["action"] for t in output["turns"]] == ["DIRECT", "WAIT", "DIRECT", "WAIT"]
+    assert output["turns"][2]["segments"] == [{"language": "zh", "speaker": "spk1", "text": "张伟确认方案。"}]
+    assert emitted(output) == "请联系张伟确认方案。"
+
+
+def test_direct_headers_preserve_real_language_and_speaker_switch_waits(tmp_path):
+    row = source(tmp_path, [("<zh><spk1>开始。", "DIRECT"), ("<en><spk1>Please ", "WAIT"),
+                            ("<en><spk1>continue.", "DIRECT"), ("<en><spk2>I ", "WAIT"),
+                            ("<en><spk2>agree.", "DIRECT")], 2.5,
+                 raw="<zh><spk1>开始。<en><spk1>Please continue.<en><spk2>I agree.")
+    aligned = alignment.align_annotation(row, timed(("开始", 10, 300), ("Please", 510, 800),
+                                                   ("continue", 1010, 1300), ("I", 1510, 1800),
+                                                   ("agree", 2010, 2300)))
+    assert [s["switched"] for s in aligned["segments"]] == [False, True, False, True, False]
+    assert [t["action"] for t in recast.recast_row(aligned)["turns"]] == ["DIRECT", "WAIT", "DIRECT", "WAIT", "DIRECT", "WAIT"]
+
+
+@pytest.mark.parametrize("header", ["<zh><spk2>", "<en><spk1>"])
+def test_repeated_direct_header_cannot_change_true_attribution(tmp_path, header):
+    row = source(tmp_path, [("<zh><spk1>我们", "DIRECT"), (header + "继续。", "DIRECT")],
+                 1, raw="<zh><spk1>我们继续。")
+    with pytest.raises(ValueError, match="attribution"):
+        alignment.align_annotation(row, timed(("我们", 10, 300), ("继续", 600, 800)))
+
+
+@pytest.mark.parametrize("pieces", [
+    [("<en><spk1>We<en", "DIRECT"), ("><spk1> go.", "DIRECT")],
+    [("<en><spk1>We<en>", "DIRECT"), ("<spk1> go.", "DIRECT")],
+])
+def test_concatenation_cannot_hide_tag_cut_between_source_units(tmp_path, pieces):
+    row = source(tmp_path, pieces, 1, raw="<en><spk1>We go.")
+    with pytest.raises(ValueError, match="tag|attribution"):
+        alignment.align_annotation(row, timed(("We", 10, 300), ("go", 600, 800)))
+
+
+def test_full_direct_header_keeps_leading_whitespace_verbatim(tmp_path):
+    row = source(tmp_path, [("<en><spk1> \n We ", "DIRECT"), ("<en><spk1>continue.\n", "DIRECT")],
+                 1, raw=" \n <en><spk1>We continue.\n")
+    aligned = alignment.align_annotation(row, timed(("We", 10, 300), ("continue", 600, 800)))
+    assert emitted(recast.recast_row(aligned)) == " \n We continue.\n"
+
+
 def test_real_word_boundaries_conservative_no_proportional_timing(tmp_path):
     row = source(tmp_path, [("<zh><spk1>我们", "DIRECT"), ("出发。", "DIRECT")], 1)
     aligned = alignment.align_annotation(row, timed(("我们出发", 10, 800)))

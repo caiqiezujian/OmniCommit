@@ -55,15 +55,25 @@ def build_demo(directory, chunk_seconds=.5):
         ("再讨论。", "DIRECT", 5.24, 5.80),
     ]
     source = "".join(u[0] for u in units)
-    annotation = {"segments": [{"source_text": text, "action": action} for text, action, _, _ in units],
-                  "flush": False, "error": None}
+    import re
+    annotation_segments = []
+    language = speaker = None
+    for text, action, _, _ in units:
+        for tag in re.findall(r"<([^<>]+)>", text):
+            if tag.startswith("spk"):
+                speaker = tag
+            else:
+                language = tag
+        rendered = (f"<{language}><{speaker}>" + re.sub(r"<[^<>]+>", "", text)
+                    if action == "DIRECT" else text)
+        annotation_segments.append({"source_text": rendered, "action": action})
+    annotation = {"segments": annotation_segments, "flush": False, "error": None}
     row = {"id": "synthetic-wiring-only", "synthetic_not_for_training": True,
            "audios": [str(audio)], "messages": [
                {"role": "system", "content": "Synthetic wiring fixture only."},
                {"role": "user", "content": "<audio>"},
                {"role": "assistant", "content": source}],
            "output": json.dumps(annotation, ensure_ascii=False)}
-    import re
     timings = {"id": row["id"], "audio": str(audio), "backend": "synthetic-scripted-not-an-aligner",
                "words": [{"text": re.sub(r"<[^<>]+>", "", text), "start": start, "end": end}
                          for text, _, start, end in units]}
