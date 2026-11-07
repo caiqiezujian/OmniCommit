@@ -2,7 +2,85 @@
 
 本目录将已经审查的流式轨迹转成音频、文本交错的 SFT 数据，沿用 FLEX 的
 **ms-swift 3.12.1 / Megatron / Qwen3-Omni / 虚拟音频区间**方案。
-所有模块在本目录内，不依赖其他 FLEX 目录。准备和检查不调用教师模型。
+不依赖其他 FLEX 目录；请保留本仓库的 `omnicommit/`，SFT 和服务共用其中的
+`runtime_protocol.py`，确保系统提示、说话人参照和结束标记一致。准备和检查不调用教师模型。
+
+## 新版文本标注路线：v2、结束轮和长会议
+
+新版 `recast_asr.py` 输出 `schema_version:2`：每个真实音频块为 `event:"audio"`，
+最后另有 `event:"end_of_audio"`、`start_ms == end_ms == duration_ms` 的结束轮。
+准备器为这个结束轮生成 user 文本 `<end_of_audio>`，不新增音频、虚构时间或补一段未来音频。
+目标为剩余的 DIRECT 内容，或无剩余时的 WAIT。它是普通输入控制文本，不是第三种动作 token。
+
+v2 每个 DIRECT 以完整语言/说话人标签开头；同轮实际归属变化也写完整标签。
+正文里的真实换行保留；不会只为新增元数据而插入换行。原 v1 格式继续兼容。
+
+```bash
+python SFT-Scripts/prepare_sft.py /data/recast.jsonl --output /data/sft/full.jsonl
+
+# 短录音可直接使用 full.jsonl。长录音在可安全提交边界切成窗口：
+python SFT-Scripts/prepare_windows.py /data/sft/full.jsonl \
+  --output /data/sft/train.jsonl --max-audio-seconds 20 \
+  --speaker-references /data/verified_refs.jsonl \
+  --max-reference-seconds 5 --max-total-reference-seconds 30 --max-speakers 8
+```
+
+窗口仅在重铸器给出的 `safe_cut:true` 切开：既没有已完成但尚未提交的文字，也没有
+跨过该边界的未听完原子段。仅仅见到 DIRECT 不足以证明边界安全。
+超预算而无安全边界的记录会拒绝并继续其余记录，不切坏实体。
+
+参照文件每行形如：
+
+```json
+{"id":"meeting-001","references":[{"audio":"/data/audio/session.wav","start_ms":0,"end_ms":1500,"speaker":"spk1","language":"zh","text":"我们开始讨论。","verified":true,"clean":true,"overlap":false}]}
+```
+
+`id` 对应原轨迹 ID，音频必须是同一条完整会议录音；参照必须已由外部流程或人工核实。
+JSON 中写 true 本身不是质量验证。每个窗口只选开始之前的参照，每位已出现说话人最多一段，
+长度 0.5 秒至所设上限。中间窗口需要全部既有说话人的有效参照；缺失时拒绝该会议，
+不会跨无关 JSONL 行拼接 `spk1`。参照音频及转录放在第一个 live **user** 输入中，
+不会生成对应 assistant 目标，因此默认 assistant-only loss 不训练复读缓存。
+只有实际会议最后一个窗口含结束轮，窗口裁剪不会伪装成会议结束。
+全部说话人参照合计还必须满足 `--max-total-reference-seconds`，默认 30 秒，与服务默认一致；
+超预算会拒绝该会议，不丢掉某位已有说话人或切短经过核实的参照。
+窗口的 `--max-speakers` 是缓存预算，服务中的同名参数也是运行预算；它们都不会创造
+未训练过的说话人 token。实际可输出的编号仍受本次训练、导出的 token 清单约束。
+
+20 秒只是音频预算，不能保证模型 token 长度不超限。请在训练容器里跑真实模板编码：
+
+```bash
+python SFT-Scripts/audit_encoded_lengths.py /data/sft/train.jsonl \
+  --model /models/qwen3_omni_original_hf \
+  --max-length 4096 --report /data/sft/encoded-audit.json
+```
+
+该检查使用实际 processor、虚拟音频读取和 SWIFT 训练模板，包含音频展开和参考输入，
+不加载模型权重。超长或无监督目标会报错，不静默截断。成功后再运行下文的训练命令。
+本地 CPU 测试未加载真实 Qwen processor；实际环境编码和训练验收仍需要上述命令。
+
+## 新增 token 与训练后导出
+
+新增 WAIT、DIRECT、语种、说话人 token 在 **SFT 前**通过训练启动器的
+`--new_special_tokens` 注册；词嵌入与输出层通过 `modules_to_save` 参与保存。
+不要先训练，再只往 tokenizer 里加 token：那样缺少学习过的对应权重。
+
+训练后沿用 FLEX 的 HF 基座加 PEFT adapter 导出方式：
+
+```bash
+# base 是原始未量化 HF 目录，和训练命令的 MCore 目录不同。
+bash SFT-Scripts/merge_lora.sh \
+  /models/qwen3_omni_original_hf /outputs/omnicommit/checkpoint-N \
+  /models/omnicommit-merged \
+  --special-tokens /data/sft/train.jsonl.tokens.txt --gpu-ids 0
+```
+
+追加 `--check-only` 只做 tokenizer、配置和张量 header 校验。
+完整导出检查训练 args 中的 token 顺序、完整词表模块、导出的 tokenizer/processor、
+以及所有新增动作/语种/说话人 token 的词嵌入和输出层权重确实来自已训练适配器。
+导出目录包含 `omnicommit_tokens.json`、`omnicommit_tokens.txt` 和
+`omnicommit_merge_report.json`；服务根据清单解析实际 ID，不沿用 FLEX 固定 ID。
+未经验证的中间导出保留在 `.incomplete-*` 路径，不会发布为正式模型；这是输出暂存，
+不会备份或覆盖原模型。CPU 测试使用微型合成张量，不等于已完成真实模型合并与推理。
 
 ## 环境
 

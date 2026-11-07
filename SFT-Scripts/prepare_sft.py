@@ -18,17 +18,9 @@ from omnicommit_audio import encode_chunk_ref, MAX_CHUNK_SECONDS
 ACTION_TOKENS = ["<|WAIT|>", "<|DIRECT|>"]
 LANGUAGE = re.compile(r"[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*")
 SPEAKER = re.compile(r"spk[1-9][0-9]*")
-SYSTEM_PROMPT = """You transcribe speech incrementally in its original language and identify its speaker.
-Each user turn provides only the next audio chunk; use earlier audio and text as context.
-Return only newly committed text, never repeat or revise previously committed text.
-If new text and its language/speaker attribution are sufficiently supported, begin with <|DIRECT|>.
-For every emitted segment, write <language><speaker>text, for example <zh><spk1>你好。
-Use the same speaker ID across this entire conversation; changing language does not change speaker identity.
-If no new segment can be committed, return exactly <|WAIT|>. Do not output empty speaker/language segments.
-Release a confirmed prefix while deferring uncertain names, numeric expressions or attribution.
-Preserve the spoken language and disfluencies. {number_instruction}
-Use punctuation supported by the available audio. A chunk boundary alone is not a sentence boundary.
-Within a DIRECT response, separate segments by a newline. Do not translate, explain or include timestamps."""
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from omnicommit.runtime_protocol import SYSTEM_PROMPT, END_OF_AUDIO, system_prompt
+
 
 
 def number(value, name):
@@ -37,7 +29,7 @@ def number(value, name):
     return float(value)
 
 
-def render_segments(segments):
+def render_segments(segments, separator="\n"):
     if not isinstance(segments, list) or not segments:
         raise ValueError("DIRECT requires nonempty segments")
     rendered, tokens = [], set()
@@ -51,18 +43,18 @@ def render_segments(segments):
             raise ValueError(f"Invalid speaker ID: {speaker!r}")
         if not isinstance(text, str) or not text.strip():
             raise ValueError("Each segment needs nonempty transcription text")
-        if "<" in text or ">" in text or "\n" in text or "\r" in text:
-            raise ValueError("Transcription text must not contain markup or embedded line breaks")
+        if "<" in text or ">" in text:
+            raise ValueError("Transcription text must not contain markup")
         rendered.append(f"<{language}><{speaker}>{text}")
         tokens.update((f"<{language}>", f"<{speaker}>"))
-    return "\n".join(rendered), tokens
+    return separator.join(rendered), tokens
 
 
 def prepare_row(row, audio_root=None):
     import soundfile as sf
 
-    if not isinstance(row, dict) or row.get("schema_version") != 1:
-        raise ValueError("Expected schema_version=1 trajectory object")
+    if not isinstance(row, dict) or row.get("schema_version") not in (1, 2):
+        raise ValueError("Expected schema_version=1 or 2 trajectory object")
     if row.get("status", "ok") != "ok":
         raise ValueError("Cannot train on a failed trajectory")
     source = row.get("audio")
@@ -85,21 +77,28 @@ def prepare_row(row, audio_root=None):
     if not isinstance(policy, dict):
         raise ValueError("policy must be an object")
     number_format = policy.get("number_format", "verbatim")
-    if number_format == "verbatim":
-        number_instruction = "Transcribe numbers in their spoken form (verbatim); do not convert them to digits."
-    elif number_format == "normalized":
-        number_instruction = "Normalize numerical expressions to digits only when their complete value is determined."
-    else:
-        raise ValueError("policy.number_format must be verbatim or normalized")
-    messages = [{"role": "system", "content": SYSTEM_PROMPT.format(number_instruction=number_instruction)}]
+    messages = [{"role": "system", "content": system_prompt(number_format)}]
+    version = row["schema_version"]
+    if version == 2 and turns[-1].get("event") != "end_of_audio":
+        raise ValueError("schema_version=2 requires a final end_of_audio event")
+    audio_turn_count = len(turns) - (1 if version == 2 else 0)
+    if audio_turn_count < 1:
+        raise ValueError("At least one audio turn is required")
     refs, durations, audio_segments, provenance = [], [], [], []
     inventory, previous_end, direct_count = set(ACTION_TOKENS), 0.0, 0
+    meeting_speakers = []
     for i, turn in enumerate(turns):
         if not isinstance(turn, dict):
             raise ValueError(f"turn {i} must be an object")
         start = number(turn.get("start_ms"), "start_ms")
         end = number(turn.get("end_ms"), "end_ms")
-        if abs(start - previous_end) > 1e-6 or end <= start or end > duration_ms + 1e-6:
+        eos = version == 2 and turn.get("event") == "end_of_audio"
+        if version == 2 and not eos and turn.get("event") != "audio":
+            raise ValueError(f"turn {i}: expected audio or final end_of_audio event")
+        if eos:
+            if i != len(turns) - 1 or abs(start - duration_ms) > 1e-6 or abs(end - duration_ms) > 1e-6 or abs(previous_end - duration_ms) > 1e-6:
+                raise ValueError("end_of_audio must follow all audio at the exact recording end")
+        elif abs(start - previous_end) > 1e-6 or end <= start or end > duration_ms + 1e-6:
             raise ValueError(f"turn {i}: ranges must be contiguous, increasing and within duration")
         if end - start > MAX_CHUNK_SECONDS * 1000:
             raise ValueError(f"turn {i}: chunk exceeds {MAX_CHUNK_SECONDS} seconds")
@@ -109,19 +108,34 @@ def prepare_row(row, audio_root=None):
                 raise ValueError(f"turn {i}: WAIT requires segments=[]")
             content = ACTION_TOKENS[0]
         elif action == "DIRECT":
-            text, tokens = render_segments(segments)
+            text, tokens = render_segments(segments, separator="" if version == 2 else "\n")
+            if version == 2:
+                for segment in segments:
+                    speaker = segment["speaker"]
+                    if speaker not in meeting_speakers:
+                        expected = "spk%d" % (len(meeting_speakers) + 1)
+                        if speaker != expected:
+                            raise ValueError("Complete meeting speaker IDs must follow first occurrence: "
+                                             + expected + "; review cropped/global IDs before preparing SFT")
+                        meeting_speakers.append(speaker)
             content = ACTION_TOKENS[1] + text
             inventory.update(tokens)
             direct_count += 1
         else:
             raise ValueError(f"turn {i}: action must be DIRECT or WAIT")
+        if eos:
+            messages.extend([{"role": "user", "content": END_OF_AUDIO},
+                             {"role": "assistant", "content": content}])
+            provenance.append({"turn_index": i, "event": "end_of_audio", "start_ms": start,
+                               "end_ms": end, "action": action, "segments": segments})
+            continue
         # Last timestamp can be rounded by <=1 source sample. Never read future
         # audio beyond the actual file. Pad the final tail to >=500 ms in memory
         # so a one-sample tail does not become an almost-empty encoder input.
-        source_end = actual_ms / 1000 if i == len(turns) - 1 else min(end, actual_ms) / 1000
+        source_end = actual_ms / 1000 if i == audio_turn_count - 1 else min(end, actual_ms) / 1000
         if round(source_end * info.samplerate) <= round(start * info.samplerate / 1000):
             raise ValueError(f"turn {i}: range contains no source samples")
-        input_seconds = max((source_end - start / 1000), .5 if i == len(turns) - 1 else .01)
+        input_seconds = max((source_end - start / 1000), .5 if i == audio_turn_count - 1 else .01)
         ref = encode_chunk_ref(path, start / 1000, source_end, input_seconds)
         refs.append(ref)
         durations.append(input_seconds)
@@ -130,16 +144,38 @@ def prepare_row(row, audio_root=None):
         messages.extend([{"role": "user", "content": "<audio>"},
                          {"role": "assistant", "content": content}])
         provenance.append({"turn_index": i, "start_ms": start, "end_ms": end,
-                           "action": action, "segments": segments})
+                           "action": action, "segments": segments,
+                           "safe_cut": bool(turn.get("safe_cut", False))})
         previous_end = end
     if abs(previous_end - duration_ms) > 1e-6:
         raise ValueError("Final turn must cover the end of the audio")
     if not direct_count:
         raise ValueError("All-WAIT trajectory has no transcription supervision")
-    prepared = {"schema_version": 1, "id": row.get("id"), "source_audio": str(path),
+    prepared = {"schema_version": version, "id": row.get("id"), "source_audio": str(path),
                 "duration_ms": duration_ms, "audios": refs, "messages": messages,
                 "audio_segments": audio_segments, "audio_chunk_durations": durations,
                 "turn_provenance": provenance, "policy": dict(policy, number_format=number_format)}
+    if version == 2 and "source_segments" in row:
+        # Retain acoustic speech evidence for later silence-window validation.
+        # This is metadata only, never included in the model's input messages.
+        sources = row["source_segments"]
+        if not isinstance(sources, list) or not sources:
+            raise ValueError("source_segments must contain aligned speech units")
+        spans, source_units = [], []
+        for source_segment in sources:
+            begin = number(source_segment.get("start_ms"), "source_segment.start_ms")
+            finish = number(source_segment.get("end_ms"), "source_segment.end_ms")
+            if not 0 <= begin < finish <= duration_ms + 1e-6:
+                raise ValueError("Aligned source speech span outside audio")
+            attributed = source_segment.get("attributed")
+            render_segments(attributed, separator="")
+            source_units.extend((s["language"], s["speaker"], char) for s in attributed for char in s["text"])
+            spans.append({"start_ms": begin, "end_ms": finish})
+        target_units = [(s["language"], s["speaker"], char)
+                        for turn in turns for s in turn["segments"] for char in s["text"]]
+        if source_units != target_units:
+            raise ValueError("Aligned source speech evidence does not cover all emitted transcription exactly")
+        prepared["source_speech_spans"] = spans
     for field in ("provenance", "reference_audit"):
         if field in row:
             prepared[field] = row[field]
@@ -171,15 +207,16 @@ def main(argv=None):
     for p in paths:
         p.parent.mkdir(parents=True, exist_ok=True)
     kept, rejected, inventory = 0, 0, set(ACTION_TOKENS)
-    with args.input.open(encoding="utf-8-sig") as source, args.output.open("x", encoding="utf-8") as out, rejected_path.open("x", encoding="utf-8") as rejects:
+    with args.input.open("rb") as source, args.output.open("x", encoding="utf-8") as out, rejected_path.open("x", encoding="utf-8") as rejects:
         for line_no, line in enumerate(source, 1):
             if not line.strip():
                 continue
             row = None
             try:
-                row = json.loads(line)
+                row = json.loads(line.decode("utf-8-sig"))
                 prepared, tokens = prepare_row(row, args.audio_root or args.input.resolve().parent)
                 serialized = json.dumps(prepared, ensure_ascii=False, allow_nan=False)
+                serialized.encode("utf-8")
             except Exception as exc:
                 rejected += 1
                 rejects.write(json.dumps({"line": line_no, "id": row.get("id") if isinstance(row, dict) else None,

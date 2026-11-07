@@ -1,5 +1,7 @@
 # 音频教师制数
 
+当前的一次文本教师路线使用 `annotate_asr.py → force_align_asr.py/外部时间戳 → align_asr.py → recast_asr.py`，请见 [完整执行手册](../docs/RUNBOOK_ZH.md) 和 [对齐与重构](../docs/alignment_and_recast.md)。以下保留独立的音频教师前缀路线，二者不是必须串行执行的步骤。
+
 本目录实现真实音频前缀识别与离线轨迹构建，和 `SFT-Scripts/` 的训练准备器衔接。请上传整个 OmniCommit 项目；脚本通过同级 `omnicommit/` 包工作，不依赖本机 FLEX 目录。
 
 ## 三种数据

@@ -1,0 +1,2 @@
+# Separate CPU evaluation environment; no GPU framework changes.
+rapidfuzz>=3,<4

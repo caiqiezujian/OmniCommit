@@ -1,0 +1,4 @@
+# OPTIONAL: separate Python3.11 environment, do not install over omni_ms.
+# Official API: QwenLM/Qwen3-ASR qwen_asr/inference/qwen3_forced_aligner.py
+qwen-asr==0.0.6
+soundfile>=0.12,<1

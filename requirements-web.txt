@@ -1,0 +1,5 @@
+# Install into the existing inference environment; do not replace CUDA/torch.
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+# HF backend targets the same transformers 4.57.1 as SFT.
+# Use existing torch/transformers/accelerate installations and requirements-data.

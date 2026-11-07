@@ -1,0 +1,4 @@
+# OPTIONAL: install in a separate Python 3.11 environment, never over omni_ms.
+# API source: https://github.com/m-bain/whisperX/blob/v3.7.4/whisperx/alignment.py
+whisperx==3.7.4
+soundfile>=0.12,<1

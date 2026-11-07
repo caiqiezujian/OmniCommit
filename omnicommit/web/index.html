@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="zh"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OmniCommit · 流式会议转录</title>
+<style>body{max-width:980px;margin:40px auto;padding:0 20px;font:16px/1.65 system-ui;background:#f5f7fb;color:#142238}h1{font-size:28px}section{background:white;padding:24px;margin:20px 0;border-radius:12px}button,input{font:inherit;padding:8px;margin:4px}button{cursor:pointer;background:#234b9c;color:white;border:0;border-radius:6px}button:disabled{opacity:.4;cursor:default}label{display:inline-block}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:460px;overflow:auto}.muted{color:#526078}#status{font-weight:600}.small{font-size:14px}input{max-width:180px}#referenceText{max-width:90%;width:500px}</style>
+<h1>OmniCommit · 流式会议转录</h1>
+<p class="muted">语言与说话人标签随新增转录显示。等待表示当前尚未提交文字。会话内编号持续保留；声音匹配准确率仍需真实会议验证。</p>
+<section><label>访问口令 <input id="token" type="password" autocomplete="off"></label>
+<button id="start">开始录音</button><button id="stop" disabled>结束并提交尾部</button><button id="save">下载本次结果</button>
+<p id="status">尚未开始</p><p id="metrics" class="small muted"></p><pre id="transcript"></pre></section>
+<section><details><summary>人工核验与说话人参照（试验工具）</summary>
+<p class="small">仅提交已听到且核验无误的音频区间。参照不会自动从最新音频块提取。提交位置表示该时刻之前全部语音都已转录，不能仅凭一个 DIRECT 判断。</p>
+<label>已完整提交至（秒）<input id="through" type="number" step=".1" min="0"></label><button id="commit">确认提交位置</button><br>
+<label>说话人 <input id="speaker" value="spk1"></label><label>语种 <input id="language" value="zh"></label><br>
+<label>参照起点 <input id="refStart" type="number" step=".1" min="0"></label><label>终点 <input id="refEnd" type="number" step=".1" min="0"></label><br>
+<input id="referenceText" placeholder="该区间的准确转录"><br><label><input id="verified" type="checkbox">已核验身份准确、语音清晰且无重叠说话</label><button id="reference">保存声音参照</button>
+</details></section><section><details><summary>事件与性能记录</summary><pre id="events"></pre></details></section>
+<script>
+const $=id=>document.getElementById(id);
+let socket,context,media,node,source,queue=[],partial=[],busy=false,ending=false,ended=false,step=8000,rows=[],capturing=false,stopping=false,stopAck=null,failed=false;
+const status=t=>$('status').textContent=t;
+function log(row){rows.push(row);$('events').textContent=rows.slice(-100).map(x=>JSON.stringify(x)).join('\n');}
+function transmit(){if(!socket||socket.readyState!==1||busy)return;if(queue.length){busy=true;socket.send(queue.shift());}else if(ending&&!ended){ended=true;busy=true;socket.send(JSON.stringify({type:'end'}));}}
+function pcmPacket(samples){let pcm=new Int16Array(samples.length);samples.forEach((v,i)=>pcm[i]=Math.round(Math.max(-1,Math.min(1,v))*32767));return pcm.buffer;}
+function capture(samples){if(!capturing)return;partial.push(...samples);while(partial.length>=step){queue.push(pcmPacket(partial.splice(0,step)));}if(queue.length*step/16000>10){stopCapture('推理积压超过 10 秒，已停止采集；正在处理已接收音频。');}transmit();}
+async function stopCapture(message){if(!capturing||stopping)return;stopping=true;$('stop').disabled=true;try{
+ // Worklet port messages are ordered: its stop acknowledgement follows every
+ // sample it produced. Drain those samples before forming the short tail.
+ await new Promise((resolve,reject)=>{const timer=setTimeout(()=>{stopAck=null;reject(Error('采集器停止确认超时，音频完整性未确认。'));},2000);stopAck=()=>{clearTimeout(timer);resolve();};node.port.postMessage('stop');});
+ if(failed)return;capturing=false;if(context)await context.suspend();if(partial.length){queue.push(pcmPacket(partial));partial=[];}if(media)media.getTracks().forEach(t=>t.stop());ending=true;status(message||'正在提交剩余音频和结尾文字…');transmit();
+ }catch(e){failed=true;status(e.message);await cleanup();if(socket)socket.close();}}
+async function cleanup(){capturing=false;if(stopAck){stopAck();stopAck=null;}if(media)media.getTracks().forEach(t=>t.stop());if(context&&context.state!=='closed')await context.close();$('start').disabled=false;$('stop').disabled=true;}
+$('start').onclick=async()=>{try{
+ if(!window.isSecureContext)throw Error('麦克风需要 HTTPS 或 localhost。');
+ queue=[];partial=[];rows=[];busy=false;ending=false;ended=false;stopping=false;failed=false;$('transcript').textContent='';$('events').textContent='';$('start').disabled=true;
+ media=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
+ context=new AudioContext({sampleRate:16000});if(context.sampleRate!==16000)throw Error('浏览器未提供 16 kHz AudioContext，请换用支持此采样率的浏览器。');
+ const code=`class Capture extends AudioWorkletProcessor{constructor(){super();this.active=true;this.port.onmessage=e=>{if(e.data==='stop'){this.active=false;this.port.postMessage({stopped:true});}};}process(inputs){if(this.active&&inputs[0]&&inputs[0][0])this.port.postMessage(inputs[0][0].slice());return true;}}registerProcessor('capture',Capture);`;
+ const url=URL.createObjectURL(new Blob([code],{type:'text/javascript'}));await context.audioWorklet.addModule(url);URL.revokeObjectURL(url);
+ node=new AudioWorkletNode(context,'capture');node.port.onmessage=e=>{if(e.data.stopped){if(stopAck){stopAck();stopAck=null;}}else capture(e.data);};source=context.createMediaStreamSource(media);source.connect(node);node.connect(context.destination);
+ await context.suspend();socket=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/stream');socket.binaryType='arraybuffer';
+ socket.onopen=()=>socket.send(JSON.stringify({type:'start',sample_rate:16000,token:$('token').value}));
+ socket.onmessage=async e=>{const row=JSON.parse(e.data);log(row);
+ if(row.type==='ready'){step=Math.round(row.chunk_seconds*16000);capturing=true;await context.resume();$('stop').disabled=false;status(row.backend+' · '+row.warning);}
+ else if(row.type==='result'){busy=false;if(row.action==='DIRECT')$('transcript').textContent+=row.segments.map(s=>`<${s.language}><${s.speaker}>${s.text}`).join('')+'\n';
+ $('metrics').textContent=`已处理 ${row.end_seconds.toFixed(2)} 秒 · 本轮耗时 ${row.generation_seconds.toFixed(3)} 秒 · RTF ${row.realtime_factor?.toFixed(2)??'—'} · 待核验音频 ${row.unverified_audio_seconds.toFixed(1)} 秒 · 客户端积压 ${(queue.length*step/16000).toFixed(1)} 秒`;
+ if(row.event==='end_of_audio'){status('本次流结束');await cleanup();}else transmit();}
+ else if(row.type==='control_ack'){busy=false;transmit();}
+ else if(row.type==='control_error'){busy=false;status('核验未接受：'+row.error);transmit();}
+ else if(row.type==='error'){failed=true;status('停止：'+row.error);await cleanup();socket.close();}};
+ socket.onclose=()=>{if(!failed&&(!ended||busy))status('连接已结束；未确认音频不能视为已处理，请保存事件记录。');cleanup();};
+ socket.onerror=()=>status('连接错误，请查看服务端日志。');
+ }catch(e){status(e.message);await cleanup();}};
+$('stop').onclick=()=>stopCapture();
+function control(event){if(!socket||socket.readyState!==1||busy||queue.length){status('请在本轮返回且无积压时提交核验信息。');return;}busy=true;socket.send(JSON.stringify({type:'control',...event}));}
+$('commit').onclick=()=>{if(!$('through').value)return;control({op:'commit',through_seconds:Number($('through').value),verified:true});};
+$('reference').onclick=()=>{if(!$('verified').checked){status('先核验声音参照。');return;}control({op:'reference',speaker:$('speaker').value,language:$('language').value,text:$('referenceText').value,start:Number($('refStart').value),end:Number($('refEnd').value),verified:true,clean:true,overlap:false});};
+$('save').onclick=()=>{const url=URL.createObjectURL(new Blob([rows.map(x=>JSON.stringify(x)).join('\n')+'\n'],{type:'application/x-ndjson'}));const a=document.createElement('a');a.href=url;a.download='omnicommit-session.jsonl';a.click();URL.revokeObjectURL(url);};
+</script></html>
