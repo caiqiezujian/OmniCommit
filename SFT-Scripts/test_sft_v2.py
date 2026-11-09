@@ -49,6 +49,22 @@ def test_eos_releases_pending_without_extra_audio(tmp_path):
     assert metrics["audio_turns"] == 6
 
 
+def test_minimal_audios_messages_pass_train_preflight_without_losing_validation(tmp_path):
+    row = example(tmp_path)
+    prepared, tokens = prepare_row(row)
+    compact = {"audios": prepared["audios"], "messages": prepared["messages"]}
+    checked = check_row(compact, decode=True, token_inventory=tokens)
+    assert checked["audio_turns"] == 6 and checked["eos_turns"] == 1
+    damaged = copy.deepcopy(compact)
+    damaged["messages"][-2]["content"] = "<audio>"
+    with pytest.raises(ValueError, match="end_of_audio"):
+        check_row(damaged, decode=False, token_inventory=tokens)
+    damaged = copy.deepcopy(compact)
+    damaged["audios"] = damaged["audios"][1:]
+    with pytest.raises(ValueError, match="Expected system"):
+        check_row(damaged, decode=False, token_inventory=tokens)
+
+
 def test_full_meeting_ids_match_stream_registry_without_silent_remap(tmp_path):
     row = example(tmp_path)
     row["turns"][0]["segments"][0]["speaker"] = "spk3"

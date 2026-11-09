@@ -42,6 +42,17 @@ def check_row(row, decode=True, token_inventory=None):
     import soundfile as sf
     from omnicommit.runtime_protocol import speaker_reference_text, LIVE_AUDIO_PREFIX
 
+    # Compact, directly trainable rows produced by build_asr_sft.py contain only
+    # audios/messages.  Virtual refs already carry their exact input durations,
+    # so derive those solely for preflight; never modify the dataset or infer
+    # speaker references/windows that the compact row does not describe.
+    if isinstance(row, dict) and set(row) == {"audios", "messages"}:
+        refs = row.get("audios")
+        if not isinstance(refs, list) or not refs:
+            raise ValueError("audios must be a nonempty array of virtual references")
+        row = dict(row, schema_version=2,
+                   audio_chunk_durations=[decode_chunk_ref(ref)["input_seconds"] for ref in refs])
+
     if not isinstance(row, dict) or row.get("schema_version") not in (1, 2):
         raise ValueError("Expected a schema_version=1 or 2 SFT object")
     refs, durations, messages = (row.get(k) for k in ("audios", "audio_chunk_durations", "messages"))

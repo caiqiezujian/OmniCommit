@@ -6,7 +6,7 @@
 
 本版本提供文本标注与真实音频教师两条数据路线，包含时间戳对齐、0.5/1 秒标签重构、安全拆窗、SFT、模型导出、流式推理和 Web 入口。没有附带真实语音数据、教师服务或模型权重。CPU 测试与模拟回放不能替代真实服务及 GPU 训练验收。
 
-**当前文本教师一次调用路线，请按 [完整执行手册](docs/RUNBOOK_ZH.md) 操作**：从云道标注一直到 tokenizer/权重导出和 Web，提供逐步命令。阶段细节见 [对齐与重构](docs/alignment_and_recast.md)、[SFT](SFT-Scripts/README.md)、[流式服务](docs/streaming_runtime.md)。下面保留原音频教师路线作为独立对照，不需要两条路线都执行。
+**已有行内时间戳的标注数据**：使用 [时间戳直接生成 SFT](docs/timestamped_to_sft_zh.md)，一条命令完成重铸、过滤和精简输出，再完成音频与真实模板长度检查。其他输入请按 [完整执行手册](docs/RUNBOOK_ZH.md) 操作。阶段细节见 [对齐与重构](docs/alignment_and_recast.md)、[SFT](SFT-Scripts/README.md)、[流式服务](docs/streaming_runtime.md)。下面保留原音频教师路线作为独立对照，不需要两条路线都执行。
 
 ## 目录与流程
 
@@ -104,7 +104,7 @@ bash SFT-Scripts/train_sft.sh \
 
 旧驱动环境可沿用 `--compat-old-driver`，具体环境前提与检查见 [SFT 说明](SFT-Scripts/README.md)。默认不升级 torch、Transformers、SWIFT 或 CUDA。新增 token、真实模板编码、packing、模型保存和加载必须在目标机器用少量数据先验收；本地 CPU 测试不加载模型权重。
 
-长会话可能超过4096训练token，需要检查实际模板编码长度；不能直接把截断后的片段称为完整会话训练。新版文本路线提供安全拆窗与因果说话人参照；不同录音之间不能凭相同 spk 编号合并身份，真实跨长间隔声纹一致性仍需模型验收。
+长会话可能超过4096训练token，需要检查实际模板编码长度；不能直接把截断后的片段称为完整会话训练。旧的分阶段文本路线提供安全拆窗与因果说话人参照；新的精简输出不保留拆窗所需元数据，不能直接用 `prepare_windows.py` 拆窗。不同录音之间不能凭相同 spk 编号合并身份，真实跨长间隔声纹一致性仍需模型验收。
 
 ## 研究定位
 

@@ -111,6 +111,112 @@ def test_prefixed_direct_releases_previous_wait_without_repeating_source(tmp_pat
     assert emitted(output) == "请联系张伟确认方案。"
 
 
+def test_wait_must_hold_until_following_direct_completes(tmp_path):
+    row = source(tmp_path, [("<zh><spk1>请联系", "DIRECT"), ("张伟", "WAIT"),
+                            ("<zh><spk1>确认方案。", "DIRECT")],
+                 2, raw="<zh><spk1>请联系张伟确认方案。")
+    aligned = alignment.align_annotation(row, timed(("请联系", 50, 300), ("张伟", 400, 850),
+                                                   ("确认方案", 1150, 1900)))
+    result = recast.recast_row(aligned)
+    assert [t['action'] for t in result['turns']] == ['DIRECT', 'WAIT', 'WAIT', 'DIRECT', 'WAIT']
+    assert result['turns'][2]['provenance']['held_for_source_direct'] is True
+    assert result['turns'][3]['segments'][0]['text'] == '张伟确认方案。'
+    assert result['turns'][2]['safe_cut'] is False
+
+
+def test_switch_is_gated_at_start_not_completion_and_not_fired_twice(tmp_path):
+    row = source(tmp_path, [("<zh><spk1>我同意。", "DIRECT"), ("<en><spk2>Yes, ", "WAIT"),
+                            ("<en><spk2>proceed.", "DIRECT")], 1.5,
+                 raw="<zh><spk1>我同意。<en><spk2>Yes, proceed.")
+    aligned = alignment.align_annotation(row, timed(("我同意", 50, 300), ("Yes", 400, 850),
+                                                   ("proceed", 1050, 1400)))
+    turns = recast.recast_row(aligned)['turns']
+    assert [t['action'] for t in turns] == ['WAIT', 'WAIT', 'DIRECT', 'WAIT']
+    assert turns[0]['provenance']['wait_events'] == [{'source_index': 1, 'event': 'switch_onset', 'time_ms': 400.0}]
+    assert turns[1]['provenance']['wait_events'] == []
+    assert [(s['language'], s['speaker'], s['text']) for s in turns[2]['segments']] == [
+        ('zh', 'spk1', '我同意。'), ('en', 'spk2', 'Yes, proceed.')]
+
+
+def test_switch_exact_start_boundary_belongs_next_audio_chunk(tmp_path):
+    row = source(tmp_path, [("<zh><spk1>好。", "DIRECT"), ("<en><spk1>Yes. ", "WAIT"),
+                            ("<en><spk1>Proceed.", "DIRECT")], 1.5,
+                 raw="<zh><spk1>好。<en><spk1>Yes. Proceed.")
+    aligned = alignment.align_annotation(row, timed(("好", 50, 300), ("Yes", 500, 800),
+                                                   ("Proceed", 1050, 1400)))
+    turns = recast.recast_row(aligned)['turns']
+    assert [t['action'] for t in turns] == ['DIRECT', 'WAIT', 'DIRECT', 'WAIT']
+    assert turns[1]['provenance']['wait_events'][0]['event'] == 'switch_onset'
+
+
+def test_wait_without_successor_direct_is_only_released_by_eos(tmp_path):
+    row = source(tmp_path, [("<zh><spk1>请联系", "DIRECT"), ("张伟", "WAIT")], 2,
+                 raw="<zh><spk1>请联系张伟")
+    aligned = alignment.align_annotation(row, timed(("请联系", 50, 300), ("张伟", 550, 850)))
+    turns = recast.recast_row(aligned)['turns']
+    assert [t['action'] for t in turns] == ['DIRECT', 'WAIT', 'WAIT', 'WAIT', 'DIRECT']
+    assert turns[-1]['event'] == 'end_of_audio'
+    assert turns[-1]['segments'][0]['text'] == '张伟'
+
+
+def test_switch_and_numeric_wait_in_one_source_unit_is_not_double_counted(tmp_path):
+    row = source(tmp_path, [("<zh><spk1>金额是", "DIRECT"), ("<en><spk2>100 million ", "WAIT"),
+                            ("<en><spk2>dollars.", "DIRECT")], 1.5,
+                 raw="<zh><spk1>金额是<en><spk2>100 million dollars.")
+    aligned = alignment.align_annotation(row, timed(("金额是", 20, 200), ("100", 400, 600),
+                                                   ("million", 610, 1100), ("dollars", 1110, 1400)))
+    turns = recast.recast_row(aligned)['turns']
+    assert [t['action'] for t in turns] == ['WAIT', 'WAIT', 'DIRECT', 'WAIT']
+    assert turns[0]['provenance']['wait_events'][0]['event'] == 'switch_onset'
+    assert turns[1]['provenance']['wait_events'] == turns[2]['provenance']['wait_events'] == []
+    assert ''.join(s['text'] for s in turns[2]['segments']) == '金额是100 million dollars.'
+
+
+def test_overlapping_same_word_completion_does_not_publish_early(tmp_path):
+    row = source(tmp_path, [("<zh><spk1>我们", "DIRECT"), ("出", "WAIT"),
+                            ("<zh><spk1>发。", "DIRECT")], 1,
+                 raw="<zh><spk1>我们出发。")
+    # One indivisible aligned word overlaps all three source units; all must
+    # inherit its complete end rather than an invented internal timestamp.
+    aligned = alignment.align_annotation(row, timed(("我们出发", 10, 800)))
+    turns = recast.recast_row(aligned)['turns']
+    assert [t['action'] for t in turns] == ['WAIT', 'WAIT', 'DIRECT']
+    assert turns[-1]['event'] == 'end_of_audio'
+    assert turns[-1]['segments'][0]['text'] == '我们出发。'
+
+
+def test_direct_end_before_previous_wait_is_rejected_without_guessing():
+    parts = [
+        {'start_ms': 10, 'end_ms': 700, 'action': 'WAIT', 'attributed': [
+            {'language': 'zh', 'speaker': 'spk1', 'text': '张伟'}]},
+        {'start_ms': 200, 'end_ms': 600, 'action': 'DIRECT', 'attributed': [
+            {'language': 'zh', 'speaker': 'spk1', 'text': '确认'}]},
+    ]
+    row = {'schema_version': 2, 'kind': 'aligned_asr', 'status': 'ok', 'audio': '/tmp/a.wav',
+           'duration_ms': 1000, 'segments': parts, 'transcript': '<zh><spk1>张伟确认'}
+    with pytest.raises(ValueError, match='chronological'):
+        recast.recast_row(row)
+
+
+def test_internal_switch_requires_timed_attribution_not_unit_start():
+    segment = lambda start, end, action, attributed: {'start_ms': start, 'end_ms': end,
+                                                      'action': action, 'attributed': attributed}
+    parts = [segment(50, 200, 'DIRECT', [{'language': 'zh', 'speaker': 'spk1', 'text': '开始'}]),
+             segment(300, 900, 'WAIT', [{'language': 'zh', 'speaker': 'spk1', 'text': '甲'},
+                                        {'language': 'en', 'speaker': 'spk1', 'text': 'X'}]),
+             segment(1000, 1400, 'DIRECT', [{'language': 'en', 'speaker': 'spk1', 'text': ' done'}])]
+    row = {'schema_version': 2, 'kind': 'aligned_asr', 'status': 'ok', 'audio': '/tmp/a.wav',
+           'duration_ms': 1500, 'segments': parts, 'transcript': '<zh><spk1>开始甲<en><spk1>X done'}
+    with pytest.raises(ValueError, match='timed attribution_spans'):
+        recast.recast_row(row)
+    parts[1]['attribution_spans'] = [
+        {'language': 'zh', 'speaker': 'spk1', 'text': '甲', 'start_ms': 300, 'end_ms': 450},
+        {'language': 'en', 'speaker': 'spk1', 'text': 'X', 'start_ms': 700, 'end_ms': 900}]
+    turns = recast.recast_row(row)['turns']
+    assert [t['action'] for t in turns] == ['DIRECT', 'WAIT', 'DIRECT', 'WAIT']
+    assert turns[1]['provenance']['wait_events'][0]['time_ms'] == 700
+
+
 def test_direct_headers_preserve_real_language_and_speaker_switch_waits(tmp_path):
     row = source(tmp_path, [("<zh><spk1>开始。", "DIRECT"), ("<en><spk1>Please ", "WAIT"),
                             ("<en><spk1>continue.", "DIRECT"), ("<en><spk2>I ", "WAIT"),
