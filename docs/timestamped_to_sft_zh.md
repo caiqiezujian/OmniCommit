@@ -68,22 +68,20 @@ python Data-Scripts/build_asr_sft.py /data/OmniCommit/timestamped.jsonl \
 ## 4. 全量检查，再启动训练
 
 ```bash
-export TRAIN_JSONL=/data/OmniCommit/run-001/train.500ms.jsonl
-export HF_BASE=/models/qwen3_omni_original_hf
-export MCORE_BASE=/models/qwen3_omni_mcore_3.12.1
-export TRAIN_OUT=/outputs/OmniCommit/sft-001
-
 # 全量结构检查并实际解码音频；报告路径必须是新文件。
-python SFT-Scripts/audit_sft.py "$TRAIN_JSONL" --decode \
+python SFT-Scripts/audit_sft.py /data/OmniCommit/run-001/train.500ms.jsonl --decode \
   --report /data/OmniCommit/run-001/structural-audit.json
 
 # 在原 omni_ms / ms-swift 3.12.1 训练环境执行；HF 是处理器目录。
-python SFT-Scripts/audit_encoded_lengths.py "$TRAIN_JSONL" \
-  --model "$HF_BASE" --max-length 4096 \
+python SFT-Scripts/audit_encoded_lengths.py /data/OmniCommit/run-001/train.500ms.jsonl \
+  --model /models/qwen3_omni_original_hf --max-length 4096 \
   --report /data/OmniCommit/run-001/encoded-audit.json
 
 # 通过检查后，在相同训练环境启动。GPU 编号按服务器调整为四张卡。
-bash SFT-Scripts/train_sft.sh "$MCORE_BASE" "$TRAIN_JSONL" "$TRAIN_OUT" \
+bash SFT-Scripts/train_sft.sh \
+  /models/qwen3_omni_mcore_3.12.1 \
+  /data/OmniCommit/run-001/train.500ms.jsonl \
+  /outputs/OmniCommit/sft-001 \
   --gpu-ids 0,1,2,6
 ```
 

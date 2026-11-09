@@ -31,9 +31,6 @@ cd /workspace/OmniCommit
 # 以下变量每次进入一个新 shell/容器都要重新设置。
 export WORK=/data/OmniCommit/run-001
 export ANNOTATED=/data/annotations/shard_stream_output.jsonl
-export HF_BASE=/models/qwen3_omni_original_hf
-export MCORE_BASE=/models/qwen3_omni_mcore_3.12.1
-export TRAIN_OUT=/outputs/OmniCommit/sft-001
 export MERGED=/models/omnicommit-sft-001
 export DATA_ENV=/data/envs/omnicommit-data
 mkdir -p "$WORK"
@@ -225,12 +222,9 @@ python SFT-Scripts/prepare_windows.py "$WORK/full.500ms.jsonl" \
   --max-audio-seconds 20 --max-reference-seconds 5 --max-speakers 8 \
   --max-total-reference-seconds 30 \
   --speaker-references /data/verified-speaker-references.jsonl
-
-export TRAIN_JSONL="$WORK/train.500ms.jsonl"
-
-# 若是短样本直接训练，则使用这一行替代上面的 TRAIN_JSONL。
-# export TRAIN_JSONL="$WORK/full.500ms.jsonl"
 ```
+
+以下检查、训练和导出示例直接使用 `/data/OmniCommit/run-001/train.500ms.jsonl`。如果修改了 `WORK`，请同步修改这些路径。如果短样本跳过拆窗，须将这些命令中的训练数据及其 token 清单路径统一改为 `full.500ms.jsonl` 和 `full.500ms.jsonl.tokens.txt`。
 
 参照音频和编号转录只作为 user 输入，不成为 assistant 训练目标。选取的参照必须早于当前窗口，覆盖此前已出现的说话人；没有可靠参照的长会议记录会被拒绝并记日志，不使用会议后面的声音补齐。没有足够短的安全边界也会拒绝，不能从姓名中间硬截。
 
@@ -241,12 +235,12 @@ export TRAIN_JSONL="$WORK/train.500ms.jsonl"
 ## 7. 训练前完成结构、音频与真实长度检查
 
 ```bash
-python SFT-Scripts/audit_sft.py "$TRAIN_JSONL" \
+python SFT-Scripts/audit_sft.py /data/OmniCommit/run-001/train.500ms.jsonl \
   --decode --report "$WORK/structural-audit.json"
 
 # 在原有 omni_ms / ms-swift3.12.1 训练环境执行；此命令只加载处理器。
-python SFT-Scripts/audit_encoded_lengths.py "$TRAIN_JSONL" \
-  --model "$HF_BASE" --max-length 4096 \
+python SFT-Scripts/audit_encoded_lengths.py /data/OmniCommit/run-001/train.500ms.jsonl \
+  --model /models/qwen3_omni_original_hf --max-length 4096 \
   --report "$WORK/encoded-audit.json"
 ```
 
@@ -258,7 +252,9 @@ python SFT-Scripts/audit_encoded_lengths.py "$TRAIN_JSONL" \
 
 ```bash
 bash SFT-Scripts/train_sft.sh \
-  "$MCORE_BASE" "$TRAIN_JSONL" "$TRAIN_OUT" \
+  /models/qwen3_omni_mcore_3.12.1 \
+  /data/OmniCommit/run-001/train.500ms.jsonl \
+  /outputs/OmniCommit/sft-001 \
   --gpu-ids 0,1,2,6
 ```
 
@@ -273,15 +269,15 @@ bash SFT-Scripts/train_sft.sh \
 将下面 `checkpoint-3000` 替换成真实保存出的 checkpoint，不能直接把整个训练输出根目录当成 adapter。
 
 ```bash
-export ADAPTER="$TRAIN_OUT/checkpoint-3000"
-
 # 先检查 token、训练参数和张量形状；不加载完整权重合并。
-bash SFT-Scripts/merge_lora.sh "$HF_BASE" "$ADAPTER" "$MERGED" \
-  --special-tokens "$TRAIN_JSONL.tokens.txt" --gpu-ids 0 --check-only
+bash SFT-Scripts/merge_lora.sh /models/qwen3_omni_original_hf \
+  /outputs/OmniCommit/sft-001/checkpoint-3000 /models/omnicommit-sft-001 \
+  --special-tokens /data/OmniCommit/run-001/train.500ms.jsonl.tokens.txt --gpu-ids 0 --check-only
 
 # 正式合并与逐项核验。
-bash SFT-Scripts/merge_lora.sh "$HF_BASE" "$ADAPTER" "$MERGED" \
-  --special-tokens "$TRAIN_JSONL.tokens.txt" --gpu-ids 0
+bash SFT-Scripts/merge_lora.sh /models/qwen3_omni_original_hf \
+  /outputs/OmniCommit/sft-001/checkpoint-3000 /models/omnicommit-sft-001 \
+  --special-tokens /data/OmniCommit/run-001/train.500ms.jsonl.tokens.txt --gpu-ids 0
 ```
 
 最终目录含完整模型、tokenizer/processor、`omnicommit_tokens.json`、`omnicommit_tokens.txt` 和合并校验报告。程序核对 token 顺序与 ID、完整词表层及新增 token 已训练权重，不沿用 FLEX 的硬编码三个 token ID。未完成导出保留在 `.incomplete-*` 工作目录，不能当成正式模型使用；它不是备份副本。
