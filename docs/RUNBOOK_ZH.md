@@ -18,7 +18,7 @@
   → train_sft.sh：在训练前注册 token 并训练词表层
   → merge_lora.sh：合并、保留 tokenizer 和训练过的词表权重
   → stream_infer.py：离线音频流式验收
-  → serve_web.py：麦克风 Web 流式服务
+  → start_server.sh：麦克风、系统声音及音视频文件 Web 服务
 ```
 
 ## 0. 先确认环境和文件
@@ -72,6 +72,8 @@ python /path/to/annotate_asr.py
 **输入去重，输出每个 DIRECT 带完整前缀。** 同一归属也重复写；重复前缀不触发 WAIT。正文及真实归属逐项校验，允许输出补充这些正确的重复前缀。模型漏写冗余前缀时，程序在验证通过后按继承状态补齐，不再调用大模型。这里 `source_text` 只保存本片源内容；最终 SFT 的 DIRECT 才合并此前 WAIT 暂存的内容。
 
 错误、截断、正文不守恒或解析失败写 `output:""`，继续下一条。输出文件已有的成功行和失败行都会跳过，因此**换 prompt 后要使用新输出目录**；它不会自动重新处理旧版输出。没有备份步骤。
+
+需要在对齐前过滤空 `output` 和确定性协议错误时，修改 `Data-Scripts/filter_asr_output.py` 开头的 `INPUT_JSONL`、`OUTPUT_JSONL`，然后执行 `python Data-Scripts/filter_asr_output.py`。输出路径必须是新文件；通过行按原字节写出，统计过滤数并最多显示前十条原因。该脚本不校验时间戳或声学正确性，也不接受行内 `output` JSON 对象代替字符串。
 
 若旧结果的正文、切分和动作已经正确，只是后续 DIRECT 缺少重复前缀，不需要重新调用模型：
 
@@ -339,27 +341,14 @@ python tools/evaluate_stream.py \
 ## 12. 启动 Web
 
 ```bash
-python tools/serve_web.py --backend hf --model "$MERGED" \
-  --chunk-seconds 0.5 --number-format normalized \
-  --context-policy rolling --recent-seconds 12 \
-  --host 127.0.0.1 --port 7860 --max-sessions 1
-
-# 或：在原 FLEX vLLM 0.11.1 推理环境中使用可选缓存后端。
-# 与上面的 HF 命令二选一，不同时占同一个端口。
-python tools/serve_web.py --backend vllm --model "$MERGED" \
-  --chunk-seconds 0.5 --number-format normalized --context-policy rolling \
-  --tensor-parallel-size 1 --gpu-memory-utilization 0.85 \
-  --mm-processor-cache-gb 1 --host 127.0.0.1 --port 7860 --max-sessions 1
-
-# 在本地电脑另开终端，把服务器端口转到本机。
-ssh -L 7860:127.0.0.1:7860 USER@SERVER
+bash start_server.sh /models/omnicommit-sft-001
 ```
 
-本地浏览器打开 `http://127.0.0.1:7860`，开启麦克风；结束时点击“结束并提交尾部”。页面显示逐轮结果、耗时、队列和待核验时长，支持导出事件 JSONL，另有人工提交边界与说话人参照入口。
+在原 FLEX vLLM 0.11.1 推理环境中运行，默认监听 `0.0.0.0:18889`，内网浏览器打开 `http://服务器内网IP:18889`；服务不要求令牌。远程浏览器麦克风/系统声音需要受信任 HTTPS 或 localhost 隧道。页面支持音视频文件、麦克风、系统声音、逐段身份修正及 TXT/JSON 导出；实验性自动参照需要额外配置独立对齐环境，见 [会议 Web 服务说明](web_meeting_service_zh.md)。
 
 vLLM 后端同样可用于 `stream_infer.py --backend vllm` 的离线验收；不要向训练环境升级安装 vLLM。模型单卡放不下时，按实际机器显存设置 `--tensor-parallel-size`。首次部署先用短音频验证 HF 与 vLLM 的 token、音频输入和输出协议一致，再比较速度。
 
-模型只加载一份，调用串行处理，各会议的音频、编号和说话人参照隔离。输入队列有界；持续跟不上会明确停止录音并处理已接收部分，停止后的现场音频没有录入，不能误称整场会议已完整采集。远程麦克风需要 HTTPS 或上述 localhost 隧道。直接绑定公网需设置访问口令和 TLS，详见 [流式服务说明](streaming_runtime.md)。
+模型只加载一份，调用串行处理，各会议的音频、编号和说话人参照隔离。输入队列有界；持续跟不上会明确停止录音并处理已接收部分，停止后的现场音频没有录入，不能误称整场会议已完整采集。内网服务不需要访问口令；远程麦克风和系统声音需要受信任的 HTTPS 或上述 localhost 隧道，详见 [会议 Web 服务说明](web_meeting_service_zh.md)。
 
 ## 当前完成范围
 

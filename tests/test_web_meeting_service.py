@@ -1,0 +1,160 @@
+"""Web protocol integration with synthetic audio; no real model or identity claims."""
+import io
+import shutil
+import threading
+import time
+import types
+
+import numpy as np
+import pytest
+import soundfile as sf
+
+from omnicommit.streaming import DIRECT, WAIT, ReplayBackend, StreamOptions
+
+pytest.importorskip("fastapi")
+pytest.importorskip("httpx")
+from fastapi.testclient import TestClient
+from omnicommit.web_service import create_app
+
+
+def test_speaker_corrections_change_display_and_preserve_original_identity():
+    replies = [DIRECT + "<zh><spk1>你好。", DIRECT + "<en><spk2>Hi.", WAIT]
+    with TestClient(create_app(lambda: ReplayBackend(replies), StreamOptions())) as client:
+        with client.websocket_connect("/stream") as socket:
+            socket.send_json({"type": "start", "sample_rate": 16000})
+            assert socket.receive_json()["type"] == "ready"
+            for _ in range(2):
+                socket.send_bytes(np.zeros(8000, dtype="<i2").tobytes())
+                result = socket.receive_json()
+                assert result["new_segments"][0]["segment_id"] == result["turn"]
+            socket.send_json({"type": "control", "op": "rename_speaker", "speaker": "spk1", "name": "Alice"})
+            assert socket.receive_json()["snapshot"]["speakers"][0]["name"] == "Alice"
+            socket.send_json({"type": "control", "op": "correct_segment", "segment_id": 2, "speaker": "spk1"})
+            snapshot = socket.receive_json()["snapshot"]
+            assert snapshot["segments"][1]["model_speaker"] == "spk2"
+            assert snapshot["segments"][1]["display_speaker"] == "spk1"
+            socket.send_json({"type": "control", "op": "merge_speakers", "source": "spk2", "target": "spk1"})
+            assert socket.receive_json()["snapshot"]["aliases"] == {"spk2": "spk1"}
+            socket.send_json({"type": "control", "op": "reference", "speaker": "spk2",
+                              "language": "en", "text": "Hi.", "start": .5, "end": 1.,
+                              "verified": True, "clean": True, "overlap": False})
+            assert "merged" in socket.receive_json()["error"]
+            socket.send_json({"type": "end"})
+            assert socket.receive_json()["action"] == "WAIT"
+
+
+def test_optional_experimental_reference_is_wired_into_next_model_turn():
+    from omnicommit.auto_reference import QwenAutoReference
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
+    class Aligner:
+        def align(self, *, audio, text, language):
+            assert len(audio[0]) == 16000 and text == 'Hello.' and language == 'English'
+            started.set()
+            assert release.wait(2)
+            finished.set()
+            return [types.SimpleNamespace(items=[types.SimpleNamespace(text='Hello', start_time=.05, end_time=.95)])]
+    class Backend(ReplayBackend):
+        def __init__(self):
+            super().__init__([WAIT, DIRECT + '<en><spk1>Hello.'] + [WAIT] * 20)
+            self.messages = None
+        def generate(self, messages, audios):
+            self.messages = messages
+            return super().generate(messages, audios)
+    backend = Backend()
+    provider = QwenAutoReference('fake', model=Aligner())
+    with TestClient(create_app(lambda: backend, StreamOptions(), auto_reference_factory=lambda: provider)) as client:
+        assert client.get('/health').json()['automatic_reference'] == 'experimental_qwen'
+        with client.websocket_connect('/stream') as socket:
+            socket.send_json({'type': 'start', 'sample_rate': 16000})
+            assert socket.receive_json()['auto_reference'] == 'experimental_qwen'
+            audio = np.full(8000, 3000, dtype='<i2').tobytes()
+            socket.send_bytes(audio)
+            assert socket.receive_json()['action'] == 'WAIT'
+            socket.send_bytes(audio)
+            result = socket.receive_json()
+            assert result['action'] == 'DIRECT'
+            assert started.wait(2)
+            began = time.monotonic()
+            socket.send_bytes(audio)
+            assert socket.receive_json()['action'] == 'WAIT'
+            assert time.monotonic() - began < 1  # ASR continues while aligner is blocked
+            release.set()
+            assert finished.wait(2)
+            time.sleep(.02)  # allow the event-loop future to publish its result
+            socket.send_bytes(audio)
+            result = socket.receive_json()
+            assert result['automatic_reference']['status'] == 'experimental'
+            assert result['automatic_reference']['identity_verified'] is False
+            assert 'Speaker reference' in backend.messages[1]['content']  # applied before this turn
+            socket.send_bytes(audio)
+            assert socket.receive_json()['action'] == 'WAIT'
+            assert 'Speaker reference' in backend.messages[1]['content']
+            socket.send_json({'type': 'end'})
+            socket.receive_json()
+
+
+def test_reference_failure_disables_only_auto_reference_for_session():
+    class BrokenProvider:
+        def __init__(self): self.calls = 0
+        def prepare(self, ledger, result): return {}
+        def evaluate(self, snapshot):
+            self.calls += 1
+            return {'status': 'error', 'verified': False, 'error': 'missing alignment model'}
+        def apply(self, ledger, result): return result
+    provider = BrokenProvider()
+    backend = ReplayBackend([DIRECT + '<en><spk1>One.', DIRECT + '<en><spk1>Two.', WAIT])
+    with TestClient(create_app(lambda: backend, StreamOptions(), auto_reference_factory=lambda: provider)) as client:
+        with client.websocket_connect('/stream') as socket:
+            socket.send_json({'type': 'start', 'sample_rate': 16000}); socket.receive_json()
+            audio = np.zeros(8000, dtype='<i2').tobytes()
+            socket.send_bytes(audio)
+            assert socket.receive_json()['action'] == 'DIRECT'
+            time.sleep(.02)
+            socket.send_bytes(audio)
+            result = socket.receive_json()
+            assert result['action'] == 'DIRECT'
+            assert result['automatic_reference']['status'] == 'error'
+            assert provider.calls == 1
+            socket.send_json({'type': 'end'}); socket.receive_json()
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
+def test_file_upload_playback_gating_tail_and_cleanup():
+    class Recording(ReplayBackend):
+        def __init__(self):
+            super().__init__([WAIT, WAIT, WAIT, WAIT])
+            self.last = None
+        def generate(self, messages, audios):
+            self.last = audios[-1].copy() if messages[-1]["content"] != "<end_of_audio>" else None
+            return super().generate(messages, audios)
+
+    source = np.linspace(-.8, .8, 19200, dtype=np.float32)
+    file = io.BytesIO()
+    sf.write(file, source, 16000, format="WAV", subtype="PCM_16")
+    backend = Recording()
+    app = create_app(lambda: backend, StreamOptions())
+    with TestClient(app) as client:
+        upload = client.post("/api/media", content=file.getvalue())
+        assert upload.status_code == 200
+        media_id = upload.json()["media_id"]
+        with client.websocket_connect("/stream") as socket:
+            socket.send_json({"type": "start", "sample_rate": 16000,
+                              "source_kind": "file", "media_id": media_id})
+            assert socket.receive_json()["type"] == "ready"
+            socket.send_json({"type": "file_next", "release_seconds": .49})
+            assert socket.receive_json()["type"] == "file_wait"
+            socket.send_json({"type": "file_next", "release_seconds": .5})
+            assert socket.receive_json()["end_seconds"] == .5
+            assert np.max(np.abs(backend.last - source[:8000])) < .0001
+            socket.send_json({"type": "file_next", "release_seconds": 1.15, "final": True})
+            assert socket.receive_json()["end_seconds"] == 1.0
+            socket.send_json({"type": "file_next", "release_seconds": 1.15, "final": True})
+            result = socket.receive_json()
+            assert result["end_seconds"] == 1.15
+            assert np.max(np.abs(backend.last[:2400] - source[16000:18400])) < .0001
+            assert np.all(backend.last[2400:] == 0)  # final tail is padded only in memory
+            socket.send_json({"type": "file_next", "release_seconds": 1.15, "final": True})
+            assert socket.receive_json()["type"] == "file_done"
+            socket.send_json({"type": "end"})
+            assert socket.receive_json()["event"] == "end_of_audio"
+        assert media_id not in app.state.media_store.uploads

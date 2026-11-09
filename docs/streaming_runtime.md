@@ -70,11 +70,11 @@ python tools/stream_infer.py /data/long-meeting.wav \
 
 参照音频与带编号的转录放在输入侧，在首个保留的 live user 消息之前明确标成
 “只用于身份参照”。历史滚动不删除参照。同一人换语言仍使用原编号。
-模型输出的一个 spk 标签不是独立的身份置信度，本实现不凭这一个结果自动污染参照。
+单个模型 spk 标签不是独立的身份置信度。Web 还提供可选的 Qwen 强制对齐实验性自动参照：它利用模型输出和已听音频挑选候选，但**不验证身份或重叠**，不是人工或外部独立核验结果。默认关闭，详见[会议 Web 服务说明](web_meeting_service_zh.md)。
 
 `StreamSession.verify_commit()` 的语义是：**该时间之前的全部语音都已经提交且没有
 剩余未提交的实体或数字**。只找到一个晚出现的词的时间戳不满足这个条件。
-开发者可以将真实外部验证器的结果传给这两个 API；当前没有内置自动声纹确认模型。
+开发者可以将真实外部验证器的结果传给这两个 API；当前没有内置自动声纹确认模型。实验性 Qwen 时间对齐不会自动成为可信的提交边界。
 
 CLI 支持按时间调度可信控制 JSONL，用于“无参照/人工正确参照”的因果对照实验：
 
@@ -94,35 +94,32 @@ python tools/stream_infer.py /data/meeting.wav \
 ```
 
 事件按 `after_seconds` 非递减排序，在对应音频处理完成后才应用。超出音频结尾的事件
-报错。该接口提供对照验证与外部验证器集成，不代表已有自动高质量缓存选择器。
+报错。该 CLI 可信控制接口提供对照验证与外部验证器集成；Web 可选实验性缓存不能作为高质量身份确认。
 
 ## 4. 启动 Web
 
-```bash
-python tools/serve_web.py --model /outputs/omnicommit-merged \
-  --chunk-seconds 0.5 --number-format normalized \
-  --context-policy rolling --host 127.0.0.1 --port 7860 --max-sessions 1
-```
-
-浏览器访问 `http://127.0.0.1:7860`。远程服务器最简单的方式是本地 SSH 端口转发：
+FLEX 风格的启动方式、文件/系统音频、说话人修正和实验性自动参照见
+[会议 Web 服务说明](web_meeting_service_zh.md)。服务不要求访问口令。
 
 ```bash
-ssh -L 7860:127.0.0.1:7860 USER@SERVER
+bash start_server.sh /outputs/omnicommit-merged
 ```
 
-网页通过 AudioWorklet 采集 16 kHz PCM；浏览器如不能提供所需采样率会明确提示。
-点击“结束并提交尾部”会先发送残余短块，再发送文本 EOS。
+默认使用 vLLM、0.5 秒块、normalized、rolling、一个会话，绑定 `0.0.0.0:18889`，直接访问 `http://服务器内网IP:18889`，不使用令牌。文件上传、系统声音和实验性自动参照的具体配置见 [会议 Web 服务说明](web_meeting_service_zh.md)。
+
+网页通过 AudioWorklet 采集麦克风或系统声音为 16 kHz PCM；浏览器如不能提供所需采样率会明确提示。文件上传后服务器先保留源采样率解码，再根据播放进度裁剪并逐块重采样；压缩格式自身解码前瞻及音画同步需实测。
+点击“结束并处理尾部”会先发送残余短块，再发送文本 EOS。
 服务端同一模型只有一个串行 worker，会话状态、编号、声音缓存分别管理；默认只接受
 一个并发会话，多个模型调用不会争抢同一会话的状态。
 
 客户端逐轮等待确认，最多允许约 10 秒积压。推理持续跟不上时明确停止采集并处理
 已接收音频；停止后的现场语音不会被记录。这个保护防止无界增长，不能替代达标的硬件速度。
-页面显示已处理音频位置、单轮耗时、RTF、积压和待核验秒数，支持下载事件 JSONL。
-“人工核验与说话人参照”面板直接调用上述可信控制接口。
+页面显示已处理音频、单轮模型及服务耗时和积压，逐轮事件记录含 RTF 与待核验秒数；支持 TXT、完整 JSON 下载与说话人修正。
+“人工核验与说话人参照”面板直接调用上述可信控制接口。修正会清理受影响参照，但不会改写模型已接收的历史回复。
 
-如必须绑定 `0.0.0.0`，设置强随机访问口令到 `OMNICOMMIT_WEB_TOKEN` 环境变量，
-并用 HTTPS 反代或 `--ssl-certfile /path/cert.pem --ssl-keyfile /path/key.pem`。
-网页口令只在首次 WebSocket 消息提交，不放在 URL。远程普通 HTTP 无法正常申请麦克风。
+在内网绑定 `0.0.0.0` 后，知道地址的人可以直接使用，不需要输入访问口令。
+远程浏览器的麦克风和系统声音需要受信任的 HTTPS 或 localhost 隧道；
+可用 HTTPS 反代或 `--ssl-certfile /path/cert.pem --ssl-keyfile /path/key.pem`。
 
 ## 5. 性能与验证边界
 

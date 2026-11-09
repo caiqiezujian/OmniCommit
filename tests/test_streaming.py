@@ -198,27 +198,24 @@ def test_web_pcm_and_eof(tmp_path):
             assert socket.receive_json()["action"]=="DIRECT"
 
 
-def test_web_auth_and_session_isolation():
+def test_web_session_isolation_without_access_token():
     pytest.importorskip("fastapi");pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
     from omnicommit.web_service import create_app
-    app=create_app(ReplayBackend,StreamOptions(),access_token="secret",max_sessions=1)
+    app=create_app(ReplayBackend,StreamOptions(),max_sessions=1)
     with TestClient(app) as client:
-        with client.websocket_connect("/stream") as bad:
-            bad.send_json({"type":"start","sample_rate":16000,"token":"wrong"})
-            assert bad.receive_json()["type"]=="error"
         with client.websocket_connect("/stream") as first:
-            first.send_json({"type":"start","sample_rate":16000,"token":"secret"})
+            first.send_json({"type":"start","sample_rate":16000})
             assert first.receive_json()["type"]=="ready"
             with client.websocket_connect("/stream") as second:
-                second.send_json({"type":"start","sample_rate":16000,"token":"secret"})
+                second.send_json({"type":"start","sample_rate":16000})
                 assert "capacity" in second.receive_json()["error"]
             first.send_bytes(np.zeros(8000,dtype="<i2").tobytes())
             assert first.receive_json()["end_seconds"]==.5
             first.send_json({"type":"end"})
             first.receive_json()
         with client.websocket_connect("/stream") as fresh:
-            fresh.send_json({"type":"start","sample_rate":16000,"token":"secret"})
+            fresh.send_json({"type":"start","sample_rate":16000})
             assert fresh.receive_json()["type"]=="ready"
             fresh.send_bytes(np.zeros(8000,dtype="<i2").tobytes())
             assert fresh.receive_json()["start_seconds"]==0

@@ -5,7 +5,22 @@
 不依赖其他 FLEX 目录；请保留本仓库的 `omnicommit/`，SFT 和服务共用其中的
 `runtime_protocol.py`，确保系统提示、说话人参照和结束标记一致。准备和检查不调用教师模型。
 
-## 新版文本标注路线：v2、结束轮和长会议
+## 已有行内时间戳：直接生成 SFT
+
+如果原始记录已有 `audios`、`messages`、LLM `output` 和 `timestamps`，优先使用一体化构建器，无需重新调用模型或先生成轨迹文件。输入必须是一行一条 JSON 对象，音频必须在构建服务器可读：
+
+```bash
+python Data-Scripts/build_asr_sft.py /data/timestamped.jsonl \
+  --output /data/sft/train.jsonl --chunk-seconds 0.5 --number-format normalized
+```
+
+主文件每行仅含 `audios` 和 `messages`；另有 `.tokens.txt`、`.rejected.jsonl`、`.review.jsonl`。最后一个文件记录至少 2 秒的未标注区间，不能当作已验证静音；默认不因该区间拒绝数据，可用 `--max-unannotated-gap-seconds` 指定过滤阈值。异常行写入拒绝清单并继续；没有成功样本时整体返回非零。输出和伴随文件须使用新路径，一体化入口不支持中断续跑。
+
+`audios` 是逐块虚拟引用，编码了原始音频绝对路径和区间，不是实际小 WAV；训练容器必须能从相同绝对路径访问原文件。`--number-format` 只选择系统指令，不改写原始数字。重铸规则、完整输入格式和云道命令参见 [带时间戳直接生成 SFT](../docs/timestamped_to_sft_zh.md)。
+
+精简文件丢弃了 `safe_cut`、原始区间和说话人参照等离线元数据，**不能直接传给 `prepare_windows.py` 拆窗**；需要从原始标注及时间戳重新构建富元数据路线，再安全拆窗。两种路线生成的文件都必须在目标训练环境检查真实模板长度。
+
+## 分阶段文本路线：v2、结束轮和长会议
 
 新版 `recast_asr.py` 输出 `schema_version:2`：每个真实音频块为 `event:"audio"`，
 最后另有 `event:"end_of_audio"`、`start_ms == end_ms == duration_ms` 的结束轮。
@@ -108,7 +123,7 @@ Transformers 4.57.1，以及原有兼容的 Megatron/Transformer Engine/CUDA 环
 `DIRECT` 必须有非空文本段，`WAIT` 必须 `segments=[]`。
 最后一轮可以是 `WAIT`，但当前版本不接收整条全部 `WAIT` 的静音训练样本。
 语言、说话人不是动作。每个输出段都带完整 `<language><speaker>` 头；
-同一说话人换语言不更换 ID。同轮多个段以换行分隔。
+同一说话人换语言不更换 ID。上例为 v1，同轮多个段以换行分隔；v2 保留原始正文，不因归属切换额外插入换行。
 
 `policy.number_format` 支持 `verbatim`（默认，保留口语数词）或 `normalized`
 （完整数值明确后转数字）。准备器据此选择 system 提示，**不会改写监督文本**。
@@ -122,7 +137,7 @@ python SFT-Scripts/prepare_sft.py /data/trajectories.jsonl \
 相对音频路径默认相对于输入文件目录；也可传 `--audio-root /data/audio`。
 输出必须使用新路径，避免覆盖已有数据；没有备份行为。
 
-生成：
+该分阶段准备器生成（区别于上面的精简一体化输出）：
 
 - `train.jsonl`：`audios + messages`，另保留区间、源 ID、数词策略与轮次来源。
 - `train.jsonl.tokens.txt`：本数据使用的特殊 token；固定先 WAIT、DIRECT，再语言和说话人。
@@ -157,7 +172,12 @@ python SFT-Scripts/check_sft.py /data/sft/train.jsonl --rows 2
 python SFT-Scripts/audit_sft.py /data/sft/train.jsonl \
   --decode --report /data/sft/audit.json
 
-# 在现有训练容器中启动
+# 在原 omni_ms / ms-swift 3.12.1 训练环境检查完整模板编码长度
+python SFT-Scripts/audit_encoded_lengths.py /data/sft/train.jsonl \
+  --model /models/qwen3_omni_original_hf \
+  --max-length 4096 --report /data/sft/encoded-audit.json
+
+# 全量检查通过后，在现有训练容器中启动
 bash SFT-Scripts/train_sft.sh \
   /models/qwen3_omni_mcore_3.12.1 \
   /data/sft/train.jsonl \
@@ -168,11 +188,13 @@ bash SFT-Scripts/train_sft.sh \
 训练入口先抽查两个样本并导入框架插件。原配方保持四进程、EP=2、LoRA r8/alpha32、
 micro/global batch=4/16、lr=1e-4、3 epochs、packing、max_length=4096、
 每 3000 步保存未合并适配器；音频/视觉与 aligner 冻结，LLM 训练。
+这里 3000 步与 FLEX 虚拟音频脚本一致；FLEX 更早的原始脚本为 1000 步。默认 `--no_save_optim true --no_save_rng true`，不保存完整优化器和随机状态，不能保证精确断点续训。
 保留 `modules_to_save word_embeddings output_layer`，以保存新特殊 token 的完整词表层。
 不启用语音输出分支。长会话应提前在真实 tokenizer/框架里检查长度，抽样音频检查
 不等于 token 长度验收；不能随意截掉后半轮次后仍声称保留完整轨迹。
 
 token 文件默认使用 `TRAIN_JSONL.tokens.txt`，也可传 `--tokens-file FILE`。
+一体化构建器在输入处理结束后才写 token 清单；如果任务异常中断，可能存在不完整 JSONL 而没有清单，不应直接当作完整训练集。检查工具不会过滤 JSONL，报告默认只保留前 100 个错误详情。
 多数据分片训练必须使用包含全部分片标签的同一份固定 token 表。
 继续训练、导出和推理时要保存并沿用训练时的 token 顺序、tokenizer 和基座版本；
 不要在已有适配器上重新排序或随意换一份 token 表。

@@ -1,6 +1,23 @@
-# 音频教师制数
+# 数据构建脚本
 
-当前的一次文本教师路线使用 `annotate_asr.py → force_align_asr.py/外部时间戳 → align_asr.py → recast_asr.py`，请见 [完整执行手册](../docs/RUNBOOK_ZH.md) 和 [对齐与重构](../docs/alignment_and_recast.md)。以下保留独立的音频教师前缀路线，二者不是必须串行执行的步骤。
+当前主线使用带语种和说话人转录的音频数据，调用一次文本教师做细切分与 `WAIT/DIRECT` 标注，获取真实音频时间戳，再一次性生成精简的流式 SFT 数据。完整输入和训练行样例见 [数据格式](../docs/data-format.md)。
+
+1. `annotate_asr.py`：原始 `audios/messages` → `output` JSON 字符串；十二语种 prompt 内置，每条请求一次。坏输入、接口或输出校验失败时 `output` 为空并继续；不直接对音频产生时间戳。
+2. `filter_asr_output.py`：按脚本开头的 `INPUT_JSONL`、`OUTPUT_JSONL` 过滤标注错误行。脚本参数写死、输出必须是新文件；检查格式和一致性不能证明文本和标签的声学准确性。
+3. 获取实际对齐时间戳：如使用项目的分阶段对齐器或已有外部结果，参照 [对齐与重构](../docs/alignment_and_recast.md)。带行内 `timestamps` 的数据可直接使用下一步，不要重复运行对齐。
+4. `build_asr_sft.py`：对带 `output/timestamps` 的每行读取原音频时长、校验、按 0.5/1 秒重铸并输出只有 `audios/messages` 的训练行，配套 `.tokens.txt`、`.rejected.jsonl` 和 `.review.jsonl`。坏行继续，所有行无效时非零返回，输出不覆盖且不支持中断续跑。
+
+```bash
+python Data-Scripts/build_asr_sft.py /data/timestamped.jsonl \
+  --output /data/sft/train.500ms.jsonl \
+  --chunk-seconds 0.5 --number-format normalized
+```
+
+`--number-format` 决定系统提示、不改写原文；模型输入为虚拟音频区间，训练端仍需能读取原文件。默认仅报告长未标注区间，不能把这些区间当已确认静音；可用 `--max-unannotated-gap-seconds` 选择过滤阈值。训练前还需完整解码和实际模板长度检查。运行细节见 [时间戳直接生成 SFT](../docs/timestamped_to_sft_zh.md) 和 [完整执行手册](../docs/RUNBOOK_ZH.md)。
+
+## 可选：音频教师累计前缀路线
+
+以下是独立的音频教师前缀路线，不是上述文本标注路线的必要步骤，二者不能简单串接或视为相同协议。其教师与轨迹的 `schema_version:1` 和当前一体化输出不同。
 
 本目录实现真实音频前缀识别与离线轨迹构建，和 `SFT-Scripts/` 的训练准备器衔接。请上传整个 OmniCommit 项目；脚本通过同级 `omnicommit/` 包工作，不依赖本机 FLEX 目录。
 

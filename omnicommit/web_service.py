@@ -5,10 +5,10 @@ import argparse
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-import hmac
 import json
-import os
+import logging
 from pathlib import Path
+import shutil
 import time
 from urllib.parse import urlparse
 
@@ -16,28 +16,53 @@ import numpy as np
 
 from .stream_cli import add_runtime_arguments, build_backend, runtime_options, apply_control
 from .streaming import StreamSession
+from .media import MediaCursor, MediaStore
+from .session_identity import SessionLedger
+
+LOG = logging.getLogger("omnicommit.web")
 
 
-def create_app(backend_factory, options, *, max_sessions=1, access_token=None):
-    from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-    from fastapi.responses import FileResponse
+def create_app(backend_factory, options, *, max_sessions=1,
+               auto_reference_factory=None):
+    from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+    from fastapi.responses import FileResponse, JSONResponse
     if max_sessions < 1:
         raise ValueError("max_sessions must be positive")
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="omnicommit-model")
+    reference_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="omnicommit-reference")
     active = set()
     backend = None
+    reference_provider = None
+    media_store = MediaStore(max_slots=max(2, max_sessions * 2))
 
     @asynccontextmanager
     async def lifespan(app):
-        nonlocal backend
+        nonlocal backend, reference_provider
+        async def expire_uploads():
+            while True:
+                await asyncio.sleep(60)
+                media_store.expire()
+        expiry_task = None
         try:
             backend = await asyncio.get_running_loop().run_in_executor(executor, backend_factory)
+            if auto_reference_factory is not None:
+                reference_provider = auto_reference_factory()
+            expiry_task = asyncio.create_task(expire_uploads())
             yield
         finally:
+            if expiry_task is not None:
+                expiry_task.cancel()
+                await asyncio.gather(expiry_task, return_exceptions=True)
             # In-flight generation finishes before shutdown; no model racing.
             executor.shutdown(wait=True, cancel_futures=True)
+            reference_executor.shutdown(wait=True, cancel_futures=True)
+            reference_model = getattr(reference_provider, "model", None)
+            if hasattr(reference_model, "close"):
+                reference_model.close()
+            media_store.close()
 
     app = FastAPI(lifespan=lifespan)
+    app.state.media_store = media_store
 
     @app.get("/")
     async def index():
@@ -51,7 +76,39 @@ def create_app(backend_factory, options, *, max_sessions=1, access_token=None):
                 "backend": type(backend).__name__ if backend else None,
                 "native_prefix_caching": type(backend).__name__ == "VLLMBackend",
                 "native_mm_processor_cache": type(backend).__name__ == "VLLMBackend",
-                "manual_kv_reuse": False}
+                "manual_kv_reuse": False, "file_input": bool(shutil.which("ffmpeg")),
+                "automatic_reference": "experimental_qwen" if reference_provider is not None else "disabled"}
+
+    async def upload_media(request):
+        origin = request.headers.get("origin")
+        if origin and urlparse(origin).netloc != request.headers.get("host"):
+            return JSONResponse({"error": "Cross-origin upload denied"}, status_code=403)
+        upload = None
+        decode_task = None
+        try:
+            upload = media_store.reserve()
+            async for chunk in request.stream():
+                upload.append(bytes(chunk))
+            # Do not delete files while a cancelled FFmpeg worker is still using them.
+            decode_task = asyncio.create_task(asyncio.to_thread(upload.decode))
+            result = await asyncio.shield(decode_task)
+            return JSONResponse(result)
+        except asyncio.CancelledError:
+            if decode_task is not None:
+                try:
+                    await asyncio.shield(decode_task)
+                except Exception:
+                    pass
+            if upload is not None:
+                media_store.discard(upload.media_id)
+            raise
+        except Exception as exc:
+            if upload is not None:
+                media_store.discard(upload.media_id)
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
+    upload_media.__annotations__["request"] = Request
+    app.post("/api/media")(upload_media)
 
     # Avoid postponed annotation resolving a function-local WebSocket import.
     async def stream(websocket):
@@ -61,28 +118,67 @@ def create_app(backend_factory, options, *, max_sessions=1, access_token=None):
             return
         await websocket.accept()
         session = None
+        ledger = None
+        cursor = None
+        upload = None
+        auto_reference_failed = False
+        reference_task = None
+        reference_started = None
+        pending_evidence = None
+        pending_reference_seconds = None
         task = None
         admitted = False
+
+        def collect_reference():
+            nonlocal reference_task, auto_reference_failed, pending_evidence, pending_reference_seconds
+            if reference_task is None or not reference_task.done():
+                return
+            try:
+                evidence = reference_provider.apply(ledger, reference_task.result())
+            except Exception as exc:
+                evidence = {"status": "error", "verified": False, "error": str(exc)}
+            pending_reference_seconds = time.perf_counter() - reference_started
+            reference_task = None
+            if evidence is not None:
+                pending_evidence = evidence
+                if evidence.get("status") == "error":
+                    auto_reference_failed = True
+                    LOG.warning("Automatic reference disabled for session: %s", evidence.get("error"))
         try:
             init = await asyncio.wait_for(websocket.receive_json(), timeout=10)
-            if access_token and not hmac.compare_digest(str(init.get("token", "")), access_token):
-                raise ValueError("Authentication failed")
             if init.get("type") != "start" or init.get("sample_rate") != 16000:
                 raise ValueError("Start requires sample_rate=16000; send mono PCM16 little-endian")
             if len(active) >= max_sessions:
                 raise ValueError("Service session capacity reached; no audio accepted")
+            source_kind = init.get("source_kind", "microphone")
+            if source_kind not in ("microphone", "system", "file"):
+                raise ValueError("Unknown audio source")
+            if source_kind == "file":
+                upload = media_store.claim(init.get("media_id"))
+                cursor = MediaCursor(upload)
             session = StreamSession(backend, options)
+            ledger = SessionLedger(session)
             active.add(session)
             admitted = True
             await websocket.send_json({"type": "ready", "chunk_seconds": options.chunk_seconds,
                 "context_policy": options.context_policy, "backend": type(backend).__name__,
-                "warning": "Rolling mode is an unverified tail heuristic" if options.context_policy == "rolling" else "Verified watermarks required before safe context eviction"})
+                "warning": "Rolling mode is an unverified tail heuristic" if options.context_policy == "rolling" else "Verified watermarks required before safe context eviction",
+                "automatic_reference": "experimental_qwen" if reference_provider is not None else "disabled",
+                "auto_reference": "experimental_qwen" if reference_provider is not None else "disabled"})
             while True:
-                packet = await asyncio.wait_for(websocket.receive(), timeout=120)
+                # A user may pause file playback for longer than two minutes.
+                # Live capture keeps an inactivity limit; files wait for an
+                # explicit resume/end or a transport disconnect.
+                packet = await websocket.receive() if cursor is not None else await asyncio.wait_for(websocket.receive(), timeout=120)
                 if packet.get("type") == "websocket.disconnect":
                     break
+                # Apply a finished reference before building the next model prompt.
+                # This is a serial point: no session.step is running for this session.
+                collect_reference()
                 binary = packet.get("bytes")
                 if binary is not None:
+                    if cursor is not None:
+                        raise ValueError("File sessions accept only playback-gated server audio")
                     if not binary or len(binary) % 2 or len(binary) > round(options.chunk_seconds * 16000) * 2:
                         raise ValueError("Invalid PCM16 chunk byte length")
                     pcm = np.frombuffer(binary, dtype="<i2").astype(np.float32) / 32768.0
@@ -90,14 +186,46 @@ def create_app(backend_factory, options, *, max_sessions=1, access_token=None):
                 else:
                     event = json.loads(packet.get("text", ""))
                     if event.get("type") == "end":
+                        if cursor is not None and not cursor.finished:
+                            raise ValueError("Drain the played file audio before ending")
                         call = lambda: session.step(end_of_audio=True)
+                    elif event.get("type") == "file_next":
+                        if cursor is None:
+                            raise ValueError("file_next requires an uploaded file session")
+                        # File I/O and scipy resampling should not block other
+                        # sockets. Wait for this worker before closing its file.
+                        task = asyncio.create_task(asyncio.to_thread(cursor.next_chunk,
+                            event.get("release_seconds"), options.chunk_seconds,
+                            final=event.get("final", False)))
+                        raw = await asyncio.shield(task)
+                        task = None
+                        if raw is None:
+                            await websocket.send_json({"type": "file_done" if cursor.finished else "file_wait"})
+                            continue
+                        pcm = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+                        call = lambda: session.step(pcm)
                     elif event.get("type") == "control":
                         try:
-                            apply_control(session, event)
+                            op = event.get("op")
+                            if op == "correct_segment":
+                                snapshot = ledger.correct_segment(event["segment_id"], event["speaker"])
+                                pending_evidence = None
+                            elif op == "merge_speakers":
+                                snapshot = ledger.merge_speakers(event["source"], event["target"])
+                                pending_evidence = None
+                            elif op == "rename_speaker":
+                                snapshot = ledger.rename_speaker(event["speaker"], event["name"])
+                            else:
+                                if op == "reference" and ledger.resolve(event.get("speaker")) != event.get("speaker"):
+                                    raise ValueError("Reference speaker was merged; use the canonical speaker ID")
+                                apply_control(session, event)
+                                if op == "reference":
+                                    ledger.reference_evidence.pop(event.get("speaker"), None)
+                                snapshot = ledger.snapshot()
                         except Exception as exc:
                             await websocket.send_json({"type": "control_error", "error": str(exc)})
                         else:
-                            await websocket.send_json({"type": "control_ack", "op": event["op"]})
+                            await websocket.send_json({"type": "control_ack", "op": event["op"], "snapshot": snapshot})
                         continue
                     else:
                         raise ValueError("Unknown message type")
@@ -111,6 +239,30 @@ def create_app(backend_factory, options, *, max_sessions=1, access_token=None):
                 # Cancellation must not free a session while its worker runs.
                 result = await asyncio.shield(task)
                 task = None
+                result["new_segments"] = ledger.record(result)
+                collect_reference()
+                if pending_evidence is not None:
+                    result["automatic_reference"] = pending_evidence
+                    pending_evidence = None
+                if pending_reference_seconds is not None:
+                    result["reference_seconds"] = pending_reference_seconds
+                    pending_reference_seconds = None
+                result["reference_speakers"] = list(session.references)
+                if (reference_provider is not None and not auto_reference_failed
+                        and reference_task is None and result["new_segments"] and result["event"] == "audio"):
+                    try:
+                        snapshot = reference_provider.prepare(ledger, result)
+                        if snapshot is not None:
+                            reference_started = time.perf_counter()
+                            reference_task = asyncio.get_running_loop().run_in_executor(reference_executor,
+                                                                                       reference_provider.evaluate, snapshot)
+                    except Exception as exc:
+                        auto_reference_failed = True
+                        LOG.warning("Automatic reference preparation failed: %s", exc)
+                        result["automatic_reference"] = {"status": "error", "verified": False, "error": str(exc)}
+                result["service_seconds"] = time.perf_counter() - submitted
+                if cursor is not None:
+                    result["file_complete"] = cursor.finished
                 await websocket.send_json(dict(result, type="result"))
                 if result["event"] == "end_of_audio":
                     break
@@ -131,6 +283,10 @@ def create_app(backend_factory, options, *, max_sessions=1, access_token=None):
                     pass
             if session:
                 session.close()
+            if reference_task is not None:
+                reference_task.cancel()
+            if upload is not None:
+                media_store.discard(upload.media_id)
             if admitted:
                 active.discard(session)
             try:
@@ -149,18 +305,37 @@ def main(argv=None):
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=7860)
     parser.add_argument("--max-sessions", type=int, default=1)
-    parser.add_argument("--token-env", default="OMNICOMMIT_WEB_TOKEN")
     parser.add_argument("--ssl-certfile")
     parser.add_argument("--ssl-keyfile")
+    parser.add_argument("--auto-reference-model", type=Path,
+                        help="Optional local Qwen3-ForcedAligner; creates unverified experimental references")
+    parser.add_argument("--auto-reference-python", type=Path,
+                        help="Python executable from the separate qwen-asr alignment environment")
+    parser.add_argument("--auto-reference-device", default="cuda:0")
+    parser.add_argument("--auto-reference-dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
+    parser.add_argument("--auto-reference-timeout", type=float, default=120,
+                        help="Maximum seconds per alignment request, including cold model loading")
     args = parser.parse_args(argv)
-    token = os.environ.get(args.token_env)
-    if args.host not in ("127.0.0.1", "localhost", "::1") and not token:
-        parser.error("Remote binding requires an access token in --token-env")
     if bool(args.ssl_certfile) != bool(args.ssl_keyfile):
         parser.error("TLS needs both certificate and private key")
+    reference_factory = None
+    if args.auto_reference_model is not None:
+        if not args.auto_reference_model.is_dir():
+            parser.error("--auto-reference-model must be an existing local model directory")
+        if args.auto_reference_python is None or not args.auto_reference_python.is_file():
+            parser.error("--auto-reference-python must be an existing separate alignment Python executable")
+        from .auto_reference import QwenAutoReference
+        from .aligner_proxy import QwenAlignerProxy
+        reference_factory = lambda: QwenAutoReference(str(args.auto_reference_model.resolve()),
+            model=QwenAlignerProxy(args.auto_reference_python, args.auto_reference_model,
+                                   device=args.auto_reference_device, dtype=args.auto_reference_dtype,
+                                   timeout_seconds=args.auto_reference_timeout))
+    elif args.auto_reference_python is not None:
+        parser.error("--auto-reference-python requires --auto-reference-model")
     import uvicorn
     app = create_app(lambda: build_backend(args), runtime_options(args),
-                     max_sessions=args.max_sessions, access_token=token)
+                     max_sessions=args.max_sessions,
+                     auto_reference_factory=reference_factory)
     uvicorn.run(app, host=args.host, port=args.port, workers=1,
                 ws_max_size=65536, ws_max_queue=4, ssl_certfile=args.ssl_certfile,
                 ssl_keyfile=args.ssl_keyfile)
