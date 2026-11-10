@@ -11,20 +11,37 @@ OmniCommit 使用 Qwen3-Omni 对增量音频进行原语言转录。每轮接收
 
 WAIT 不输出文本；DIRECT 输出尚未提交的文本，并为每段标明语种和说话人。同一个说话人切换语种时保留编号。语种或说话人变化时，DIRECT 内的新归属使用完整 `<语言><说话人>` 前缀。真实模型能否正确判断等待、语种及身份，需要实际训练和评测。
 
-本仓库包含：文本大模型一次调用的 ASR 标注、音频时间戳对齐、0.5/1 秒标签重铸、FLEX 风格音频/文本交错 SFT、模型导出、流式推理与 Web。默认示例路径均为占位路径，必须换成实际服务器路径。仓库不包含用户音频、训练数据、模型权重或线上服务。
+本仓库包含：本地 HF Omni 批量前缀推理、切换时间约束下的标签构建、旧版文本模型标注/对齐、FLEX 风格音频/文本交错 SFT、模型导出、流式推理与 Web。默认示例路径均为占位路径，必须换成实际服务器路径。仓库不包含用户音频、训练数据、模型权重或线上服务。
 
 ## 先选择当前输入
 
 | 当前已有数据 | 下一步 |
 |---|---|
-| 原始音频和完整的带语种、说话人标签的转录 | 用 `Data-Scripts/annotate_asr.py` 一次调用文本模型切分并构建初步标签，再取得声学时间戳。 |
+| 原始音频、完整带标签转录，以及仅在真实语种/说话人变化处的 `time_ms` | **当前新路线**：`collect_hf_prefixes.py` 本地批量识别，随后 `build_prefix_sft.py` 校验、过滤并直接生成 SFT。单语单人不需要变化时间戳。 |
+| 计划继续使用旧版文本模型标注路线 | 用 `Data-Scripts/annotate_asr.py` 一次调用文本模型切分并构建初步标签，再取得各单元声学时间戳。 |
 | 每行已有 `audios`、`messages`、`output`、`timestamps` | 使用 `Data-Scripts/build_asr_sft.py`，直接重铸并生成精简 SFT JSONL。 |
 | 已有精简的 SFT JSONL 和对应 `.tokens.txt` | 直接进行音频、结构和真实训练模板长度检查，之后运行 SFT。 |
 | 需要将长录音拆成训练窗口并加入说话人参照 | 使用保留中间元数据的分阶段路线；精简 JSONL 不能直接提供安全拆窗信息。 |
 
-详细字段见 [数据格式](docs/data-format.md)。与此独立的音频教师累计前缀路线仍然保留，作为另一种数据构造实验，见 [方法与边界](docs/method.md)；不需要将它接在当前文本标注流程之后。
+新路线的实际字段、批量推理、缓存恢复和逐步命令见 [本地 Omni 前缀到 SFT](docs/hf_prefix_sft_zh.md)。旧版详细字段见 [数据格式](docs/data-format.md)。原有 API 教师实验也保留，见 [方法与边界](docs/method.md)；三条路线的输入不能直接混用。
 
 ## 当前主线
+
+```text
+完整音频 + 带语种/说话人的参考转录 + 真实变化处 time_ms
+  ↓
+collect_hf_prefixes.py：HF 模型加载一次、独立前缀批量推理、查询缓存恢复
+  ├─ 同语种换人：保留累计声音上下文
+  └─ 换语种：边界处结束旧段，新语种重新累计
+  ↓
+build_prefix_sft.py：完整转录核对、局部前缀筛选、切换门控、精简 SFT
+  ↓
+audit_sft.py / audit_encoded_lengths.py → train_sft.sh → merge_lora.sh → start_server.sh
+```
+
+相同归属的重复语义标签不再决定切分；跨界块可提交旧归属的已确认尾部，新归属暂存。最终继续使用 WAIT/DIRECT 和每段完整语种/说话人头，与现有训练、导出及服务协议兼容。方法借鉴 R2T2 的前缀筛选，加入了本项目的分语种教师及切换规则，不是原样复现论文。真实 GPU 推理、声学质量和新模型效果仍需在服务器验收。
+
+以下保留旧版文本标注路线，供已有数据继续使用：
 
 ```text
 原始音频 + JSONL：audios / messages（完整转录及语言、说话人标签）
@@ -128,7 +145,7 @@ python SFT-Scripts/audit_encoded_lengths.py \
 bash SFT-Scripts/train_sft.sh \
   /models/qwen3_omni_mcore_3.12.1 \
   /data/OmniCommit/run-001/train.500ms.jsonl \
-  /outputs/OmniCommit/sft-001 \
+  /data/yb/Code/OmniCommit/outputs/sft-001 \
   --gpu-ids 0,1,2,6
 ```
 
@@ -143,8 +160,8 @@ bash SFT-Scripts/train_sft.sh \
 ```bash
 bash SFT-Scripts/merge_lora.sh \
   /models/qwen3_omni_original_hf \
-  /outputs/OmniCommit/sft-001/checkpoint-N \
-  /outputs/OmniCommit/merged \
+  /data/yb/Code/OmniCommit/outputs/sft-001/checkpoint-N \
+  /data/yb/Code/OmniCommit/outputs/merged \
   --special-tokens /data/OmniCommit/run-001/train.500ms.jsonl.tokens.txt \
   --gpu-ids 0
 ```
@@ -152,7 +169,7 @@ bash SFT-Scripts/merge_lora.sh \
 模型和网页放在同一 GPU 服务器时，使用导出的 **HF 模型目录**启动：
 
 ```bash
-bash start_server.sh /outputs/OmniCommit/merged
+bash start_server.sh /data/yb/Code/OmniCommit/outputs/merged
 ```
 
 网页默认监听 `0.0.0.0:18889`，无需访问令牌，支持麦克风、系统声音、音视频文件、实时转录、逐段修正、说话人合并/改名及 TXT/JSON 导出。远程浏览器采集麦克风或系统声音仍需要受信任的 HTTPS 或 localhost；文件模式受浏览器支持格式限制。
