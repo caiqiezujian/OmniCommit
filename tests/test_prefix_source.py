@@ -2,7 +2,7 @@ import copy
 
 import pytest
 
-from omnicommit.prefix_source import parse_source, plan_queries
+from omnicommit.prefix_source import parse_source, plan_queries, plan_span_queries
 
 
 def record(text, timestamps=None):
@@ -124,3 +124,50 @@ def test_source_grid_rounding_and_invalid_subsample_spans():
 def test_no_timestamp_marker_allowed_without_real_switch():
     with pytest.raises(ValueError, match="Inline timestamp"):
         parse_source(record("<en><spk1>A<en>[400ms]<spk1>B"), 1000)
+
+
+@pytest.mark.parametrize("step, expected", [
+    (.5, [(1200, 1400), (1400, 1500), (1400, 2000), (1400, 2500)]),
+    (.8, [(1200, 1400), (1400, 1600), (1400, 2400), (1400, 2500)]),
+    (1., [(1200, 1400), (1400, 2000), (1400, 2500)]),
+])
+def test_local_speaker_queries_use_global_phase_and_exact_full_span(step, expected):
+    source = parse_source(record("<en><spk1>AAA<spk2>B<spk1>CCC", [
+        {"time_ms": 1200}, {"time_ms": 1400}]), 2500)
+    primary_before = plan_queries(source, 2500, 1000, step)
+    local = plan_span_queries(source, 2500, 1000, step)
+    assert [(q["start_sample"], q["end_sample"]) for q in local] == expected
+    assert all(q["run_index"] == 0 for q in local)
+    assert local[0]["span_index"] == 1 and local[0]["kind"] == "full"
+    assert all(q["span_index"] == 2 for q in local[1:])
+    assert local[-1]["kind"] == "full"
+    assert len({q["query_id"] for q in primary_before + local}) == len(primary_before) + len(local)
+    assert plan_queries(source, 2500, 1000, step) == primary_before
+
+
+def test_local_queries_do_not_duplicate_language_restart_or_semantic_headers():
+    source = parse_source(record("<zh><spk1>甲<zh><spk1>乙<en><spk2>B<fr><spk3>C", [
+        {"time_ms": 1200}, {"time_ms": 1400}]), 2000)
+    assert plan_span_queries(source, 2000, 1000, .5) == []
+    single = parse_source(record("<en><spk1>A<en><spk1>B"), 1000)
+    assert plan_span_queries(single, 1000, 1000, .5) == []
+
+
+def test_local_speaker_queries_never_include_neighboring_language():
+    source = parse_source(record("<zh><spk1>甲<en><spk1>A<spk2>B<fr><spk2>C", [
+        {"time_ms": 1000}, {"time_ms": 1200}, {"time_ms": 1400}]), 2000)
+    local = plan_span_queries(source, 2000, 1000, .5)
+    assert local == [{"query_id": "span2:1200:1400", "run_index": 1, "span_index": 2,
+                      "start_sample": 1200, "end_sample": 1400, "end_ms": 1400.,
+                      "kind": "full", "kinds": ["full"]}]
+
+
+def test_local_query_rounding_matches_primary_geometry():
+    source = parse_source(record("<en><spk1>A<spk2>B", [{"time_ms": 400.4}]), 1000)
+    local = plan_span_queries(source, 1000, 1000, .5)
+    assert [(q["start_sample"], q["end_sample"]) for q in local] == [(400, 500), (400, 1000)]
+    with pytest.raises(ValueError, match="duration"):
+        plan_span_queries(source, 900, 1000, .5)
+    tiny = parse_source(record("<en><spk1>A<spk2>B", [{"time_ms": .1}]), 1000)
+    with pytest.raises(ValueError, match="collapse"):
+        plan_span_queries(tiny, 1000, 1000, .5)

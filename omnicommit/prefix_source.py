@@ -3,7 +3,8 @@
 All times are milliseconds relative to the sole ``audios`` file. Text offsets
 refer to Python Unicode characters, not UTF-8 bytes. Repeated attribute headers
 are merely old semantic boundaries: they neither reset the teacher nor create
-switches. The teacher restarts only at a real language change.
+switches. Primary teacher queries restart only at a real language change;
+auxiliary local queries can recover later speakers without rewriting that track.
 """
 from __future__ import annotations
 
@@ -243,4 +244,43 @@ def plan_queries(source, duration_samples, sample_rate, chunk_seconds):
             result.append({"query_id": f"run{run['index']}:{start}:{endpoint}",
                            "run_index": run["index"], "start_sample": start, "end_sample": endpoint,
                            "end_ms": endpoint * 1000.0 / sample_rate, "kind": kind, "kinds": sorted(kinds)})
+    return result
+
+
+def plan_span_queries(source, duration_samples, sample_rate, chunk_seconds):
+    """Plan auxiliary local prefixes after same-language speaker boundaries.
+
+    Primary language-run queries retain their context. These independent extra
+    hypotheses let later attributed spans recover when an earlier missed word
+    makes the cumulative hypothesis disagree with the full reference. A span
+    beginning at the language-run start already has equivalent primary queries
+    and is not duplicated. All coordinates use the same source sample rounding.
+    """
+    # Keep the primary schedule and validation unchanged for legacy traces.
+    plan_queries(source, duration_samples, sample_rate, chunk_seconds)
+    step = round(chunk_seconds * sample_rate)
+    global_ends = list(range(step, duration_samples, step)) + [duration_samples]
+    result = []
+    for span_index, span in enumerate(source["spans"]):
+        runs = [run for run in source["language_runs"]
+                if run["char_start"] <= span["char_start"] < span["char_end"] <= run["char_end"]
+                and run["language"] == span["language"]]
+        if len(runs) != 1:
+            raise ValueError("Attributed span must belong to exactly one language run")
+        run = runs[0]
+        start = round(span["start_ms"] * sample_rate / 1000)
+        end = round(span["end_ms"] * sample_rate / 1000)
+        if start == round(run["start_ms"] * sample_rate / 1000):
+            continue
+        if not round(run["start_ms"] * sample_rate / 1000) < start < end <= round(run["end_ms"] * sample_rate / 1000):
+            raise ValueError("Local speaker query is outside its language run")
+        endpoints = {value: {"prefix"} for value in global_ends if start < value <= end}
+        endpoints.setdefault(end, set()).add("full")
+        for endpoint, kinds in sorted(endpoints.items()):
+            result.append({"query_id": f"span{span_index}:{start}:{endpoint}",
+                           "run_index": run["index"], "span_index": span_index,
+                           "start_sample": start, "end_sample": endpoint,
+                           "end_ms": endpoint * 1000.0 / sample_rate,
+                           "kind": "full" if "full" in kinds else "prefix",
+                           "kinds": sorted(kinds)})
     return result

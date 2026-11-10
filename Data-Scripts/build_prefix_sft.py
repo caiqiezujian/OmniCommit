@@ -22,13 +22,16 @@ def parser():
     p.add_argument("input", type=Path, help="collect_hf_prefixes.py trace JSONL")
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--comparison", choices=("surface", "exact"), default="surface")
+    p.add_argument("--reference-fallback", choices=("completed-spans", "off"), default="completed-spans",
+                   help="Use supplied reference as trusted supervision for completed switch spans; off keeps strict teacher agreement")
     p.add_argument("--max-wait-ratio", type=float, default=1., help="Optional filter; default reports only")
     p.add_argument("--max-eos-text-ratio", type=float, default=1., help="Optional filter; default reports only")
+    p.add_argument("--max-fallback-text-ratio", type=float, default=1., help="Optional filter on reference-supplied characters; default reports only")
     return p
 
 
 def run(args):
-    for name in ("max_wait_ratio", "max_eos_text_ratio"):
+    for name in ("max_wait_ratio", "max_eos_text_ratio", "max_fallback_text_ratio"):
         if not 0 <= getattr(args, name) <= 1:
             raise ValueError(name + " must be between 0 and 1")
     source = args.input.resolve(strict=True)
@@ -42,6 +45,7 @@ def run(args):
     inventory = set(ACTION_TOKENS)
     counts = Counter()
     language_rows, language_chars, reject_reasons = Counter(), Counter(), Counter()
+    language_fallback_chars, chunk_rows = Counter(), Counter()
     from contextlib import ExitStack
     with ExitStack() as stack:
         handles = {key: stack.enter_context(paths[key].open("x", encoding="utf-8", newline="\n"))
@@ -51,14 +55,17 @@ def run(args):
             try:
                 if error:
                     raise ValueError(error)
-                trajectory = build_trajectory(trace, args.comparison)
+                trajectory = build_trajectory(trace, args.comparison, reference_fallback=args.reference_fallback)
                 m = trajectory["metrics"]
                 wait_ratio = m["wait_turns"] / m["audio_turns"]
                 eos_ratio = m["eos_characters"] / m["total_characters"]
+                fallback_ratio = m["reference_fallback_characters"] / m["total_characters"]
                 if wait_ratio > args.max_wait_ratio:
                     raise ValueError("WAIT ratio exceeds configured maximum")
                 if eos_ratio > args.max_eos_text_ratio:
                     raise ValueError("EOS text ratio exceeds configured maximum")
+                if fallback_ratio > args.max_fallback_text_ratio:
+                    raise ValueError("Reference fallback text ratio exceeds configured maximum")
                 prepared, tokens = prepare_row(trajectory)
                 compact = {"audios": prepared["audios"], "messages": prepared["messages"]}
                 check_row(compact, decode=False, token_inventory=tokens)
@@ -84,12 +91,20 @@ def run(args):
             counts["wait_turns"] += m["wait_turns"]
             counts["eos_characters"] += m["eos_characters"]
             counts["total_characters"] += m["total_characters"]
+            counts["reference_fallback_rows"] += bool(m["reference_fallback_characters"])
+            counts["reference_fallback_spans"] += m["reference_fallback_spans"]
+            counts["reference_fallback_characters"] += m["reference_fallback_characters"]
+            counts["teacher_full_mismatch_runs"] += m["teacher_full_mismatch_runs"]
+            language_fallback_chars.update(m["language_fallback_characters"])
+            chunk_rows[str(trace["chunk_seconds"])] += 1
             language_rows.update(m["languages"])
             for turn in trajectory["turns"]:
                 for span in turn["segments"]:
                     language_chars[span["language"]] += len(span["text"])
             inventory.update(tokens)
             warnings = []
+            if m["reference_fallback_characters"]:
+                warnings.append("reference_completed_span_supervision_used")
             if wait_ratio >= .8:
                 warnings.append("at_least_80_percent_audio_turns_wait")
             if eos_ratio >= .5:
@@ -98,14 +113,19 @@ def run(args):
                 counts["review_rows"] += 1
                 write_row(handles["review"], {"line": line, "id": trace.get("id"),
                     "audio": trace["audio"], "warnings": warnings,
-                    "wait_ratio": wait_ratio, "eos_text_ratio": eos_ratio})
+                    "wait_ratio": wait_ratio, "eos_text_ratio": eos_ratio,
+                    "reference_fallback_text_ratio": fallback_ratio,
+                    "reference_fallback_events": trajectory["provenance"]["reference_fallback_events"]})
     paths["tokens"].write_text("\n".join(sort_tokens(inventory)) + "\n", encoding="utf-8")
-    summary = {"algorithm": ALGORITHM, "comparison": args.comparison, **dict(counts),
+    summary = {"algorithm": ALGORITHM, "comparison": args.comparison,
+               "reference_fallback": args.reference_fallback, **dict(counts),
                "language_rows": dict(language_rows), "language_characters": dict(language_chars),
+               "language_fallback_characters": dict(language_fallback_chars), "chunk_seconds_rows": dict(chunk_rows),
+               "reference_fallback_text_ratio": counts["reference_fallback_characters"] / max(1, counts["total_characters"]),
                "reject_reasons": dict(reject_reasons), "paths": {k: str(v) for k, v in paths.items()},
                "full_structural_check": True, "waveform_decode_checked": False,
                "real_template_length_checked": False, "acoustic_quality_verified": False,
-               "note": "Synthetic/local teacher supervision; validate switch timing and recognition by audio replay."}
+               "note": "Supplied references are operator-trusted when fallback is enabled; not independently verified acoustic truth."}
     paths["summary"].write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(summary, ensure_ascii=False), flush=True)
     return summary

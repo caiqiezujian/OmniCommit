@@ -13,9 +13,10 @@ import time
 
 from .audio import inspect_audio
 from .io import Journal, fingerprint, row_id, source_rows
-from .prefix_source import parse_source, plan_queries
+from .prefix_source import parse_source, plan_queries, plan_span_queries
 
-VERSION = "local-language-hf-prefix-v1"
+VERSION = "local-language-hf-prefix-v2"
+LOCAL_QUERY_POLICY = "later-speakers-in-language-run-v1"
 
 
 def model_signature(path):
@@ -118,6 +119,7 @@ def run(args, teacher_factory=None):
     output.parent.mkdir(parents=True, exist_ok=True)
     signature = model_signature(args.model)
     config = {"version": VERSION, "model": signature, "input": str(source_path),
+              "local_query_policy": LOCAL_QUERY_POLICY,
               "contract_code_sha256": {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
                                        for name in ("prefix_collection.py", "prefix_source.py", "prefix_hf.py")},
               "audio_root": str((args.audio_root or source_path.parent).resolve()),
@@ -168,6 +170,8 @@ def run(args, teacher_factory=None):
                 info = inspect_audio(audio, args.max_audio_seconds)
                 parsed = parse_source(record, info["duration_ms"])
                 queries = plan_queries(parsed, info["frames"], info["sample_rate"], args.chunk_seconds)
+                local_queries = plan_span_queries(parsed, info["frames"], info["sample_rate"], args.chunk_seconds)
+                all_queries = queries + local_queries
             except (ValueError, TypeError, KeyError, OSError, RuntimeError) as exc:
                 error = str(exc)
             try:
@@ -184,7 +188,8 @@ def run(args, teacher_factory=None):
                       "source_line": line, "input_hash": input_hash, "audio": str(audio) if audio else None,
                       "audio_info": info, "chunk_seconds": args.chunk_seconds,
                       "number_format": args.number_format, "teacher": {"model": signature["path"],
-                      "config_hash": config_hash, "reference_in_prompt": False}}
+                      "config_hash": config_hash, "reference_in_prompt": False,
+                      "local_query_policy": LOCAL_QUERY_POLICY}}
             if not error:
                 try:
                     pcm, rate = sf.read(str(audio), dtype="float32", always_2d=True)
@@ -194,7 +199,7 @@ def run(args, teacher_factory=None):
                     waveform_hash = hashlib.sha256(pcm.tobytes()).hexdigest()
                     result["waveform_sha256"] = waveform_hash
                     pending, responses = [], {}
-                    for q in queries:
+                    for q in all_queries:
                         key = fingerprint({"input": input_hash, "pcm": waveform_hash, "query": q})
                         prior = cache.get(key)
                         if prior is None:
@@ -242,10 +247,11 @@ def run(args, teacher_factory=None):
                     counts["queries_inferred"] += len(batch)
                     counts["real_hf_inference_executed"] = teacher_factory.__module__ == "omnicommit.prefix_hf"
                     print(f"[prefix] line={line} inferred={min(offset + len(batch), len(pending))}/{len(pending)} "
-                          f"cached={len(queries) - len(pending)}", flush=True)
+                          f"cached={len(all_queries) - len(pending)}", flush=True)
                 result["source"] = parsed
                 result["queries"] = [{**q, **responses[q["query_id"]]} for q in queries]
-                failures = [q for q in result["queries"] if q.get("error")]
+                result["local_queries"] = [{**q, **responses[q["query_id"]]} for q in local_queries]
+                failures = [q for q in result["queries"] + result["local_queries"] if q.get("error")]
                 if failures:
                     error = f"{len(failures)} teacher queries failed: {failures[0]['error']}"
             result.update(status="error" if error else "ok", error=error)

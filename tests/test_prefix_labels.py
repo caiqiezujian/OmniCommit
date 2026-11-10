@@ -133,7 +133,7 @@ def test_final_chunk_switch_flushes_only_verified_tail_at_real_eos():
     broken = deepcopy(trace)
     broken["queries"][-1]["text"] = "AAABX"
     with pytest.raises(ValueError, match="full teacher/reference mismatch"):
-        build_trajectory(broken)
+        build_trajectory(broken, reference_fallback="off")
 
 
 def test_language_switch_resets_teacher_but_not_final_student_timeline():

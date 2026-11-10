@@ -68,8 +68,8 @@ class StreamOptions:
     rolling_tail_seconds: float = 2.0
 
     def __post_init__(self):
-        if self.chunk_seconds not in (.5, 1.0):
-            raise ValueError("chunk_seconds must be 0.5 or 1.0")
+        if isinstance(self.chunk_seconds, bool) or self.chunk_seconds not in (.5, .8, 1.0):
+            raise ValueError("chunk_seconds must be 0.5, 0.8 or 1.0")
         for key in ("recent_seconds", "max_context_seconds", "max_pending_seconds",
                     "max_reference_seconds", "max_total_reference_seconds", "rolling_tail_seconds"):
             value = getattr(self, key)

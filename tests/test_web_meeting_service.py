@@ -17,6 +17,23 @@ from fastapi.testclient import TestClient
 from omnicommit.web_service import create_app
 
 
+def test_web_800ms_step_is_advertised_and_accepts_12800_samples():
+    replies = [DIRECT + "<en><spk1>Hello.", WAIT, WAIT]
+    with TestClient(create_app(lambda: ReplayBackend(replies), StreamOptions(chunk_seconds=.8))) as client:
+        with client.websocket_connect("/stream") as socket:
+            socket.send_json({"type": "start", "sample_rate": 16000})
+            ready = socket.receive_json()
+            assert ready["type"] == "ready" and ready["chunk_seconds"] == .8
+            socket.send_bytes(np.zeros(12800, dtype="<i2").tobytes())
+            first = socket.receive_json()
+            assert first["type"] == "result" and first["end_seconds"] == .8
+            socket.send_bytes(np.zeros(1600, dtype="<i2").tobytes())
+            assert socket.receive_json()["end_seconds"] == pytest.approx(.9)
+            socket.send_json({"type": "end"})
+            final = socket.receive_json()
+            assert final["event"] == "end_of_audio" and final["end_seconds"] == pytest.approx(.9)
+
+
 def test_speaker_corrections_change_display_and_preserve_original_identity():
     replies = [DIRECT + "<zh><spk1>你好。", DIRECT + "<en><spk2>Hi.", WAIT]
     with TestClient(create_app(lambda: ReplayBackend(replies), StreamOptions())) as client:

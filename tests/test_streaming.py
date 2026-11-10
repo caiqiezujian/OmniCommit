@@ -15,6 +15,25 @@ def pcm(seconds=.5):
     return np.full(round(16000*seconds), .1, dtype=np.float32)
 
 
+@pytest.mark.parametrize("step", [.5, .8, 1.0])
+def test_configured_chunk_step_and_real_short_tail(step):
+    from argparse import ArgumentParser
+    from omnicommit.stream_cli import add_runtime_arguments
+    parser = ArgumentParser()
+    add_runtime_arguments(parser)
+    assert parser.parse_args(["--chunk-seconds", str(step)]).chunk_seconds == step
+    session = StreamSession(ReplayBackend([DIRECT + "<en><spk1>First ", WAIT,
+                                           DIRECT + "<en><spk1>tail.", WAIT]),
+                            StreamOptions(chunk_seconds=step))
+    assert session.step(pcm(step))["end_seconds"] == step
+    assert session.step(pcm(step))["end_seconds"] == 2 * step
+    assert session.step(pcm(.1))["end_seconds"] == pytest.approx(2 * step + .1)
+    assert len(session.history[-1].audio) == 8000  # padding is not source time
+    final = session.step(end_of_audio=True)
+    assert final["end_seconds"] == pytest.approx(2 * step + .1)
+    assert final["event"] == "end_of_audio"
+
+
 def test_wait_and_full_attribution_parser():
     assert parse_reply(WAIT)["segments"] == []
     result = parse_reply(DIRECT + "<zh><spk1>你好。<en><spk1>Hello.\n<en><spk2>Yes.")

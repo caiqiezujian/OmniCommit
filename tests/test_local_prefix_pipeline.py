@@ -262,6 +262,10 @@ def test_same_language_speaker_switch_retains_teacher_context_and_defers_new_spe
 
     def script(language, count):
         assert language == "en"
+        if count in (3200, 11200):
+            return "Good"
+        if count == 19200:
+            return "Good day."
         if count <= 16000:
             return "Hello"
         if count <= 20800:
@@ -275,7 +279,9 @@ def test_same_language_speaker_switch_retains_teacher_context_and_defers_new_spe
     trace, = read_rows(args.output)
     assert len(trace["source"]["language_runs"]) == 1
     assert {q["start_sample"] for q in trace["queries"]} == {0}
-    assert sorted(len(wave) for batch in calls for _, wave in batch) == [8000, 16000, 20800, 24000, 32000, 40000]
+    assert sorted(len(wave) for batch in calls for _, wave in batch) == [
+        3200, 8000, 11200, 16000, 19200, 20800, 24000, 32000, 40000]
+    assert {q["start_sample"] for q in trace["local_queries"]} == {20800}
     trajectory = build_trajectory(trace)
     cross = trajectory["turns"][2]
     assert cross["action"] == "DIRECT" and cross["segments"] == [
@@ -283,6 +289,50 @@ def test_same_language_speaker_switch_retains_teacher_context_and_defers_new_spe
     assert trajectory["turns"][3]["segments"] == [
         {"language": "en", "speaker": "spk2", "text": " Good "}]
     assert "".join(s["text"] for turn in trajectory["turns"] for s in turn["segments"]) == "Hello there. Good day."
+
+
+@pytest.mark.parametrize("step", [.5, .8, 1.0])
+def test_short_switch_fallback_export_and_audio_grid(tmp_path, sft_modules, step):
+    args, _ = make_job(tmp_path, seconds=2.,
+        text="<zh><spk1>甲乙<en><spk1>B<fr><spk1>CCC",
+        timestamps=[{"time_ms": 1200}, {"time_ms": 1400}])
+    args.chunk_seconds = step
+
+    def script(language, count):
+        if language == "zh":
+            return "甲" if count < 19200 else "甲乙"
+        if language == "en":
+            return ""  # Completed, successful decode; teacher cannot recognize B.
+        return "C" if count < 9600 else "CCC"
+
+    teacher, _, _ = fake_teacher(script)
+    run(args, teacher_factory=teacher)
+    trace, = read_rows(args.output)
+    train = tmp_path / f"train.{step}.jsonl"
+    process = subprocess.run([sys.executable, "-X", "utf8", str(ROOT / "Data-Scripts" / "build_prefix_sft.py"),
+                              str(args.output), "--output", str(train)], cwd=ROOT,
+                             capture_output=True, text=True, encoding="utf-8", timeout=60)
+    assert process.returncode == 0, process.stdout + process.stderr
+    compact, = read_rows(train)
+    trajectory, = read_rows(Path(str(train) + ".trajectory.jsonl"))
+    assert trajectory["policy"]["chunk_seconds"] == step
+    assert "".join(s["text"] for t in trajectory["turns"] for s in t["segments"]) == "甲乙BCCC"
+    b_turns = [t for t in trajectory["turns"] if any(s["language"] == "en" for s in t["segments"])]
+    assert len(b_turns) == 1 and b_turns[0]["end_ms"] >= 1400
+    if step == 1.0:
+        assert b_turns[0]["event"] == "end_of_audio"
+    else:
+        assert b_turns[0]["event"] == "audio" and b_turns[0]["end_ms"] == 2000
+    assert trajectory["metrics"]["reference_fallback_characters"] == 1
+    report = json.loads(Path(str(train) + ".summary.json").read_text(encoding="utf-8"))
+    assert report["reference_fallback_rows"] == 1
+    assert report["language_fallback_characters"] == {"en": 1}
+    assert report["chunk_seconds_rows"] == {str(step): 1}
+    review, = read_rows(Path(str(train) + ".review.jsonl"))
+    assert "reference_completed_span_supervision_used" in review["warnings"]
+    sft_modules[1].check_row(compact, decode=True)
+    with pytest.raises(ValueError, match="full teacher/reference mismatch"):
+        build_trajectory(trace, reference_fallback="off")
 
 
 def test_builder_cli_rejects_failed_trace_and_exports_compact_sft_sidecars(tmp_path, sft_modules):

@@ -16,7 +16,7 @@ def add_runtime_arguments(parser):
     parser.add_argument("--backend", choices=("hf", "vllm", "replay"), default="hf")
     parser.add_argument("--model", type=Path)
     parser.add_argument("--replies", type=Path, help="Replay only: JSON array of scripted replies; never real ASR")
-    parser.add_argument("--chunk-seconds", type=float, choices=(.5, 1.0), default=.5)
+    parser.add_argument("--chunk-seconds", type=float, choices=(.5, .8, 1.0), default=.5)
     parser.add_argument("--number-format", choices=("verbatim", "normalized"), default="verbatim")
     parser.add_argument("--context-policy", choices=("verified", "rolling"), default="verified")
     parser.add_argument("--recent-seconds", type=float, default=12)
