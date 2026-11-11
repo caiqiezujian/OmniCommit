@@ -124,8 +124,8 @@ class MediaCursor:
     def next_chunk(self, release_seconds, chunk_seconds, *, final=False):
         if isinstance(release_seconds, bool) or not isinstance(release_seconds, (int, float)) or not math.isfinite(release_seconds):
             raise MediaError('Invalid playback position')
-        if chunk_seconds not in (.5, 1.):
-            raise MediaError('Chunk length must be 0.5 or 1 second')
+        if isinstance(chunk_seconds, bool) or chunk_seconds not in (.5, .8, 1.):
+            raise MediaError('Chunk length must be 0.5, 0.8 or 1 second')
         if self.chunk_seconds is not None and chunk_seconds != self.chunk_seconds:
             raise MediaError('Chunk length cannot change within a session')
         self.chunk_seconds = chunk_seconds

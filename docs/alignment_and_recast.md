@@ -61,7 +61,7 @@ python Data-Scripts/align_asr.py /data/annotated.jsonl \
 
 原始标签只在首处或真实切换处保留；读取状态与提交状态分开。相同标签的重复标注不会产生切换。跨语言仍可保留同一 `spk`。对齐时间允许顺序一致的区间重叠，但不支持无法按转录顺序排序的复杂重叠发言；此类样本需要独立审查，不能宣称单流线性标注能完整表示。
 
-## 3. 固定 0.5 秒或 1 秒重构动作
+## 3. 按固定步长（0.5、0.8 或 1 秒）重构动作
 
 ```bash
 python Data-Scripts/recast_asr.py /data/aligned.jsonl \

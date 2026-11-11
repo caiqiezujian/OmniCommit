@@ -14,7 +14,7 @@
 1. `annotate_asr.py`：原始 `audios/messages` → `output` JSON 字符串；十二语种 prompt 内置，每条请求一次。坏输入、接口或输出校验失败时 `output` 为空并继续；不直接对音频产生时间戳。
 2. `filter_asr_output.py`：按脚本开头的 `INPUT_JSONL`、`OUTPUT_JSONL` 过滤标注错误行。脚本参数写死、输出必须是新文件；检查格式和一致性不能证明文本和标签的声学准确性。
 3. 获取实际对齐时间戳：如使用项目的分阶段对齐器或已有外部结果，参照 [对齐与重构](../docs/alignment_and_recast.md)。带行内 `timestamps` 的数据可直接使用下一步，不要重复运行对齐。
-4. `build_asr_sft.py`：对带 `output/timestamps` 的每行读取原音频时长、校验、按 0.5/1 秒重铸并输出只有 `audios/messages` 的训练行，配套 `.tokens.txt`、`.rejected.jsonl` 和 `.review.jsonl`。坏行继续，所有行无效时非零返回，输出不覆盖且不支持中断续跑。
+4. `build_asr_sft.py`：对带 `output/timestamps` 的每行读取原音频时长、校验、按 0.5、0.8 或 1 秒重铸并输出只有 `audios/messages` 的训练行，配套 `.tokens.txt`、`.rejected.jsonl` 和 `.review.jsonl`。坏行继续，所有行无效时非零返回，输出不覆盖且不支持中断续跑。
 
 ```bash
 python Data-Scripts/build_asr_sft.py /data/timestamped.jsonl \

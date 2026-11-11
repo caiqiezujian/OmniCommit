@@ -136,7 +136,8 @@ def test_reference_failure_disables_only_auto_reference_for_session():
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
-def test_file_upload_playback_gating_tail_and_cleanup():
+@pytest.mark.parametrize("step", [.5, .8])
+def test_file_upload_playback_gating_tail_and_cleanup(step):
     class Recording(ReplayBackend):
         def __init__(self):
             super().__init__([WAIT, WAIT, WAIT, WAIT])
@@ -145,11 +146,13 @@ def test_file_upload_playback_gating_tail_and_cleanup():
             self.last = audios[-1].copy() if messages[-1]["content"] != "<end_of_audio>" else None
             return super().generate(messages, audios)
 
-    source = np.linspace(-.8, .8, 19200, dtype=np.float32)
+    frames = round(step * 16000)
+    final_playhead = (2 * frames + 2400) / 16000
+    source = np.linspace(-.8, .8, 2 * frames + 3200, dtype=np.float32)
     file = io.BytesIO()
     sf.write(file, source, 16000, format="WAV", subtype="PCM_16")
     backend = Recording()
-    app = create_app(lambda: backend, StreamOptions())
+    app = create_app(lambda: backend, StreamOptions(chunk_seconds=step))
     with TestClient(app) as client:
         upload = client.post("/api/media", content=file.getvalue())
         assert upload.status_code == 200
@@ -157,20 +160,21 @@ def test_file_upload_playback_gating_tail_and_cleanup():
         with client.websocket_connect("/stream") as socket:
             socket.send_json({"type": "start", "sample_rate": 16000,
                               "source_kind": "file", "media_id": media_id})
-            assert socket.receive_json()["type"] == "ready"
-            socket.send_json({"type": "file_next", "release_seconds": .49})
+            ready = socket.receive_json()
+            assert ready["type"] == "ready" and ready["chunk_seconds"] == step
+            socket.send_json({"type": "file_next", "release_seconds": step - .01})
             assert socket.receive_json()["type"] == "file_wait"
-            socket.send_json({"type": "file_next", "release_seconds": .5})
-            assert socket.receive_json()["end_seconds"] == .5
-            assert np.max(np.abs(backend.last - source[:8000])) < .0001
-            socket.send_json({"type": "file_next", "release_seconds": 1.15, "final": True})
-            assert socket.receive_json()["end_seconds"] == 1.0
-            socket.send_json({"type": "file_next", "release_seconds": 1.15, "final": True})
+            socket.send_json({"type": "file_next", "release_seconds": step})
+            assert socket.receive_json()["end_seconds"] == step
+            assert np.max(np.abs(backend.last - source[:frames])) < .0001
+            socket.send_json({"type": "file_next", "release_seconds": final_playhead, "final": True})
+            assert socket.receive_json()["end_seconds"] == 2 * step
+            socket.send_json({"type": "file_next", "release_seconds": final_playhead, "final": True})
             result = socket.receive_json()
-            assert result["end_seconds"] == 1.15
-            assert np.max(np.abs(backend.last[:2400] - source[16000:18400])) < .0001
+            assert result["end_seconds"] == pytest.approx(final_playhead)
+            assert np.max(np.abs(backend.last[:2400] - source[2*frames:2*frames+2400])) < .0001
             assert np.all(backend.last[2400:] == 0)  # final tail is padded only in memory
-            socket.send_json({"type": "file_next", "release_seconds": 1.15, "final": True})
+            socket.send_json({"type": "file_next", "release_seconds": final_playhead, "final": True})
             assert socket.receive_json()["type"] == "file_done"
             socket.send_json({"type": "end"})
             assert socket.receive_json()["event"] == "end_of_audio"

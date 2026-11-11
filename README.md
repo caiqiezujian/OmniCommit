@@ -108,7 +108,7 @@ python Data-Scripts/build_asr_sft.py \
 
 单行错误不会中断后续处理；全部失败时返回非零。输出及 sidecar 已存在时不会覆盖。当前一体化脚本**不支持自动断点续跑**；系统级中断后可能留下不完整输出，需确认任务完成并使用新输出路径重新构建。
 
-数词参数必须与原转录一致：`normalized` / `verbatim` 只改变 system 指令，**不会改写原文**。可用 `--chunk-seconds 1.0` 另建 1 秒数据。完整规则、可选间隙过滤与错误处理见 [时间戳直接生成 SFT](docs/timestamped_to_sft_zh.md)。
+数词参数必须与原转录一致：`normalized` / `verbatim` 只改变 system 指令，**不会改写原文**。重铸可选 `--chunk-seconds 0.8` 或 `1.0`。为每个步长指定独立输出文件，训练和检查时传入相应文件。完整规则、可选间隙过滤与错误处理见 [时间戳直接生成 SFT](docs/timestamped_to_sft_zh.md)。
 
 ### 最终训练数据
 
@@ -135,7 +135,7 @@ python SFT-Scripts/audit_sft.py \
 python SFT-Scripts/audit_encoded_lengths.py \
   /data/OmniCommit/run-001/train.500ms.jsonl \
   --model /models/qwen3_omni_original_hf \
-  --max-length 4096 \
+  --max-length 8192 \
   --report /data/OmniCommit/run-001/encoded-audit.json
 ```
 
@@ -148,10 +148,10 @@ bash SFT-Scripts/train_sft.sh \
   /models/qwen3_omni_mcore_3.12.1 \
   /data/OmniCommit/run-001/train.500ms.jsonl \
   /data/yb/Code/OmniCommit/outputs/sft-001 \
-  --gpu-ids 0,1,2,6
+  --gpu-ids 0,1,2,3,4,5,6,7
 ```
 
-启动器沿用 FLEX **虚拟音频 SFT 版本**的主要配方：四卡、LoRA r8/alpha32、EP2、micro/global 4/16、学习率 `1e-4`、3 epochs、packing、最大长度 4096；默认每 **3000 步**保存，原始 FLEX 旧脚本是 1000 步。启动器只抽查两条，不代替全量检查。默认保存未合并 adapter 和训练过的词表层，且不保存 optimizer/RNG，因此不能保证精确断点续训。详见 [SFT 文档](SFT-Scripts/README.md)。
+启动器默认使用八卡、LoRA r8/alpha32、EP2、micro/global batch 2/16、学习率 `1e-4`、3 epochs、packing 和 8192 token 长度上限。默认每 **3000 步**保存一次，传 `--save_interval 1000` 可改为每 1000 步保存一次。启动器只抽查两条，不代替全量检查。默认保存未合并 adapter 和训练过的词表层，且不保存 optimizer/RNG，因此不能保证精确断点续训。详见 [SFT 文档](SFT-Scripts/README.md)。
 
 训练前通过 `--new_special_tokens` 注册清单；结束后必须保留同一清单和对应权重，不能仅在训练后手动增加随机 token。
 

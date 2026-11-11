@@ -66,7 +66,7 @@ JSON 中写 true 本身不是质量验证。每个窗口只选开始之前的参
 ```bash
 python SFT-Scripts/audit_encoded_lengths.py /data/sft/train.jsonl \
   --model /models/qwen3_omni_original_hf \
-  --max-length 4096 --report /data/sft/encoded-audit.json
+  --max-length 8192 --report /data/sft/encoded-audit.json
 ```
 
 该检查使用实际 processor、虚拟音频读取和 SWIFT 训练模板，包含音频展开和参考输入，
@@ -175,19 +175,19 @@ python SFT-Scripts/audit_sft.py /data/sft/train.jsonl \
 # 在原 omni_ms / ms-swift 3.12.1 训练环境检查完整模板编码长度
 python SFT-Scripts/audit_encoded_lengths.py /data/sft/train.jsonl \
   --model /models/qwen3_omni_original_hf \
-  --max-length 4096 --report /data/sft/encoded-audit.json
+  --max-length 8192 --report /data/sft/encoded-audit.json
 
 # 全量检查通过后，在现有训练容器中启动
 bash SFT-Scripts/train_sft.sh \
   /models/qwen3_omni_mcore_3.12.1 \
   /data/sft/train.jsonl \
   /outputs/omnicommit_sft_001 \
-  --gpu-ids 0,1,2,3
+  --gpu-ids 0,1,2,3,4,5,6,7
 ```
 
-训练入口先抽查两个样本并导入框架插件。原配方保持四进程、EP=2、LoRA r8/alpha32、
-micro/global batch=4/16、lr=1e-4、3 epochs、packing、max_length=4096、
-每 3000 步保存未合并适配器；音频/视觉与 aligner 冻结，LLM 训练。
+训练入口先抽查两个样本并导入框架插件。默认启动八个进程，使用 EP=2、LoRA r8/alpha32、
+micro/global batch=2/16、lr=1e-4、3 epochs、packing、max_length=8192，
+每 3000 步保存未合并适配器。训练更新 LLM，冻结音频/视觉与 aligner。显式指定四张 GPU 时，默认 micro/global batch 为 4/16。
 这里 3000 步与 FLEX 虚拟音频脚本一致；FLEX 更早的原始脚本为 1000 步。默认 `--no_save_optim true --no_save_rng true`，不保存完整优化器和随机状态，不能保证精确断点续训。
 保留 `modules_to_save word_embeddings output_layer`，以保存新特殊 token 的完整词表层。
 不启用语音输出分支。长会话应提前在真实 tokenizer/框架里检查长度，抽样音频检查
@@ -215,7 +215,7 @@ python SFT-Scripts/check_sft_attention.py --gpu-id 0
 CPU 测试覆盖真实区间读取、重采样前隔离未来采样、标签与说话人格式、
 尾部 WAIT、坏行继续、特殊 token 清单，以及 shell 参数构造。
 兼容模式另有真实小型 HF 注意力的分段等价性/梯度测试；依赖不可用时明确跳过。
-模板注册测试使用 SWIFT stub。**尚未把本项目作为真实四卡作业训练并保存 checkpoint。**
+模板注册测试使用 SWIFT stub。八卡训练、checkpoint 保存和加载需要在目标服务器上验证。
 应先在目标服务器以少量样本完成实际模板编码、训练、保存和加载，再做全量训练。
 
 ```bash

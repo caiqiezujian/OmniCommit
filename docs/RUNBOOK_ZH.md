@@ -1,6 +1,6 @@
 # OmniCommit：从文本标注到流式 Web 的执行手册
 
-这份文档对应本仓库当前的 **文本教师一次调用路线**。原始输入是 `audios + messages`，assistant 中含完整 ASR、语种和说话人标签；最终使用真实音频的 0.5 秒或 1 秒增量轮次训练与推理。
+这份文档对应本仓库当前的 **文本教师一次调用路线**。原始输入是 `audios + messages`，assistant 中含完整 ASR、语种和说话人标签；最终使用真实音频的 0.5、0.8 或 1 秒增量轮次训练与推理。
 
 **已有用户提供的行内 `timestamps` 数据时**，优先看 [时间戳直接生成 SFT](timestamped_to_sft_zh.md)：其一体化入口直接得到仅含 `audios/messages` 的训练行，无需重复执行本手册第 3–5 节。下文是独立的分阶段路线；其富元数据输出和一体化精简输出不能互换拆窗步骤。
 
@@ -11,7 +11,7 @@
   → annotate_asr.py：一次文本 LLM 调用，细切分 + 初步 WAIT/DIRECT
   → force_align_asr.py：已有正文与真实音频强制对齐（或导入外部时间戳）
   → align_asr.py：将字/词时间对应到完整语义单元
-  → recast_asr.py：按 0.5/1 秒音频网格重构动作 + 明确 EOS
+  → recast_asr.py：按 0.5、0.8 或 1 秒音频网格重构动作 + 明确 EOS
   → prepare_sft.py：FLEX 风格 audios/messages + token 清单
   → prepare_windows.py：长样本安全拆窗 + 因果说话人参照（按需）
   → 结构/音频检查 + 真实模型模板长度检查
@@ -208,7 +208,7 @@ python SFT-Scripts/check_sft.py "$WORK/full.500ms.jsonl" --rows 2 \
 
 ## 6. 长样本拆窗与 Speaker Prompt Cache 训练
 
-如果数据原本是十几秒的短音频，可直接使用 `full.500ms.jsonl`。长会议不能直接依靠训练器截断到 4096 token；必须在没有待提交内容、没有跨界半个实体的位置拆窗。
+如果数据原本是十几秒的短音频，可直接使用 `full.500ms.jsonl`。长会议不能直接依靠训练器截断到 8192 token；必须在没有待提交内容、没有跨界半个实体的位置拆窗。
 
 本节的 `prepare_windows.py` 输入必须是本手册第 5 节生成的富元数据 `full.500ms.jsonl`，不能把一体化脚本的精简文件传入。精简文件缺少安全边界和源语音区间；需要长会议拆窗时保留或重建分阶段的中间数据，再检查原始时间戳与拆窗结果。
 
@@ -242,7 +242,7 @@ python SFT-Scripts/audit_sft.py /data/OmniCommit/run-001/train.500ms.jsonl \
 
 # 在原有 omni_ms / ms-swift3.12.1 训练环境执行；此命令只加载处理器。
 python SFT-Scripts/audit_encoded_lengths.py /data/OmniCommit/run-001/train.500ms.jsonl \
-  --model /models/qwen3_omni_original_hf --max-length 4096 \
+  --model /models/qwen3_omni_original_hf --max-length 8192 \
   --report "$WORK/encoded-audit.json"
 ```
 
@@ -256,11 +256,11 @@ python SFT-Scripts/audit_encoded_lengths.py /data/OmniCommit/run-001/train.500ms
 bash SFT-Scripts/train_sft.sh \
   /models/qwen3_omni_mcore_3.12.1 \
   /data/OmniCommit/run-001/train.500ms.jsonl \
-  /outputs/OmniCommit/sft-001 \
-  --gpu-ids 0,1,2,6
+  /data/yb/Code/OmniCommit/outputs/sft-001 \
+  --gpu-ids 0,1,2,3,4,5,6,7
 ```
 
-保留 FLEX 原配方：四卡、LoRA r8/alpha32、EP2、micro/global batch 4/16、学习率 1e-4、3 epochs、packing、最大长度 4096。云道文本教师的量化 DeepSeek 是数据标注模型，与这里被训练的 Omni 基座不同。
+此命令使用八卡、LoRA r8/alpha32、EP2、micro/global batch 2/16、学习率 1e-4、3 epochs、packing 和 8192 token 长度上限。云道文本教师的量化 DeepSeek 是数据标注模型，与这里被训练的 Omni 基座不同。
 
 `--new_special_tokens` 在 SFT 前注册 WAIT、DIRECT、语种与说话人 token；`--modules_to_save word_embeddings output_layer` 保存它们训练后的权重。**不是训练结束后再往 tokenizer 里加随机新 token。** `protocol_tokens.txt` 只有两种动作，正式训练应使用数据生成的完整 `.tokens.txt`。
 
@@ -273,12 +273,12 @@ bash SFT-Scripts/train_sft.sh \
 ```bash
 # 先检查 token、训练参数和张量形状；不加载完整权重合并。
 bash SFT-Scripts/merge_lora.sh /models/qwen3_omni_original_hf \
-  /outputs/OmniCommit/sft-001/checkpoint-3000 /models/omnicommit-sft-001 \
+  /data/yb/Code/OmniCommit/outputs/sft-001/checkpoint-3000 /models/omnicommit-sft-001 \
   --special-tokens /data/OmniCommit/run-001/train.500ms.jsonl.tokens.txt --gpu-ids 0 --check-only
 
 # 正式合并与逐项核验。
 bash SFT-Scripts/merge_lora.sh /models/qwen3_omni_original_hf \
-  /outputs/OmniCommit/sft-001/checkpoint-3000 /models/omnicommit-sft-001 \
+  /data/yb/Code/OmniCommit/outputs/sft-001/checkpoint-3000 /models/omnicommit-sft-001 \
   --special-tokens /data/OmniCommit/run-001/train.500ms.jsonl.tokens.txt --gpu-ids 0
 ```
 

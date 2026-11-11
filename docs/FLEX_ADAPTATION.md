@@ -7,11 +7,11 @@ OmniCommit 借鉴 FLEX 的虚拟音频读取、多轮 SWIFT 模板、Megatron SF
 | 输出任务 | 同声翻译 | 保留原语言的语音转录，附语种与说话人 |
 | 动作 | `<\|WAIT\|>`、`<\|DIRECT\|>`、`<\|FLEX\|>` | `<\|WAIT\|>`、`<\|DIRECT\|>`；不使用翻译重组动作 |
 | 单轮输出 | 等待或新增译文 | WAIT 无文本；DIRECT 仅输出新增转录，每段带完整 `<语言><说话人>` |
-| 音频输入 | 多轮虚拟音频区间 | 同样是原音频区间；当前文本标注主线按 0.5/1 秒重铸 |
+| 音频输入 | 多轮虚拟音频区间 | 同样是原音频区间；当前文本标注主线按 0.5、0.8 或 1 秒重铸 |
 | 最后处理 | 以 FLEX 数据协议为准 | 当前 schema 2 增加无音频 `<end_of_audio>`，有积压时释放；早期音频教师 schema 1 不应混同 |
 | token 清单 | 项目固定的三个动作 token | 两个动作加数据使用的语种、说话人标签；训练、恢复、导出使用同一有序清单 |
 | 模型训练 | Qwen3-Omni MCore、ms-swift 3.12.1 / Megatron、LoRA | 同一训练栈；OmniCommit 使用自己的虚拟音频插件和模板 |
-| 默认主要配方 | 四卡、r8/alpha32、EP2、micro4/global16、lr 1e-4、3 epochs、packing、4096 | 以上主要配方相同；可选旧驱动兼容模式另有变化 |
+| 默认主要配方 | 四卡、r8/alpha32、EP2、micro4/global16、lr 1e-4、3 epochs、packing、4096 | 默认八卡、r8/alpha32、EP2、micro2/global16、lr 1e-4、3 epochs、packing、8192 token |
 | 保存 | 虚拟版本 3000 步，未合并 adapter | 默认 3000 步、未合并 adapter，并保存训练词表层；默认不保存 optimizer/RNG，不能保证精确续训 |
 | Web 入口 | 文件/电脑声音等同传交互 | 麦克风、系统声音、音视频文件，逐轮 ASR 与说话人修正；内网无需访问令牌 |
 

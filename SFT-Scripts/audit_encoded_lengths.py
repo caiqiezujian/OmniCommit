@@ -34,7 +34,7 @@ def main(argv=None):
     parser.add_argument("dataset", type=Path)
     parser.add_argument("--model", type=Path, required=True, help="Original HF base with processor files, not MCore")
     parser.add_argument("--tokens-file", type=Path)
-    parser.add_argument("--max-length", type=int, default=4096)
+    parser.add_argument("--max-length", type=int, default=8192)
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--rows", type=int, default=0, help="0 checks the entire file")
     args = parser.parse_args(argv)

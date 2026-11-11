@@ -79,7 +79,7 @@ python Data-Scripts/collect_hf_prefixes.py \
 - `--batch-size 4`：一个 batch 的请求数量。遇到普通批次失败或 GPU OOM，后端递归拆小；单请求仍失败就记录错误，不无限重试。
 - `--chunk-seconds 0.5`：支持 0.5 / 0.8 / 1.0。采集计划、标签门控、SFT 音频区间以及 CLI/Web 服务均支持这三种步长；默认仍为 0.5。
 - `--max-new-tokens 512`：达到上限仍没有正常 EOS 的输出记为失败，不训练成 WAIT。
-- `--max-context-tokens 32768`：教师上下文加生成预留的上限；不是学生的 4096 训练长度。
+- `--max-context-tokens 32768`：教师上下文加生成预留的上限。学生训练的长度上限由启动器设为 8192。
 - `--max-audio-seconds 300`：超长记录拒绝，不静默裁短。
 - `--number-format normalized`：与当前原始数据的数字格式指令一致；若原文保留数词，改为 `verbatim`。脚本不自动改写参考正文。
 - `--audio-root`：只用于相对路径。绝对路径须在当前容器可访问。
@@ -179,14 +179,14 @@ python SFT-Scripts/audit_sft.py \
 python SFT-Scripts/audit_encoded_lengths.py \
   /data/yb/Code/OmniCommit/datasets/data_006/train.500ms.jsonl \
   --model /data/models/qwen3_omni_original_hf \
-  --max-length 4096 \
+  --max-length 8192 \
   --report /data/yb/Code/OmniCommit/datasets/data_006/encoded-audit.json
 
 bash SFT-Scripts/train_sft.sh \
   /data/data_process/lzy/qwen3_omni_mega/train/qwen3_omni_mcore_3.12.1 \
   /data/yb/Code/OmniCommit/datasets/data_006/train.500ms.jsonl \
   /data/yb/Code/OmniCommit/outputs/sft-prefix-001 \
-  --gpu-ids 1,2,3,4 \
+  --gpu-ids 0,1,2,3,4,5,6,7 \
   --save_interval 1000
 ```
 

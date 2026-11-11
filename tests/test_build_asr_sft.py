@@ -49,6 +49,29 @@ def test_compact_training_data_is_checkable_and_preserves_text(record, tmp_path)
     one.check_row(prepared, decode=True, token_inventory=tokens)
 
 
+def test_cli_800ms_recasts_switch_at_grid_boundary_and_keeps_short_tail(record, tmp_path):
+    from omnicommit_audio import decode_chunk_ref
+
+    sf.write(record['audios'][0], np.zeros(53760, dtype=np.float32), 16000)  # 3.36 s
+    switch = record['timestamps'][3]
+    switch.update(start_ms=2400, end_ms=2550)
+    switch['spans'][0].update(start_ms=2400, end_ms=2550)
+    source, target = tmp_path / 'timed.jsonl', tmp_path / 'train.800ms.jsonl'
+    source.write_text(json.dumps(record) + '\n', encoding='utf-8')
+    assert one.main([str(source), '--output', str(target), '--chunk-seconds', '0.8']) == 0
+
+    row = json.loads(target.read_text(encoding='utf-8'))
+    refs = [decode_chunk_ref(ref) for ref in row['audios']]
+    assert [(r['start'], r['end']) for r in refs] == [
+        (0, .8), (.8, 1.6), (1.6, 2.4), (2.4, 3.2), (3.2, 3.36)]
+    assert refs[-1]['input_seconds'] == .5
+    assert [m['content'] for m in row['messages'] if m['role'] == 'assistant'] == [
+        '<|DIRECT|><zh><spk1>请联系', '<|WAIT|>', '<|DIRECT|><zh><spk1>张伟确认方案。',
+        '<|WAIT|>', '<|DIRECT|><en><spk2>Hello, yes.', '<|WAIT|>']
+    tokens = set(Path(str(target) + '.tokens.txt').read_text(encoding='utf-8').splitlines())
+    one.check_row(row, decode=True, token_inventory=tokens)
+
+
 def test_unannotated_audio_gap_reported_but_not_assumed_silence_or_dropped(record, tmp_path):
     sf.write(record['audios'][0], np.zeros(6 * 16000, dtype=np.float32), 16000)
     diagnostics = {}

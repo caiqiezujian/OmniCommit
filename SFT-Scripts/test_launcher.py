@@ -17,6 +17,7 @@ def run_launcher(tmp_path, extra):
     fake_bin.mkdir()
     python = fake_bin / "python3"
     python.write_bytes(('#!/usr/bin/env bash\nprintf "CALL\\n"\nprintf "ARG:%s\\n" "$@"\n'
+                      'printf "CUDA:%s\\n" "$CUDA_VISIBLE_DEVICES"\n'
                       'printf "ENV:%s,%s,%s,%s,%s\\n" "${OMNICOMMIT_SFT_ATTENTION_COMPAT-unset}" '
                       '"${NVTE_FLASH_ATTN-unset}" "${NVTE_FUSED_ATTN-unset}" '
                       '"${NVTE_UNFUSED_ATTN-unset}" "${NVTE_MASKED_SOFTMAX_FUSION-unset}"\n').encode("utf-8"))
@@ -35,17 +36,28 @@ def run_launcher(tmp_path, extra):
         prefix += 'mock_bin="$(cygpath -u "$mock_bin")"; '
     return subprocess.run([BASH, "-c", prefix + 'export PATH="$mock_bin:$PATH"; exec bash "$@"',
                            "test", str(fake_bin), str(SCRIPT), str(model), str(dataset), str(tmp_path / "output"),
-                           "--gpu-ids", "0,1,2,3", *extra], env=env, capture_output=True, text=True, timeout=30)
+                           *extra], env=env, capture_output=True, text=True, timeout=30)
 
 
-def test_default_launcher_preserves_existing_fast_recipe(tmp_path):
+def test_default_launcher_uses_eight_gpus_and_8192_length(tmp_path):
     run = run_launcher(tmp_path, [])
     assert run.returncode == 0, run.stderr
     assert "ARG:--attention_backend\nARG:flash" in run.stdout
     assert "ARG:--packing\nARG:true" in run.stdout
-    assert "ARG:--micro_batch_size\nARG:4" in run.stdout
+    assert "CUDA:0,1,2,3,4,5,6,7" in run.stdout
+    for flag, value in (("nproc_per_node", "8"), ("micro_batch_size", "2"),
+                        ("global_batch_size", "16"), ("max_length", "8192")):
+        assert f"ARG:--{flag}\nARG:{value}" in run.stdout
     assert "ARG:--padding_free" not in run.stdout
     assert "ENV:unset,unset,unset,unset,unset" in run.stdout
+
+
+def test_four_gpu_selection_uses_four_processes(tmp_path):
+    run = run_launcher(tmp_path, ["--gpu-ids", "1,2,3,4"])
+    assert run.returncode == 0, run.stderr
+    assert "CUDA:1,2,3,4" in run.stdout
+    assert "ARG:--nproc_per_node\nARG:4" in run.stdout
+    assert "ARG:--micro_batch_size\nARG:4" in run.stdout
 
 
 def test_compat_launcher_routes_both_attention_branches_and_preserves_global_batch(tmp_path):

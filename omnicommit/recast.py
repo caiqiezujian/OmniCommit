@@ -10,12 +10,14 @@ import sys
 from .alignment import finite, group_units, render_units, tagged_units, source_rows
 from .io import Journal, fingerprint, row_id, write_row
 
+CHUNK_SECONDS = (0.5, 0.8, 1.0)
+
 
 def recast_row(row, chunk_seconds=0.5, number_format="verbatim"):
     if row.get("schema_version") != 2 or row.get("kind") != "aligned_asr" or row.get("status") != "ok":
         raise ValueError("Expected successful schema_version=2 aligned_asr row")
-    if chunk_seconds not in (0.5, 1.0):
-        raise ValueError("chunk_seconds must be 0.5 or 1.0")
+    if chunk_seconds not in CHUNK_SECONDS:
+        raise ValueError(f"chunk_seconds must be one of {CHUNK_SECONDS}")
     if number_format not in ("verbatim", "normalized"):
         raise ValueError("Unknown number format")
     duration = finite(row.get("duration_ms"), "duration_ms")
@@ -104,10 +106,10 @@ def recast_row(row, chunk_seconds=0.5, number_format="verbatim"):
     gates_by_chunk = [[] for _ in endpoints]
     for event_time, index, event_type in event_specs:
         if event_type == "switch_onset":
-            # Chunk intervals are half-open for onset: exact 0.5 -> next.
+            # A switch exactly on a grid boundary belongs to the next chunk.
             bucket = int(math.floor(event_time / step))
         else:
-            # Completion on exact 0.5 is covered by the first chunk.
+            # A segment ending on a grid boundary completes in the preceding chunk.
             bucket = max(0, int(math.ceil((event_time - 1e-6) / step)) - 1)
         if not 0 <= bucket < len(endpoints):
             raise ValueError("WAIT event lies outside audio chunks")
@@ -182,7 +184,7 @@ def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("input", help="Aligned schema2 JSONL")
     p.add_argument("--output", required=True)
-    p.add_argument("--chunk-seconds", type=float, choices=[0.5, 1.0], default=0.5)
+    p.add_argument("--chunk-seconds", type=float, choices=CHUNK_SECONDS, default=0.5)
     p.add_argument("--number-format", choices=["verbatim", "normalized"], default="verbatim",
                    help="Must match existing annotation text; does not rewrite digits")
     p.add_argument("--resume", action="store_true")

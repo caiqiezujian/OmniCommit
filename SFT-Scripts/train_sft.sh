@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# SWIFT 3.12.1 / Megatron SFT. Same optimization recipe as the supplied script;
-# OmniCommit virtual audio input, two actions, and unmerged adapter saves. Run in the existing omni_ms container.
+# SWIFT 3.12.1 / Megatron SFT with virtual audio input and unmerged adapter saves.
+# Default: eight local GPUs, global batch 16, sequence length 8192.
 # System prompts come from the prepared JSONL; no separate --system override.
 set -euo pipefail
 
 if (( $# < 3 )); then
-  echo "Usage: bash train_sft.sh MCORE_MODEL TRAIN_JSONL OUTPUT_DIR [--gpu-ids 0,1,2,6] [--compat-old-driver] [--tokens-file FILE] [native Megatron options...]" >&2
+  echo "Usage: bash train_sft.sh MCORE_MODEL TRAIN_JSONL OUTPUT_DIR [--gpu-ids 0,1,2,3,4,5,6,7] [--compat-old-driver] [--tokens-file FILE] [native Megatron options...]" >&2
   exit 2
 fi
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -13,7 +13,7 @@ MODEL_PATH="$1"
 DATASET_PATH="$2"
 OUTPUT_PATH="$3"
 shift 3
-GPU_LIST="${CUDA_VISIBLE_DEVICES:-0,1,2,6}"
+GPU_LIST="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 COMPAT_OLD_DRIVER=0
 TOKENS_PATH="${DATASET_PATH}.tokens.txt"
 EXTRA_ARGS=()
@@ -30,10 +30,12 @@ while (( $# )); do
   esac
 done
 IFS=',' read -r -a DEVICES <<< "$GPU_LIST"
-if (( ${#DEVICES[@]} != 4 )); then
-  echo "This recipe uses 4 GPUs (global=16/EP=2). Set --gpu-ids to four IDs." >&2
-  exit 2
-fi
+GPU_COUNT=${#DEVICES[@]}
+case "$GPU_COUNT" in
+  8) MICRO_BATCH=2 ;;
+  4) MICRO_BATCH=4 ;;
+  *) echo "This recipe supports 8 or 4 local GPUs (global batch 16, EP=2). Got $GPU_COUNT." >&2; exit 2 ;;
+esac
 if [[ ! -d "$MODEL_PATH" || ! -f "$DATASET_PATH" || ! -f "$TOKENS_PATH" ]]; then
   echo "Missing model directory, training JSONL or token inventory. Paths must exist inside this container." >&2
   exit 2
@@ -44,7 +46,6 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 export PYTHONUNBUFFERED=1
 ATTENTION_ARGS=(--attention_backend flash)
 PACKING_ARGS=(--packing true)
-MICRO_BATCH=4
 if (( COMPAT_OLD_DRIVER )); then
   # These are coupled: TE unfused does not support the THD padding-free layout.
   for arg in "${EXTRA_ARGS[@]}"; do
@@ -68,7 +69,7 @@ fi
 python3 "$SCRIPT_DIR/check_sft.py" "$DATASET_PATH" --rows 2 --tokens-file "$TOKENS_PATH" --framework
 echo "[train] Original audio is read by range; no small WAV files will be written. GPUs=$GPU_LIST"
 python3 -m torch.distributed.run \
-  --nproc_per_node 4 --nnodes 1 --master_port "${MASTER_PORT:-29571}" \
+  --nproc_per_node "$GPU_COUNT" --nnodes 1 --master_port "${MASTER_PORT:-29571}" \
   --module swift.cli._megatron.sft \
   --load "$MODEL_PATH" \
   --dataset "$DATASET_PATH" \
@@ -95,7 +96,7 @@ python3 -m torch.distributed.run \
   --save "$OUTPUT_PATH" \
   --save_safetensors true --merge_lora false \
   --eval_interval 1000000 --save_interval 3000 \
-  --vit_gradient_checkpointing true --max_length 4096 \
+  --vit_gradient_checkpointing true --max_length 8192 \
   --num_workers 8 --dataset_num_proc 8 \
   --no_save_optim true --no_save_rng true "${ATTENTION_ARGS[@]}" \
   "${EXTRA_ARGS[@]}"

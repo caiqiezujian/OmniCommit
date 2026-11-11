@@ -19,7 +19,7 @@ import numpy as np
 import soundfile as sf
 
 from omnicommit.alignment import align_annotation
-from omnicommit.recast import recast_row
+from omnicommit.recast import CHUNK_SECONDS, recast_row
 from omnicommit.streaming import ReplayBackend, StreamOptions, StreamSession
 from prepare_sft import prepare_row, sort_tokens
 from check_sft import check_row
@@ -115,7 +115,7 @@ def build_demo(directory, chunk_seconds=.5):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--chunk-seconds", type=float, choices=[.5, 1.0], default=.5)
+    parser.add_argument("--chunk-seconds", type=float, choices=CHUNK_SECONDS, default=.5)
     args = parser.parse_args(argv)
     print(json.dumps(build_demo(args.output_dir, args.chunk_seconds), ensure_ascii=False))
 

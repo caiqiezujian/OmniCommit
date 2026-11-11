@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / 'SFT-Scripts'))
 from omnicommit.alignment import TAG, annotation_units, align_annotation, finite
-from omnicommit.recast import recast_row
+from omnicommit.recast import CHUNK_SECONDS, recast_row
 from prepare_sft import prepare_row, sort_tokens
 from check_sft import check_row
 
@@ -138,7 +138,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('input', type=Path, help='Timed annotation JSONL')
     parser.add_argument('--output', required=True, type=Path)
-    parser.add_argument('--chunk-seconds', type=float, choices=(.5, 1.), default=.5)
+    parser.add_argument('--chunk-seconds', type=float, choices=CHUNK_SECONDS, default=.5)
     parser.add_argument('--number-format', choices=('normalized', 'verbatim'), default='normalized')
     parser.add_argument('--audio-root', type=Path)
     parser.add_argument('--max-unannotated-gap-seconds', type=float,
@@ -184,7 +184,8 @@ def main(argv=None):
                           'error': str(exc)}
                 rejects.write(json.dumps(record, ensure_ascii=True) + '\n')
                 rejects.flush()
-                print(f'[reject] line={line_number}: {type(exc).__name__}', file=sys.stderr, flush=True)
+                detail = f': {exc}' if isinstance(exc, ModuleNotFoundError) else ''
+                print(f'[reject] line={line_number}: {type(exc).__name__}{detail}', file=sys.stderr, flush=True)
                 continue
             gaps = diagnostics['unannotated_gaps']
             counts['rows_with_unannotated_gaps_ge_2s'] += bool(gaps)
