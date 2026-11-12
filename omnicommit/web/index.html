@@ -23,19 +23,19 @@
 </section><section class="card"><h2>实时转录</h2><div class="buttons"><button id="exportTxt">导出 TXT</button><button id="exportJson">导出 JSON</button></div>
 <p class="hint">正文只显示已提交的文字；说话人与语种由模型识别，长会议结果需要实际验证。</p><div id="transcript" class="transcript" aria-live="polite"></div>
 <details><summary>说话人管理</summary><div id="speakerList"></div><label>说话人编号 <input id="speaker" placeholder="例如 spk1"></label><label>显示名称 <input id="speakerName" placeholder="例如 张老师"></label><button id="rename">修改名称</button><label>合并来源 <input id="mergeSource" placeholder="例如 spk3"></label><label>合并到 <input id="mergeTarget" placeholder="例如 spk1"></label><button id="merge">合并说话人</button><p class="hint">会话进行中修正将同步服务端；当前会话结束后无法再修改服务端缓存。</p></details>
-<details id="logPanel"><summary>逐轮日志 · WAIT / DIRECT</summary>
+<details id="logPanel" open><summary>逐轮日志 · WAIT / DIRECT</summary>
 <div class="log-toolbar">
 <label>会议 <select id="logSession" aria-label="日志会议"></select></label>
 <label>显示 <select id="logFilter"><option value="model">模型全部轮次</option><option value="WAIT">仅 WAIT</option><option value="DIRECT">仅 DIRECT</option><option value="all">全部事件（含文件轮询）</option></select></label>
+<button id="logTxt">下载逐轮 TXT</button><button id="logJsonl">下载完整日志 JSONL</button>
 </div>
 <div class="log-nav">
-<button id="logFirst">最早</button><button id="logPrev">上一页</button><button id="logNext">下一页</button>
+<button id="logFirst">最早</button><button id="logPrev">上一页</button><button id="logNext">下一页</button><button id="logLatest">看最新</button>
 <label><input type="checkbox" id="logFollow"> 跟随最新</label><span id="logRange"></span>
 <span id="logCounts" class="hint"></span>
 </div>
 <p id="logProgress" class="hint"></p><p id="logError" class="error" hidden></p>
 <div id="events" tabindex="0" aria-label="逐轮日志内容"></div>
-<div class="log-toolbar"><button id="logTxt">下载逐轮 TXT</button><button id="logJsonl">下载完整日志 JSONL</button></div>
 <p class="hint">日志保存在当前浏览器。点开一条记录可查看完整字段。</p>
 <p class="error" id="logWarning" role="status" hidden></p></details>
 <details><summary>人工核验与声音参照</summary><p class="hint">仅填写已听到、确认完整且身份可靠的区间，不能仅凭一次 DIRECT 确认已处理的全部音频。</p><label>已完整提交至（秒）<input id="through" type="number" step=".1" min="0"></label><button id="commit">确认提交位置</button><label>说话人 <input id="refSpeaker" value="spk1"></label><label>语种 <input id="refLanguage" value="zh"></label><label>参照起点（秒） <input id="refStart" type="number" step=".1" min="0"></label><label>参照终点（秒） <input id="refEnd" type="number" step=".1" min="0"></label><label>参照转录 <input id="refText"></label><label><input id="verified" type="checkbox"> 已核验声音清晰、身份准确且没有重叠发言</label><button id="reference">保存参照</button></details>

@@ -76,8 +76,7 @@ class MeetingTurnLog {
     this.archive = new MeetingLogArchive({onError: () => this.warnStorage()});
     const follow = get('logFollow');
     follow.onchange = () => {
-      if (follow.checked) this.offset = Math.max(0, this.visible().length - LOG_PAGE_SIZE);
-      this.draw(follow.checked);
+      if (follow.checked) this.showLatest();
     };
     get('logFilter').onchange = () => {
       this.filter = get('logFilter').value;
@@ -88,7 +87,14 @@ class MeetingTurnLog {
     get('logFirst').onclick = () => this.go(0);
     get('logPrev').onclick = () => this.go(this.offset - LOG_PAGE_SIZE);
     get('logNext').onclick = () => this.go(this.offset + LOG_PAGE_SIZE);
+    get('logLatest').onclick = () => {
+      follow.checked = false;
+      this.showLatest();
+    };
     const box = get('events');
+    box.onclick = event => {
+      if (event.target.closest('summary')) follow.checked = false;
+    };
     box.onscroll = () => {
       if (follow.checked && box.scrollTop + box.clientHeight < box.scrollHeight - 4) follow.checked = false;
     };
@@ -195,6 +201,11 @@ class MeetingTurnLog {
 
   visible() { return this.view[this.filter]; }
 
+  showLatest() {
+    this.offset = Math.max(0, this.visible().length - LOG_PAGE_SIZE);
+    this.draw(true);
+  }
+
   go(offset) {
     this.get('logFollow').checked = false;
     this.offset = Math.max(0, Math.min(offset, Math.max(0, this.visible().length - 1)));
@@ -225,6 +236,7 @@ class MeetingTurnLog {
       : n ? '第 ' + (this.offset + 1) + '–' + last + ' 条，共 ' + n + ' 条' : '暂无记录';
     g('logFirst').disabled = g('logPrev').disabled = this.offset === 0;
     g('logNext').disabled = last >= n;
+    g('logLatest').disabled = !n;
     g('logTxt').disabled = this.loading || !this.view.model.length;
     g('logJsonl').disabled = this.loading || !this.view.all.length;
   }
