@@ -1,9 +1,36 @@
 # OmniCommit SFT
 
-本目录将已经审查的流式轨迹转成音频、文本交错的 SFT 数据，沿用 FLEX 的
-**ms-swift 3.12.1 / Megatron / Qwen3-Omni / 虚拟音频区间**方案。
+本目录将已经审查的流式轨迹转成音频、文本交错的 SFT 数据。两个 Megatron 入口共用 Qwen3-Omni 训练模板和虚拟音频区间。ms-swift 4.1.3 读取 HF 原始基座，ms-swift 3.12.1 使用 FLEX 的 MCore 训练入口。
 不依赖其他 FLEX 目录；请保留本仓库的 `omnicommit/`，SFT 和服务共用其中的
 `runtime_protocol.py`，确保系统提示、说话人参照和结束标记一致。准备和检查不调用教师模型。
+
+## ms-swift 4.1.3 八卡训练
+
+在已经跑通离线 Qwen3-Omni SFT 的 Linux 环境执行。对应版本为 torch 2.10.0+cu129、Megatron-Core 0.16.1、Transformer Engine 2.14.0、flash-attn 2.8.3。复用原来的 500 ms 训练 JSONL、同顺序的 token 清单和已挂载的原始音频。文件名以下用之前的 `train_v1.jsonl` 举例，请换成本次实际训练集。
+
+```bash
+cd /data/yb/Code/OmniCommit
+
+python SFT-Scripts/audit_encoded_lengths.py \
+  /data/yb/Code/OmniCommit/datasets/data_005/train_v1.jsonl \
+  --model /data/shc/pretrained_models/Qwen3-Omni-30B-A3B-Instruct \
+  --rows 2 --check-packing --max-length 8192 \
+  --report /data/yb/Code/OmniCommit/packing-check-swift413.json
+
+bash SFT-Scripts/train_sft_swift4.sh \
+  /data/shc/pretrained_models/Qwen3-Omni-30B-A3B-Instruct \
+  /data/yb/Code/OmniCommit/datasets/data_005/train_v1.jsonl \
+  /data/yb/Code/OmniCommit/outputs/sft-swift413-packed-001 \
+  --gpu-ids 0,1,2,3,4,5,6,7
+```
+
+第一条抽取两条会话，通过实际 processor、项目模板和打包 collator 检查音频块、监督标签和会话边界。每次运行使用新的报告路径。两条命令都默认从 `训练文件路径.tokens.txt` 读取清单，清单另存时两条都加 `--tokens-file /实际路径/清单.txt`。
+
+第二条调用原生 `megatron sft`。默认 FlashAttention、packing、8192 token、EP 4、micro/global batch 4/32、1 epoch，每 1000 个优化步保存到指定目录的 `checkpoint-1000` 等子目录。LoRA 沿用 OmniCommit 的 rank 8、alpha 32，默认留出 1% 验证集。需要全部用于训练可追加 `--split_dataset_ratio 0`。训练容器如果在较长的多轮音频上显存不足，可追加 `--micro_batch_size 2 --global_batch_size 32`。
+
+与原 OmniCommit 配方一致，checkpoint 保存未合并 LoRA 和受训词表层，省略优化器和随机数状态。若要保留这些状态用于精确续训，启动时追加 `--no_save_optim false --no_save_rng false`。
+
+验证 GPU 前向、反向和 checkpoint 写入时，可以先抽取一个训练子集并单独指定输出目录，追加 `--train_iters 2 --save_steps 2 --split_dataset_ratio 0` 和原训练集的 `--tokens-file`。应选足够的记录供打包后组成完整 batch。直接对全量文件指定 `--train_iters 2` 仍会进行全量长度预处理。评估 packing 的收益可比较稳定阶段每秒训练的有效 token 数，计时应将初次处理音频和长度统计单列。
 
 ## 已有行内时间戳：直接生成 SFT
 
@@ -82,7 +109,7 @@ python SFT-Scripts/audit_encoded_lengths.py /data/sft/train.jsonl \
 训练后沿用 FLEX 的 HF 基座加 PEFT adapter 导出方式：
 
 ```bash
-# base 是原始未量化 HF 目录，和训练命令的 MCore 目录不同。
+# base 使用原始未量化 HF 目录。在 4.1.3 中与训练入口的第一个参数一致。
 bash SFT-Scripts/merge_lora.sh \
   /models/qwen3_omni_original_hf /outputs/omnicommit/checkpoint-N \
   /models/omnicommit-merged \
@@ -97,7 +124,7 @@ bash SFT-Scripts/merge_lora.sh \
 未经验证的中间导出保留在 `.incomplete-*` 路径，不会发布为正式模型；这是输出暂存，
 不会备份或覆盖原模型。CPU 测试使用微型合成张量，不等于已完成真实模型合并与推理。
 
-## 环境
+## 数据准备和旧版 3.12.1 环境
 
 数据准备、音频检查：
 

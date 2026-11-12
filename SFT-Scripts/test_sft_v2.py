@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from prepare_sft import prepare_row
 from prepare_windows import split_row, window_boundaries
 from check_sft import check_row
-from audit_encoded_lengths import audit_encoded
+from audit_encoded_lengths import audit_encoded, check_encoded_protocol, check_packed_batch
 
 
 def example(tmp_path):
@@ -147,6 +147,42 @@ def test_actual_encoded_length_audit_rejects_truncation_and_no_labels():
         audit_encoded({"input_ids": [1, 2], "labels": [-100, 2]}, 1)
     with pytest.raises(ValueError, match="No supervised"):
         audit_encoded({"input_ids": [1], "labels": [-100]}, 2)
+
+
+def test_packing_audit_detects_masked_wait_or_reordered_tags():
+    torch = pytest.importorskip("torch")
+    row = {"audios": ["one", "two"], "messages": [
+        {"role": "assistant", "content": "<|WAIT|>"},
+        {"role": "assistant", "content": "<|DIRECT|><zh><spk1>开始。"}]}
+    ids = {"<|WAIT|>": 41, "<|DIRECT|>": 42, "<zh>": 43, "<spk1>": 44}
+    encoded = {"labels": [-100, 41, 42, 43, 44, 88], "input_features": torch.ones(2, 1, 4),
+               "feature_attention_mask": torch.ones(2, 4)}
+    check_encoded_protocol(row, encoded, ids)
+    for labels in ([-100, -100, 42, 43, 44, 88], [-100, 41, 42, 44, 43, 88]):
+        with pytest.raises(ValueError, match="actions/language/speaker"):
+            check_encoded_protocol(row, dict(encoded, labels=labels), ids)
+
+
+@pytest.mark.parametrize("damaged", [None, "text_position_ids", "cu_seq_lens_k", "input_features", "labels"])
+def test_packing_audit_compares_originals_to_collated_batch(damaged):
+    torch = pytest.importorskip("torch")
+    from types import SimpleNamespace
+    source = [{"input_ids": [1, 6], "labels": [-100, 6], "input_features": torch.ones(1, 1, 2),
+               "feature_attention_mask": torch.ones(1, 2)},
+              {"input_ids": [1, 9, 7], "labels": [-100, 9, 7], "input_features": torch.full((1, 1, 1), 2.),
+               "feature_attention_mask": torch.ones(1, 1)}]
+    batch = {"input_ids": torch.tensor([[1, 6, 1, 9, 7]]), "labels": torch.tensor([[-100, 6, -100, 9, 7]]),
+             "text_position_ids": torch.tensor([[0, 1, 0, 1, 2]]), "position_ids": torch.zeros(3, 1, 5),
+             "cu_seq_lens_k": torch.tensor([0, 2, 5]), "input_features": torch.tensor([[[1., 1.]], [[2., 0.]]]),
+             "feature_attention_mask": torch.tensor([[1., 1.], [1., 0.]])}
+    template = SimpleNamespace(data_collator=lambda packs: batch)
+    if damaged:
+        batch[damaged].flatten()[1] = 99
+        with pytest.raises(ValueError):
+            check_packed_batch(template, source, max_length=8)
+    else:
+        assert check_packed_batch(template, source, max_length=8)["records_per_pack"] == [2]
+        assert check_packed_batch(template, source, max_length=4)["records_per_pack"] == [1, 1]
 
 
 def test_total_reference_budget_is_shared_across_speakers(tmp_path):

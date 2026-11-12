@@ -141,7 +141,17 @@ python SFT-Scripts/audit_encoded_lengths.py \
 
 第二条使用原始 **HF** 模型的 processor 和实际 SWIFT 模板计算长度，不加载模型权重；它需要在原有训练环境运行。两项检查均需 token 清单，默认查找 `训练文件路径.tokens.txt`，可通过 `--tokens-file` 指定同一份清单。多分片必须共享覆盖所有数据的固定清单；继续训练和导出不能改变 token 顺序。超长数据不会自动拆分或过滤。
 
-检查通过后，在现有 `omni_ms` / ms-swift 3.12.1 环境使用 **MCore** 基座训练：
+在已跑通离线 Omni 的 **ms-swift 4.1.3** 环境，用原始 **HF** 基座启动原生 FlashAttention 和 packing。虚拟音频、WAIT/DIRECT 和语种、说话人 token 由 OmniCommit 模板与训练清单处理。完整抽检和八卡命令见 [4.1.3 八卡训练](SFT-Scripts/README.md#ms-swift-413-八卡训练)。
+
+```bash
+bash SFT-Scripts/train_sft_swift4.sh \
+  /data/shc/pretrained_models/Qwen3-Omni-30B-A3B-Instruct \
+  /data/OmniCommit/run-001/train.500ms.jsonl \
+  /data/yb/Code/OmniCommit/outputs/sft-swift413-packed-001 \
+  --gpu-ids 0,1,2,3,4,5,6,7
+```
+
+在原 `omni_ms` / **ms-swift 3.12.1** 环境使用 **MCore** 基座训练：
 
 ```bash
 bash SFT-Scripts/train_sft.sh \

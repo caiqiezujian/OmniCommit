@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Export one SFT PEFT adapter plus its original HF base as a standalone model.
 
-Uses the ms-swift 3.12.1 export interface. No training dataset or MCore conversion
+Uses the ms-swift 3.12.1 or 4.1.3 HF export interface. No training dataset or MCore conversion
 is needed. Preserves inputs and publishes the final directory only after checks.
 """
 from __future__ import annotations
@@ -232,11 +232,12 @@ def verify_export(output, expected):
             "inference_verified": False}
 
 
-def export_command(args, staging):
+def export_command(args, staging, swift_version):
+    swift4 = swift_version.split(".", 1)[0] == "4"
     return [sys.executable, "-u", "-m", "swift.cli.export",
             "--model", str(args.base), "--adapters", str(args.adapter),
-            "--model_type", "qwen3_omni", "--template", "qwen3_omni",
-            "--load_args", "false", "--train_type", "lora",
+            "--model_type", "qwen3_omni_moe" if swift4 else "qwen3_omni", "--template", "qwen3_omni",
+            "--load_args", "false", "--tuner_type" if swift4 else "--train_type", "lora",
             "--new_special_tokens", str(args.special_tokens), "--merge_lora", "true",
             "--torch_dtype", "bfloat16", "--device_map", args.device_map,
             "--safe_serialization", "true", "--max_shard_size", "5GB",
@@ -270,8 +271,8 @@ def main(argv=None):
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
         version = importlib.metadata.version("ms-swift")
         print(f"[merge] Python: {sys.executable}\n[merge] ms-swift: {version}", flush=True)
-        if version != "3.12.1":
-            print("[merge] NOTE: this recipe was source-audited for ms-swift 3.12.1; use your SFT environment.", flush=True)
+        if version not in {"3.12.1", "4.1.3"}:
+            print("[merge] NOTE: this recipe was source-audited for ms-swift 3.12.1 and 4.1.3.", flush=True)
         print("[merge] Checking local HF base, adapter tensors and protocol tokens...", flush=True)
         expected = preflight(args.base, args.adapter, args.special_tokens)
         print(json.dumps({"input_checks_passed": True, "protocol_token_ids": expected["protocol_token_ids"],
@@ -282,7 +283,7 @@ def main(argv=None):
             return 0
         args.output.parent.mkdir(parents=True, exist_ok=True)
         staging = args.output.with_name(args.output.name + ".incomplete-" + uuid.uuid4().hex[:8])
-        command = export_command(args, staging)
+        command = export_command(args, staging, version)
         print("[merge] " + shlex.join(command), flush=True)
         started = time.monotonic()
         # Run as one process; device_map can distribute HF weights across visible GPUs.

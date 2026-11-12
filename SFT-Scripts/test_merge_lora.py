@@ -143,14 +143,23 @@ def test_real_sharded_headers_and_index_checked(tmp_path):
         merge.weight_inventory(tmp_path, "model")
 
 
-def test_command_does_not_restore_old_plugin_or_use_mcore_export(tmp_path):
+@pytest.mark.parametrize(("version", "model_type", "tuner_option"), [
+    ("3.12.1", "qwen3_omni", "--train_type"),
+    ("4.1.3", "qwen3_omni_moe", "--tuner_type"),
+])
+def test_command_does_not_restore_old_plugin_or_use_mcore_export(tmp_path, version, model_type, tuner_option):
     args = SimpleNamespace(base=tmp_path / "base", adapter=tmp_path / "adapter",
                            special_tokens=tmp_path / "tokens.txt", device_map="auto")
-    cmd = merge.export_command(args, tmp_path / "staging")
+    cmd = merge.export_command(args, tmp_path / "staging", version)
+    assert cmd[cmd.index("--model_type") + 1] == model_type
+    assert cmd[cmd.index(tuner_option) + 1] == "lora"
+    assert len(set(cmd) & {"--train_type", "--tuner_type"}) == 1
     assert cmd[cmd.index("--load_args") + 1] == "false"
     assert cmd[cmd.index("--template") + 1] == "qwen3_omni"
     assert "--to_hf" not in cmd and "--mcore_model" not in cmd
     assert cmd[cmd.index("--new_special_tokens") + 1] == str(args.special_tokens)
+    assert cmd[cmd.index("--adapters") + 1] == str(args.adapter)
+    assert cmd[cmd.index("--merge_lora") + 1] == "true"
 
 
 @pytest.mark.parametrize("fails", [False, True])
