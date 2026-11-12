@@ -23,7 +23,8 @@ class VLLMBackend:
     def __init__(self, model_path, *, max_context_tokens=4096, max_new_tokens=256,
                  tensor_parallel_size=1, gpu_memory_utilization=.85,
                  max_audio_turns=80, max_audio_seconds=5.0,
-                 mm_processor_cache_gb=1.0, image_slots=1, dtype="auto"):
+                 mm_processor_cache_gb=1.0, image_slots=1, dtype="auto",
+                 manifest_validator=validate_token_manifest):
         os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
         import vllm
         from vllm import LLM, SamplingParams
@@ -37,7 +38,7 @@ class VLLMBackend:
         path = Path(model_path).resolve(strict=True)
         manifest = json.loads((path/"omnicommit_tokens.json").read_text(encoding="utf-8"))
         self.tokenizer = AutoTokenizer.from_pretrained(str(path), local_files_only=True)
-        self.allowed_tokens = validate_token_manifest(self.tokenizer, manifest)
+        self.allowed_tokens = manifest_validator(self.tokenizer, manifest)
         self.TokensPrompt = TokensPrompt
         self.max_context_tokens = max_context_tokens
         self.max_new_tokens = max_new_tokens

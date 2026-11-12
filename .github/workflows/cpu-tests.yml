@@ -13,5 +13,10 @@ jobs:
         run: python -m pytest -q
       - name: Second streaming ASR tests
         run: python -m pytest -q Second/tests
-      - name: Check both sets of training launchers
-        run: find SFT-Scripts Second/SFT-Scripts -name '*.sh' -print0 | xargs -0 -n 1 bash -n
+      - name: Meeting page and transcript export
+        run: node tests/test_web_ui_contract.mjs
+      - name: Check training, export and server launchers
+        run: |
+          find SFT-Scripts Second/SFT-Scripts -name '*.sh' -print0 | xargs -0 -n 1 bash -n
+          bash -n start_server.sh
+          bash -n Second/start_server.sh

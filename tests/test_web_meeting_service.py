@@ -32,10 +32,14 @@ def test_meeting_page_serves_its_log_scripts():
 def test_web_800ms_step_is_advertised_and_accepts_12800_samples():
     replies = [DIRECT + "<en><spk1>Hello.", WAIT, WAIT]
     with TestClient(create_app(lambda: ReplayBackend(replies), StreamOptions(chunk_seconds=.8))) as client:
+        health = client.get("/health").json()
+        assert health["protocol"] == "first" and health["chunk_seconds"] == .8
+        assert health["chunk_ms_choices"] == [500, 700, 800, 1000]
         with client.websocket_connect("/stream") as socket:
             socket.send_json({"type": "start", "sample_rate": 16000})
             ready = socket.receive_json()
             assert ready["type"] == "ready" and ready["chunk_seconds"] == .8
+            assert ready["chunk_ms_choices"] == health["chunk_ms_choices"]
             socket.send_bytes(np.zeros(12800, dtype="<i2").tobytes())
             first = socket.receive_json()
             assert first["type"] == "result" and first["end_seconds"] == .8
@@ -44,6 +48,34 @@ def test_web_800ms_step_is_advertised_and_accepts_12800_samples():
             socket.send_json({"type": "end"})
             final = socket.receive_json()
             assert final["event"] == "end_of_audio" and final["end_seconds"] == pytest.approx(.9)
+
+
+def test_first_meetings_use_independent_steps_and_keep_direct_replies():
+    reply = DIRECT + "<en><spk1>Hello."
+    app = create_app(lambda: ReplayBackend([reply, WAIT]), StreamOptions(), max_sessions=2)
+    with TestClient(app) as client:
+        with client.websocket_connect("/stream") as mic, client.websocket_connect("/stream") as system:
+            mic.send_json({"type": "start", "sample_rate": 16000, "chunk_ms": 700})
+            assert mic.receive_json()["chunk_seconds"] == .7
+            system.send_json({"type": "start", "sample_rate": 16000, "source_kind": "system", "chunk_ms": 1000})
+            assert system.receive_json()["chunk_seconds"] == 1
+            mic.send_bytes(bytes(2 * 11200))
+            result = mic.receive_json()
+            assert result["action"] == "DIRECT" and result["text"] == reply
+            assert result["end_seconds"] == .7
+            mic.send_bytes(bytes(2 * 16000))
+            assert mic.receive_json()["type"] == "error"
+            system.send_bytes(bytes(2 * 16000))
+            assert system.receive_json()["end_seconds"] == 1
+        assert client.get("/health").json()["chunk_seconds"] == .5
+
+
+@pytest.mark.parametrize("step", [600, "700"])
+def test_first_service_rejects_invalid_step_before_audio(step):
+    with TestClient(create_app(ReplayBackend, StreamOptions())) as client, client.websocket_connect("/stream") as socket:
+        socket.send_json({"type": "start", "sample_rate": 16000, "chunk_ms": step})
+        error = socket.receive_json()
+        assert error["type"] == "error" and error["heard_seconds"] == 0
 
 
 def test_speaker_corrections_change_display_and_preserve_original_identity():
@@ -148,8 +180,8 @@ def test_reference_failure_disables_only_auto_reference_for_session():
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
-@pytest.mark.parametrize("step", [.5, .8])
-def test_file_upload_playback_gating_tail_and_cleanup(step):
+@pytest.mark.parametrize(("default", "choice_ms"), [(.5, None), (.8, None), (.5, 700)])
+def test_file_upload_playback_gating_tail_and_cleanup(default, choice_ms):
     class Recording(ReplayBackend):
         def __init__(self):
             super().__init__([WAIT, WAIT, WAIT, WAIT])
@@ -158,20 +190,22 @@ def test_file_upload_playback_gating_tail_and_cleanup(step):
             self.last = audios[-1].copy() if messages[-1]["content"] != "<end_of_audio>" else None
             return super().generate(messages, audios)
 
+    step = default if choice_ms is None else choice_ms / 1000
     frames = round(step * 16000)
     final_playhead = (2 * frames + 2400) / 16000
     source = np.linspace(-.8, .8, 2 * frames + 3200, dtype=np.float32)
     file = io.BytesIO()
     sf.write(file, source, 16000, format="WAV", subtype="PCM_16")
     backend = Recording()
-    app = create_app(lambda: backend, StreamOptions(chunk_seconds=step))
+    app = create_app(lambda: backend, StreamOptions(chunk_seconds=default))
     with TestClient(app) as client:
         upload = client.post("/api/media", content=file.getvalue())
         assert upload.status_code == 200
         media_id = upload.json()["media_id"]
         with client.websocket_connect("/stream") as socket:
+            fields = {} if choice_ms is None else {"chunk_ms": choice_ms}
             socket.send_json({"type": "start", "sample_rate": 16000,
-                              "source_kind": "file", "media_id": media_id})
+                              "source_kind": "file", "media_id": media_id, **fields})
             ready = socket.receive_json()
             assert ready["type"] == "ready" and ready["chunk_seconds"] == step
             socket.send_json({"type": "file_next", "release_seconds": step - .01})

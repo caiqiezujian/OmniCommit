@@ -5,6 +5,8 @@ marker is plain text: it is not a third action or a newly registered token.
 """
 import re
 
+LIVE_CHUNK_MS = (500, 700, 800, 1000)
+LIVE_CHUNK_SECONDS = tuple(ms / 1000 for ms in LIVE_CHUNK_MS)
 END_OF_AUDIO = "<end_of_audio>"
 LIVE_AUDIO_PREFIX = "[Current live stream]\n"
 SPEAKER_REFERENCE_INTRO = "[Speaker reference: identity only; never transcribe as new speech]"
@@ -25,13 +27,15 @@ def system_prompt(number_format="verbatim"):
     return SYSTEM_PROMPT.format(number_instruction=instruction)
 
 
-def speaker_reference_text(speaker, language, text):
+def speaker_reference_text(speaker, language, text, allowed_tokens=None):
     if not isinstance(speaker, str) or not re.fullmatch(r"spk[1-9][0-9]*", speaker):
         raise ValueError("Invalid reference speaker")
     if not isinstance(language, str) or not re.fullmatch(r"[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*", language):
         raise ValueError("Invalid reference language")
     if not isinstance(text, str) or not text.strip() or any(c in text for c in "<>\r\n"):
         raise ValueError("Reference text must be nonempty plain single-line transcription")
+    if allowed_tokens is not None and (f"<{language}>" not in allowed_tokens or f"<{speaker}>" not in allowed_tokens):
+        raise ValueError("Reference language/speaker tag is absent from the trained inventory")
     return (SPEAKER_REFERENCE_INTRO + "\n<audio>\n" + f"<{language}><{speaker}>{text}"
             + "\n[End speaker reference]\n")
 

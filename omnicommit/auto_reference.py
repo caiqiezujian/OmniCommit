@@ -12,7 +12,7 @@ import numpy as np
 
 from .forced_alignment import QWEN_LANGUAGES, restore_qwen_spans, strict_qwen_timestamps
 from .runtime_protocol import speaker_reference_text
-from .streaming import SAMPLE_RATE, SpeakerReference, parse_reply
+from .streaming import SAMPLE_RATE, SpeakerReference
 
 
 class QwenAutoReference:
@@ -74,8 +74,7 @@ class QwenAutoReference:
                 continue
             if abs(low - position) > 1 / SAMPLE_RATE:
                 return None
-            parsed = parse_reply(turn.reply)
-            if any(p['speaker'] != speaker or p['language'] != language for p in parsed['segments']):
+            if any(pair != (language, speaker) for pair in turn.attributions):
                 return None
             pieces.append(turn.audio[round((low-turn.start)*SAMPLE_RATE):round((high-turn.start)*SAMPLE_RATE)])
             position = high

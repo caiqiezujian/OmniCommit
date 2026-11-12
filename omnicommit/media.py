@@ -19,6 +19,8 @@ import uuid
 import numpy as np
 import soundfile as sf
 
+from .runtime_protocol import LIVE_CHUNK_SECONDS
+
 RATE = 16000
 MAX_UPLOAD_BYTES = 1024 * 1024 * 1024
 MAX_DURATION_SECONDS = 4 * 60 * 60
@@ -121,11 +123,15 @@ class MediaCursor:
     def finished(self):
         return self.done or (self.final_release is not None and self.position >= self.final_release)
 
+    def _next_source_boundary(self, chunk_seconds):
+        if isinstance(chunk_seconds, bool) or chunk_seconds not in LIVE_CHUNK_SECONDS:
+            raise MediaError(f"Chunk seconds must be one of {LIVE_CHUNK_SECONDS}")
+        return round((self.chunk_index + 1) * chunk_seconds * self.upload.sample_rate)
+
     def next_chunk(self, release_seconds, chunk_seconds, *, final=False):
         if isinstance(release_seconds, bool) or not isinstance(release_seconds, (int, float)) or not math.isfinite(release_seconds):
             raise MediaError('Invalid playback position')
-        if isinstance(chunk_seconds, bool) or chunk_seconds not in (.5, .8, 1.):
-            raise MediaError('Chunk length must be 0.5, 0.8 or 1 second')
+        nominal_end = self._next_source_boundary(chunk_seconds)
         if self.chunk_seconds is not None and chunk_seconds != self.chunk_seconds:
             raise MediaError('Chunk length cannot change within a session')
         self.chunk_seconds = chunk_seconds
@@ -142,7 +148,6 @@ class MediaCursor:
             self.final_release = release
         self.last_release = release
         if self.finished: return None
-        nominal_end = round((self.chunk_index + 1) * chunk_seconds * source_rate)
         end = min(nominal_end, self.upload.samples)
         if end > release:
             if self.final_release is None or release <= self.position:

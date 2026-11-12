@@ -14,19 +14,27 @@ from .streaming import ContextBudgetError, WAIT
 
 def validate_token_manifest(tokenizer, manifest):
     if manifest.get("schema_version") != 1:
-        raise ValueError("Unsupported OmniCommit tokenizer manifest")
+        raise ValueError("Expected a first-generation OmniCommit WAIT/DIRECT tokenizer manifest")
+    tokens = validate_manifest_token_ids(tokenizer, manifest)
+    if not {"<|WAIT|>", "<|DIRECT|>"}.issubset(tokens):
+        raise ValueError("Manifest missing action tokens")
+    return tokens
+
+
+def validate_manifest_token_ids(tokenizer, manifest):
+    """Check the exact tokenizer shipped with this model for either ASR protocol."""
     tokens = manifest.get("tokens")
     ids = manifest.get("token_ids")
-    if not isinstance(tokens, list) or len(tokens) != len(set(tokens)) or not isinstance(ids, dict):
+    if (not isinstance(tokens, list) or not all(isinstance(token, str) for token in tokens)
+            or len(tokens) != len(set(tokens)) or not isinstance(ids, dict) or set(ids) != set(tokens)):
         raise ValueError("Malformed token manifest")
-    if not {"<|WAIT|>", "<|DIRECT|>"}.issubset(tokens) or set(ids) != set(tokens):
-        raise ValueError("Manifest missing action tokens or IDs")
     if manifest.get("tokenizer_length") != len(tokenizer):
         raise ValueError("Exported tokenizer length differs from manifest")
     seen = set()
     for token in tokens:
         actual = tokenizer.encode(token, add_special_tokens=False)
-        if actual != [ids[token]] or ids[token] in seen:
+        if (type(ids[token]) is not int or not 0 <= ids[token] < len(tokenizer)
+                or actual != [ids[token]] or ids[token] in seen):
             raise ValueError("Exported tokenizer ID mismatch for " + token)
         if token not in tokenizer.all_special_tokens:
             raise ValueError("Protocol token is not registered special: " + token)
@@ -52,14 +60,15 @@ def multimodal_messages(messages):
 
 class HFBackend:
     def __init__(self, model_path, *, max_context_tokens=4096, max_new_tokens=256,
-                 device_map="auto", dtype="auto", attn_implementation="sdpa"):
+                 device_map="auto", dtype="auto", attn_implementation="sdpa",
+                 manifest_validator=validate_token_manifest):
         import torch
         from transformers import Qwen3OmniMoeForConditionalGeneration, Qwen3OmniMoeProcessor
         path = Path(model_path).resolve(strict=True)
         manifest = json.loads((path / "omnicommit_tokens.json").read_text(encoding="utf-8"))
         self.processor = Qwen3OmniMoeProcessor.from_pretrained(str(path), local_files_only=True)
         self.tokenizer = self.processor.tokenizer
-        self.allowed_tokens = validate_token_manifest(self.tokenizer, manifest)
+        self.allowed_tokens = manifest_validator(self.tokenizer, manifest)
         probe = self.processor.apply_chat_template(multimodal_messages([
             {"role": "user", "content": "<audio>"}]), tokenize=False, add_generation_prompt=True)
         audio_body = re.search(r"<\|im_start\|>user\n(.*?)<\|im_end\|>", probe, re.S)

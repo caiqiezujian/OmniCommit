@@ -15,7 +15,7 @@ def pcm(seconds=.5):
     return np.full(round(16000*seconds), .1, dtype=np.float32)
 
 
-@pytest.mark.parametrize("step", [.5, .8, 1.0])
+@pytest.mark.parametrize("step", [.5, .7, .8, 1.0])
 def test_configured_chunk_step_and_real_short_tail(step):
     from argparse import ArgumentParser
     from omnicommit.stream_cli import add_runtime_arguments
@@ -42,6 +42,21 @@ def test_wait_and_full_attribution_parser():
     for bad in ("", WAIT+"x", DIRECT+"hello", DIRECT+"<en><spk1>", DIRECT+"<en><spk1>hi<|WAIT|>"):
         with pytest.raises(ValueError):
             parse_reply(bad)
+
+
+def test_web_vllm_reserves_capacity_for_steps_other_than_startup_default(monkeypatch):
+    from omnicommit import web_service
+
+    def inspect_launch(parser, args, backend_factory, options, app_factory):
+        assert options.chunk_seconds == .8
+        config = backend_factory()
+        assert config["max_audio_turns"] == 60 + options.max_speakers + 2
+        assert config["max_audio_seconds"] == 1.0
+
+    monkeypatch.setattr(web_service, "serve_web", inspect_launch)
+    monkeypatch.setattr("omnicommit.vllm_backend.VLLMBackend", lambda path, **kwargs: kwargs)
+    web_service.main(["--backend", "vllm", "--model", "mock-model", "--chunk-seconds", ".8",
+                      "--max-context-seconds", "30", "--max-reference-seconds", ".5"])
 
 
 def test_direct_preserves_boundary_whitespace():

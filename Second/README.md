@@ -1,4 +1,4 @@
-# 第二版 SFT · WAIT / 正文
+# 第二版流式 ASR · 数据构建、SFT 与会议服务
 
 一条带时间戳的录音生成一条多轮训练样本。模型每轮听一块新增音频，回答本轮刚刚完整听到的文字。整轮没有可以提交的新文字时，回答独立的 `<|WAIT|>`。开始转录和每次语种或说话人变化时，输出完整标签对，例如 `<en><spk2>`。
 
@@ -9,7 +9,7 @@
 | ms-swift 3.12.1 / Megatron | [train_sft.sh](SFT-Scripts/train_sft.sh) | MCore 基座目录 | 3000 步，可传 `--save_interval` |
 | ms-swift 4.1.3 / Megatron | [train_sft_swift4.sh](SFT-Scripts/train_sft_swift4.sh) | 原始 HF 基座目录 | 1000 步，可传 `--save_steps` |
 
-本手册到第二版 LoRA checkpoint 为止。仓库顶层的合并器和 Web 服务目前接受第一版的 WAIT / DIRECT 协议。
+第二版训练结束后，使用本目录的 `SFT-Scripts/merge_lora.sh` 导出 HF 模型，再用本目录的 `start_server.sh` 启动会议服务。导出和服务复用仓库顶层实现，部署时请保留完整的 OmniCommit 目录。
 
 ## 1. 准备输入
 
@@ -127,3 +127,73 @@ bash SFT-Scripts/train_sft_swift4.sh \
 ~~~
 
 若将多档步长混训，应先按原始录音或会议划分训练集和验证集，再分别生成各步长，并在训练时传入独立验证集，以免同一录音的不同版本落入两边。混训所用的 token 清单需覆盖参与训练和验证的全部语种、说话人和 WAIT，可用 `--tokens-file` 指定。
+
+## 5. 导出第二版 checkpoint
+
+在 SFT 环境中运行。第一项传**原始未量化 HF 基座**，第二项传含 `adapter_config.json` 和适配器权重的实际 checkpoint 目录。`--special-tokens` 使用该次训练的原始 token 清单。示例中的目录按服务器实际路径替换。
+
+~~~bash
+cd /data/yb/Code/OmniCommit/Second
+
+bash SFT-Scripts/merge_lora.sh \
+  /data/models/qwen3_omni_original_hf \
+  /data/yb/Code/OmniCommit/outputs/second-sft-001/checkpoint-1000 \
+  /data/yb/Code/OmniCommit/models/second-merged \
+  --special-tokens /data/yb/Code/OmniCommit/datasets/second_run_001/train.700ms.jsonl.tokens.txt \
+  --gpu-ids 0
+~~~
+
+如已有第二版导出器生成的完整 HF 目录，直接用它启动服务。第二版导出器在 `omnicommit_tokens.json` 中写入 `protocol.name=omnicommit_second`。启动时会校验协议、token 清单及其真实 ID。从旧流程取得的裸 HF 目录或第一版导出目录，需要从对应的第二版训练适配器和训练清单重新导出。
+
+## 6. 启动第二版会议网页
+
+在 GPU 服务器的推理环境中运行。默认后端沿用仓库已适配的 vLLM 0.11.1，默认监听 `0.0.0.0:18890`，网页默认选中 500 ms，数字格式为 `normalized`。下面示例用一张可见 GPU，并将网页默认值设为 700 ms。单卡可运行的上下文长度取决于模型大小和实际显存。
+
+~~~bash
+cd /data/yb/Code/OmniCommit/Second
+python -m pip install -r ../requirements-web.txt
+
+CUDA_VISIBLE_DEVICES=0 bash start_server.sh \
+  /data/yb/Code/OmniCommit/models/second-merged \
+  --chunk-ms 700
+~~~
+
+网页地址为 `http://服务器内网IP:18890`，无需访问令牌。浏览器使用麦克风或共享系统声音需要受信任的 HTTPS 或 localhost。已有证书时，可在启动命令末尾加 `--ssl-certfile /path/server.crt --ssl-keyfile /path/server.key`。上传音视频还需要服务器上可执行的 `ffmpeg`。HF 推理可给同一命令追加 `--backend hf`。
+
+~~~bash
+curl http://127.0.0.1:18890/health
+~~~
+
+确认 `ready` 为 `true`、`protocol` 为 `second`。在网页的“音频来源”下选择**音频块时长**，再点击“开始转录”。可选 500、700、800、1000 ms。如果服务以 `--chunk-ms 600` 启动，菜单还会列出并默认选中 600 ms。选定值对本场会议的麦克风、系统声音或文件输入生效。结束会议后可选择下一场的步长，无需重启模型。健康检查的 `chunk_seconds` 是启动默认值，`chunk_ms_choices` 是可选列表，每场 WebSocket 握手的 `ready.chunk_seconds` 记录该场实际值。`--number-format verbatim` 用于保留口述数字写法的模型。
+
+使用小于 500 ms 的步长时，文件播放可在已知的最后一块补零到训练时的最短尾块长度。实时麦克风若恰好结束在一个完整小块上，服务在收到结束事件前已处理该块，因此最后一块的补零长度可能和离线构建不同。
+
+### 第二版模型的实际输出
+
+~~~text
+第一轮    <zh><spk1>预算是
+第二轮    <|WAIT|>
+第三轮    300元。<en><spk1>OK?
+第四轮    <en><spk2>Sure,
+第五轮     I will.
+结束事件  <|WAIT|>
+~~~
+
+第三轮开头的“300元。”沿用先前提交的中文与 `spk1`，同轮的 `OK?` 切换到英文。第五轮原始字符串是 `" I will."`，词间空格也是转录的一部分。模型原始回复保存在事件的 `text` 字段。事件层沿用 `DIRECT` 代表本轮提交了正文，`segments` 给出每段的完整归属，方便网页、人工修正和日志导出。发送 `<end_of_audio>` 后模型应答独立的 `<|WAIT|>`。
+
+网页和正文 TXT 会把同一语种、同一显示说话人的连续增量接成一段，例如 `Sure, I will.`。点击段内某次新增的文字可以单独修正其说话人。逐轮日志和 JSON 保留每轮原文。
+
+### 长会议与说话人参照
+
+默认使用滚动上下文。服务会携带裁剪位置之前最后一次提交的语种和说话人，使窗口从纯正文续写开始时也能恢复归属。页面允许修正一个片段、合并或重命名说话人。声音参照按会话保存，人工确认清晰且无重叠的已听音频后可以加入。长时间连续 WAIT 时会受到待提交音频及上下文预算限制。
+
+如需自动选取参照，在同一启动命令末尾追加独立对齐环境与本地模型的路径。默认不开启自动对齐。候选只取自已收到的音频，真实会议中能否认回久未发言的人需要用模型和会议音频验证。
+
+~~~bash
+CUDA_VISIBLE_DEVICES=0 bash start_server.sh \
+  /data/yb/Code/OmniCommit/models/second-merged --chunk-ms 700 \
+  --auto-reference-model /data/yb/models/Qwen3-ForcedAligner-0.6B \
+  --auto-reference-python /data/yb/envs/qwen-align/bin/python
+~~~
+
+麦克风、系统声音、文件播放、自动参照的语种覆盖与人工修正沿用共用网页。[网页操作和对齐环境安装](../docs/web_meeting_service_zh.md)

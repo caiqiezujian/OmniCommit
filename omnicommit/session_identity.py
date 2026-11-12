@@ -10,7 +10,7 @@ import math
 import numpy as np
 
 from .runtime_protocol import speaker_reference_text
-from .streaming import SAMPLE_RATE, SpeakerReference, parse_reply, DIRECT
+from .streaming import SAMPLE_RATE, SpeakerReference
 
 
 class SessionLedger:
@@ -157,9 +157,8 @@ class SessionLedger:
         # identity verification. Evidence provider must perform those checks.
         if rms < .005 or clipping > .02:
             return None
-        parse_reply(DIRECT + f'<{item["language"]}><{speaker}>' + item['text'],
-                    getattr(self.session.backend, 'allowed_tokens', None))
-        speaker_reference_text(speaker, item['language'], item['text'])
+        speaker_reference_text(speaker, item['language'], item['text'],
+                               getattr(self.session.backend, 'allowed_tokens', None))
         self.session.references[speaker] = SpeakerReference(speaker, item['language'], item['text'],
                                                             start, end, audio)
         self.reference_evidence[speaker] = {'status': 'estimated', 'source': 'independent_online',

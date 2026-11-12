@@ -3,12 +3,13 @@
 // Keep the displayed range independent from the append-only event history.
 const LOG_PAGE_SIZE = 50;
 
-function logHistory() {
-  return {all: [], model: [], WAIT: [], DIRECT: [], waitRun: 0, waitSeconds: 0, lastDirect: null, error: null};
+function logHistory(protocol = 'first') {
+  return {protocol, all: [], model: [], WAIT: [], DIRECT: [], waitRun: 0, waitSeconds: 0, lastDirect: null, error: null};
 }
 
 function indexLogRow(history, row) {
   history.all.push(row);
+  if (row.type === 'ready' && row.protocol) history.protocol = row.protocol;
   if (row.type === 'error') history.error = row;
   if (row.type === 'result' && (row.action === 'WAIT' || row.action === 'DIRECT')) {
     history.model.push(row);
@@ -63,7 +64,8 @@ class MeetingTurnLog {
   constructor(get, download) {
     this.get = get;
     this.download = download;
-    this.current = logHistory();
+    this.protocol = 'first';
+    this.current = logHistory(this.protocol);
     this.view = this.current;
     this.currentId = null;
     this.selectedId = null;
@@ -143,7 +145,7 @@ class MeetingTurnLog {
       this.archive.flush(previous).then(() => this.unsaved.delete(previous), () => this.warnStorage());
     }
     this.currentId = this.archive.start(sourceKind, sourceName);
-    this.current = logHistory();
+    this.current = logHistory(this.protocol);
     this.sessions.set(this.currentId, {id: this.currentId, startedAt: new Date().toISOString(), sourceKind, sourceName});
     this.selectedId = this.currentId;
     this.updateSessions();
@@ -216,14 +218,18 @@ class MeetingTurnLog {
     const n = this.visible().length;
     const last = Math.min(this.offset + LOG_PAGE_SIZE, n);
     const g = this.get;
-    g('logCounts').textContent = 'WAIT ' + this.view.WAIT.length + ' · DIRECT ' + this.view.DIRECT.length;
+    const commit = this.view.protocol === 'second' ? '正文' : 'DIRECT';
+    g('logTitle').textContent = '逐轮日志 · WAIT / ' + commit;
+    g('committedFilter').textContent = '仅' + (commit === 'DIRECT' ? ' DIRECT' : '正文');
+    g('logCounts').textContent = 'WAIT ' + this.view.WAIT.length + ' · ' + commit + ' ' + this.view.DIRECT.length;
     const {lastDirect, waitRun, waitSeconds, error} = this.view;
     const details = [];
     if (lastDirect) {
       const segments = lastDirect.segments || [];
       const lastSpan = segments[segments.length - 1];
       const when = Number.isFinite(lastDirect.end_seconds) ? lastDirect.end_seconds.toFixed(1) + ' 秒' : '第 ' + lastDirect.turn + ' 轮';
-      details.push('最后一次 DIRECT 在 ' + when + (lastSpan ? '（' + lastSpan.language + ' · ' + lastSpan.speaker + '）' : ''));
+      details.push('最后一次' + (commit === 'DIRECT' ? ' DIRECT ' : '提交正文') + '在 ' + when
+        + (lastSpan ? '（' + lastSpan.language + ' · ' + lastSpan.speaker + '）' : ''));
     }
     if (waitRun) details.push('连续 WAIT ' + waitRun + ' 个音频块' + (Number.isFinite(waitSeconds) ? ' / ' + waitSeconds.toFixed(1) + ' 秒' : ''));
     g('logProgress').textContent = details.join('；');

@@ -170,4 +170,129 @@ vm.runInContext(`
 assert.match(elements.get('logProgress').textContent,/60\.0 秒（zh · spk1）.*连续 WAIT 2 个音频块 \/ 1\.0 秒/);
 assert.equal(elements.get('logError').hidden,false);
 assert.match(elements.get('logError').textContent,/61\.0 秒.*Context audio budget exhausted/);
+
+// Second uses the same transport metadata for UI grouping; the visible log and
+// downloaded session must preserve the sparse model text, including its spaces.
+vm.runInContext(`
+  turnLog.start('system');
+  log({type:'ready',protocol:'second',chunk_seconds:.7});
+  log({type:'result',event:'audio',turn:1,action:'DIRECT',text:'<en><spk4>Yes'});
+  log({type:'result',event:'audio',turn:2,action:'DIRECT',text:' I will.'});
+  $('logFilter').value='DIRECT'; $('logFilter').onchange();
+  $('logJsonl').onclick();
+`,context);
+assert.equal(elements.get('brand').textContent,'OmniCommit Second');
+assert.match(elements.get('serviceDescription').textContent,/700 ms/);
+assert.match(elements.get('logTitle').textContent,/WAIT \/ 正文/);
+assert.equal(elements.get('committedFilter').textContent,'仅正文');
+assert.equal(elements.get('logCounts').textContent,'WAIT 0 · 正文 2');
+assert.equal(JSON.parse(downloads.at(-1).body.trimEnd().split('\n').at(-1)).text,' I will.');
+
+vm.runInContext(`
+  finished=true; ending=true; busy=false; socket=null;
+  speakers=[{speaker:'spk1',name:'甲'},{speaker:'spk2',name:'乙'}];
+  segments=[{segment_id:1,display_speaker:'spk1',language:'en',text:'Yes.'}];
+  render();
+`,context);
+const transcript = elements.get('transcript');
+const firstGroup = transcript.children[0], firstPiece = firstGroup.children[1];
+vm.runInContext(`
+  for (const seg of [
+    {segment_id:2,display_speaker:'spk1',language:'en',text:' I will.'},
+    {segment_id:3,display_speaker:'spk1',language:'zh',text:'可以。'},
+    {segment_id:4,display_speaker:'spk2',language:'zh',text:'好。'}]) {
+    segments.push(seg);
+    appendTranscript($('transcript'), seg);
+  }
+`,context);
+assert.equal(transcript.children.length,3);
+assert.equal(transcript.children[0],firstGroup);
+assert.equal(firstGroup.children[1],firstPiece);
+assert.equal(firstGroup.children.slice(1).map(e=>e.textContent).join(''),'Yes. I will.');
+assert.equal(firstGroup.children[2].dataset.segmentId,2);
+assert.equal(vm.runInContext('transcriptText()',context),'甲 [en] Yes. I will.\n甲 [zh] 可以。\n乙 [zh] 好。\n');
+context.prompt=()=> 'spk2';
+firstGroup.children[2].onclick();
+assert.equal(vm.runInContext('segments[1].display_speaker',context),'spk2');
+assert.equal(transcript.children.length,4);
+assert.equal(vm.runInContext('transcriptText()',context),'甲 [en] Yes.\n乙 [en]  I will.\n甲 [zh] 可以。\n乙 [zh] 好。\n');
+
+// Start via the actual page handler. Stub only the browser capture/upload
+// devices and transport so lock timing and the real JSON handshake are covered.
+assert.match(html, /<label id="chunkSettings" for="chunkMs" hidden>/);
+const picker = elements.get('chunkMs'), chunkSettings = document.getElementById('chunkSettings');
+chunkSettings.hidden = true;
+const sockets = [];
+context.location = {protocol:'http:', host:'localhost'};
+context.WebSocket = class {
+  constructor() { this.frames = []; this.readyState = 1; sockets.push(this); }
+  send(frame) { this.frames.push(frame); }
+  close() { this.readyState = 3; }
+};
+context.fetch = async () => ({ok:true, json:async () =>
+  ({media_id:'file-7', duration_seconds:20, sample_rate:16000, samples:320000})});
+media.play = async () => { media.paused = false; };
+elements.get('file').files = [{name:'meeting.wav'}];
+vm.runInContext(`
+  turnLog.protocol = 'first'; acceptedChunkMs = null;
+  prepareLive = async () => { context = {resume: async () => {}, close: async () => {}}; };
+`, context);
+
+async function startMeeting(source) {
+  context.selectedSource = source;
+  vm.runInContext('mode=selectedSource;',context);
+  const starting = elements.get('start').onclick();
+  assert.equal(picker.disabled, true, 'locked before capture permissions or file upload');
+  await starting;
+  const ws = sockets.at(-1);
+  ws.onopen();
+  return [ws, JSON.parse(ws.frames[0])];
+}
+vm.runInContext("identifyService({protocol:'first',chunk_seconds:.5})",context);
+assert.equal(chunkSettings.hidden, true);
+const [legacySocket, legacyStart] = await startMeeting('microphone');
+assert.deepEqual(legacyStart, {type:'start',sample_rate:16000,source_kind:'microphone'});
+legacySocket.close();
+await vm.runInContext('cleanup()',context);
+for (const service of [
+  {protocol:'first',chunk_seconds:.8,chunk_ms_choices:[500,700,800,1000]},
+  {protocol:'second',chunk_seconds:.601,chunk_ms_choices:[500,601,700,800,1000]},
+]) {
+  // A fresh page receives its capabilities and default from its own service.
+  picker.replaceChildren();
+  chunkSettings.hidden = true;
+  context.stepService = service;
+  vm.runInContext('acceptedChunkMs=null; identifyService(stepService)',context);
+  assert.equal(chunkSettings.hidden, false);
+  assert.equal(picker.value, String(Math.round(service.chunk_seconds * 1000)));
+  assert.deepEqual(picker.children.map(option => option.textContent), service.chunk_ms_choices.map(ms => ms + ' ms'));
+  assert.equal(elements.get('brand').textContent, service.protocol === 'first' ? 'OmniCommit' : 'OmniCommit Second');
+  for (const [source, ms] of [['microphone',700], ['system',800], ['file',1000]]) {
+    picker.value = String(ms);
+    vm.runInContext('identifyService(stepService)',context); // delayed health never overwrites the selection
+    const [ws, start] = await startMeeting(source);
+    assert.equal(start.chunk_ms, ms);
+    assert.equal(start.source_kind, source);
+    if (source === 'file') assert.equal(start.media_id,'file-7');
+    await ws.onmessage({data:JSON.stringify({...service,type:'ready',chunk_seconds:ms/1000})});
+    assert.equal(vm.runInContext('step',context), ms * 16);
+    assert.equal(picker.disabled, true);
+    assert.match(elements.get('serviceDescription').textContent, new RegExp(ms + ' ms'));
+    assert.equal(elements.get('logTitle').textContent, '逐轮日志 · WAIT / ' + (service.protocol === 'first' ? 'DIRECT' : '正文'));
+    if (source !== 'file') {
+      context.expectedFrames = ms * 16;
+      vm.runInContext('capture(new Float32Array(expectedFrames - 1))',context);
+      assert.equal(ws.frames.length, 1);
+      vm.runInContext('capture(new Float32Array(1))',context);
+      assert.equal(ws.frames[1].byteLength, ms * 32);
+    }
+    vm.runInContext('identifyService(stepService)',context);
+    assert.equal(picker.value, String(ms));
+    await ws.onmessage({data:JSON.stringify({type:'result',event:'end_of_audio',action:'WAIT',text:'<|WAIT|>'})});
+    assert.equal(picker.disabled, false);
+  }
+}
+elements.get('file').files = [];
+await elements.get('start').onclick();
+assert.equal(picker.disabled, false, 'unlocked after a failed file start');
 console.log('web UI contract checks passed');

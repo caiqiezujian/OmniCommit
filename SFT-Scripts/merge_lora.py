@@ -20,8 +20,7 @@ import sys
 import time
 import uuid
 
-PROTOCOL = ["<|WAIT|>", "<|DIRECT|>"]
-from check_sft import read_tokens
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from omnicommit.runtime_protocol import END_OF_AUDIO
 VOCAB_KEYS = ("thinker.model.embed_tokens.weight", "thinker.lm_head.weight")
 
@@ -129,7 +128,17 @@ def protocol_ids(tokenizer, tokens):
     return ids
 
 
-def preflight(base, adapter, tokens_file):
+def read_export_protocol(tokens_file):
+    from check_sft import read_tokens
+    read_tokens(tokens_file)
+    tokens = tokens_file.read_text(encoding="utf-8-sig").splitlines()
+    if len(tokens) < 4:
+        raise ValueError("Use the complete dataset-generated tokens file, including language and speaker tokens")
+    return tokens, {"schema_version": 1, "protocol": {"wait": "<|WAIT|>", "direct": "<|DIRECT|>",
+                                                       "end_of_audio": END_OF_AUDIO}}
+
+
+def preflight(base, adapter, tokens_file, *, protocol_reader=read_export_protocol):
     with diagnostic_stage("Import transformers.AutoTokenizer (may initialize PyTorch)"):
         from transformers import AutoTokenizer
 
@@ -139,10 +148,7 @@ def preflight(base, adapter, tokens_file):
             raise ValueError("--base must be the original Hugging Face Qwen3-Omni model directory, not MCore")
         if config.get("quantization_config") or config.get("thinker_config", {}).get("quantization_config"):
             raise ValueError("Use the original unquantized HF base for this merge")
-        tokens = tokens_file.read_text(encoding="utf-8-sig").split()
-        read_tokens(tokens_file)  # Validate WAIT/DIRECT first, then unique language/speaker tokens.
-        if len(tokens) < 4:
-            raise ValueError("Use the complete dataset-generated tokens file, including language and speaker tokens")
+        tokens, manifest_metadata = protocol_reader(tokens_file)
         adapter_config = read_json(adapter / "adapter_config.json")
         if str(adapter_config.get("peft_type", "")).upper() != "LORA":
             raise ValueError("Expected a PEFT LoRA adapter_config.json, not a merged/MCore checkpoint")
@@ -177,7 +183,8 @@ def preflight(base, adapter, tokens_file):
         if max(ids.values()) >= shape[0]:
             raise ValueError(f"Protocol IDs do not fit saved module {key}")
         modules[target] = {"key": key, **adapter_weights[key]}
-    return {"tokens": tokens, "protocol_token_ids": ids, "tokenizer_length": len(tokenizer),
+    return {"tokens": tokens, "manifest_metadata": manifest_metadata,
+            "protocol_token_ids": ids, "tokenizer_length": len(tokenizer),
             "expected_vocab_size": expected_vocab, "saved_modules": modules,
             "base_tensor_shapes": {key: value["shape"] for key, value in base_weights.items()},
             "training_base_recorded": training_args.get("model"),
@@ -244,7 +251,7 @@ def export_command(args, staging, swift_version):
             "--output_dir", str(staging)]
 
 
-def main(argv=None):
+def main(argv=None, *, protocol_reader=read_export_protocol):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("base", type=Path, help="Original unquantized HF Qwen3-Omni directory (NOT MCore)")
     parser.add_argument("adapter", type=Path, help="One checkpoint-N with adapter_config.json and adapter weights")
@@ -274,7 +281,7 @@ def main(argv=None):
         if version not in {"3.12.1", "4.1.3"}:
             print("[merge] NOTE: this recipe was source-audited for ms-swift 3.12.1 and 4.1.3.", flush=True)
         print("[merge] Checking local HF base, adapter tensors and protocol tokens...", flush=True)
-        expected = preflight(args.base, args.adapter, args.special_tokens)
+        expected = preflight(args.base, args.adapter, args.special_tokens, protocol_reader=protocol_reader)
         print(json.dumps({"input_checks_passed": True, "protocol_token_ids": expected["protocol_token_ids"],
                           "vocab_size": expected["expected_vocab_size"],
                           "training_base_recorded": expected["training_base_recorded"]}, ensure_ascii=False), flush=True)
@@ -297,9 +304,8 @@ def main(argv=None):
                   "adapter": str(args.adapter), "output": str(args.output), "ms_swift": version,
                   "elapsed_seconds": round(time.monotonic() - started, 2), **verified}
         (staging / "omnicommit_merge_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        manifest = {"schema_version": 1, "tokens": expected["tokens"],
-                    "token_ids": verified["protocol_token_ids"], "tokenizer_length": verified["tokenizer_length"],
-                    "protocol": {"wait": PROTOCOL[0], "direct": PROTOCOL[1], "end_of_audio": END_OF_AUDIO}}
+        manifest = {**expected["manifest_metadata"], "tokens": expected["tokens"],
+                    "token_ids": verified["protocol_token_ids"], "tokenizer_length": verified["tokenizer_length"]}
         (staging / "omnicommit_tokens.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         (staging / "omnicommit_tokens.txt").write_text("\n".join(expected["tokens"]) + "\n", encoding="utf-8")
         if args.output.exists():

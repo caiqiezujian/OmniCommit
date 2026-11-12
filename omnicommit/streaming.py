@@ -12,7 +12,7 @@ import time
 
 import numpy as np
 
-from .runtime_protocol import (system_prompt, END_OF_AUDIO,
+from .runtime_protocol import (system_prompt, END_OF_AUDIO, LIVE_CHUNK_SECONDS,
                                speaker_reference_text, LIVE_AUDIO_PREFIX,
                                speaker_registry_text, last_committed_text)
 
@@ -67,9 +67,12 @@ class StreamOptions:
     context_policy: str = "verified"
     rolling_tail_seconds: float = 2.0
 
+    def _validate_chunk_seconds(self):
+        if isinstance(self.chunk_seconds, bool) or self.chunk_seconds not in LIVE_CHUNK_SECONDS:
+            raise ValueError(f"chunk_seconds must be one of {LIVE_CHUNK_SECONDS}")
+
     def __post_init__(self):
-        if isinstance(self.chunk_seconds, bool) or self.chunk_seconds not in (.5, .8, 1.0):
-            raise ValueError("chunk_seconds must be 0.5, 0.8 or 1.0")
+        self._validate_chunk_seconds()
         for key in ("recent_seconds", "max_context_seconds", "max_pending_seconds",
                     "max_reference_seconds", "max_total_reference_seconds", "rolling_tail_seconds"):
             value = getattr(self, key)
@@ -104,6 +107,9 @@ class SpeakerReference:
 
 
 class StreamSession:
+    sequential_speaker_ids = True
+    retryable_errors = ()
+
     def __init__(self, backend, options=None):
         self.backend = backend
         self.options = options or StreamOptions()
@@ -145,12 +151,15 @@ class StreamSession:
                 self._speakers_before_history.add(attribution[1])
                 self._last_attribution_before_history = attribution
 
-    def _context(self, current_audio=None, end_of_audio=False):
-        messages = [{"role": "system", "content": system_prompt(self.options.number_format)}]
+    def _context_system_prompt(self):
         # Match SFT windows: the system prefix describes the state at the
         # START of the retained dialogue. Later changes appear in its replies.
-        messages[0]["content"] += speaker_registry_text(self._speakers_before_history)
-        messages[0]["content"] += last_committed_text(*self._last_attribution_before_history)
+        return (system_prompt(self.options.number_format)
+                + speaker_registry_text(self._speakers_before_history)
+                + last_committed_text(*self._last_attribution_before_history))
+
+    def _context(self, current_audio=None, end_of_audio=False):
+        messages = [{"role": "system", "content": self._context_system_prompt()}]
         audios = []
         ref_prefix = ""
         for speaker in sorted(self.references, key=lambda name: int(name[3:])):
@@ -181,12 +190,18 @@ class StreamSession:
             if speaker not in seen:
                 if len(seen) >= self.options.max_speakers:
                     raise ValueError("Speaker registry budget exhausted; never recycle an ID")
-                if speaker != "spk%d" % (len(seen) + 1):
+                if self.sequential_speaker_ids and speaker != "spk%d" % (len(seen) + 1):
                     raise ValueError("New speakers must use the next meeting-wide ID")
                 seen.append(speaker)
         return seen
 
-    def step(self, audio=None, *, end_of_audio=False):
+    def _model_reply(self, reply, end_of_audio):
+        return parse_reply(reply, getattr(self.backend, "allowed_tokens", None))
+
+    def _minimum_input_samples(self, final_chunk):
+        return SAMPLE_RATE // 2
+
+    def step(self, audio=None, *, end_of_audio=False, final_chunk=False):
         self._check_open()
         self.evicted_this_turn = False
         if end_of_audio:
@@ -219,18 +234,20 @@ class StreamSession:
             if retained > self.options.max_context_seconds + 1e-8:
                 raise ContextBudgetError("Context audio budget exhausted; cannot safely evict uncommitted speech")
             # Match SFT's last short-tail padding without inventing source time.
-            if len(pcm) < SAMPLE_RATE // 2:
-                pcm = np.pad(pcm, (0, SAMPLE_RATE // 2 - len(pcm)))
+            short_chunk = len(pcm) < round(self.options.chunk_seconds * SAMPLE_RATE)
+            minimum = self._minimum_input_samples(final_chunk or short_chunk)
+            if len(pcm) < minimum:
+                pcm = np.pad(pcm, (0, minimum - len(pcm)))
         messages, audios = self._context(pcm, end_of_audio)
         started = time.perf_counter()
         try:
             generated = self.backend.generate(messages, audios)
             reply = generated["text"] if isinstance(generated, dict) else generated
-            parsed = parse_reply(reply, getattr(self.backend, "allowed_tokens", None))
+            parsed = self._model_reply(reply, end_of_audio)
             new_speakers = self._validate_speakers(parsed["segments"])
-        except Exception:
+        except Exception as exc:
             # State remains uncommitted. No fabricated WAIT hides model errors.
-            self.failed = True
+            self.failed = not isinstance(exc, self.retryable_errors)
             raise
         elapsed = time.perf_counter() - started
         start = self.heard_seconds
@@ -249,7 +266,7 @@ class StreamSession:
         if not end_of_audio:
             attributions = tuple((s["language"], s["speaker"]) for s in parsed["segments"])
             self.history.append(AudioTurn(start, self.heard_seconds, pcm, parsed["text"], attributions))
-            self._short_tail = duration < self.options.chunk_seconds - 1e-8
+            self._short_tail = short_chunk or final_chunk
         else:
             self.closed = True
         return dict(parsed, turn=self.turn_count, event="end_of_audio" if end_of_audio else "audio",
@@ -288,9 +305,7 @@ class StreamSession:
             raise ValueError("Speaker reference requires verified, clean, nonoverlapping audio")
         if speaker not in self.speakers:
             raise ValueError("Reference speaker must already occur in this meeting")
-        parse_reply(DIRECT + "<%s><%s>%s" % (language, speaker, text),
-                    getattr(self.backend, "allowed_tokens", None))
-        speaker_reference_text(speaker, language, text)
+        speaker_reference_text(speaker, language, text, getattr(self.backend, "allowed_tokens", None))
         if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
                for v in (start, end)) or not 0 <= start < end <= self.heard_seconds:
             raise ValueError("Reference must be entirely inside already heard audio")

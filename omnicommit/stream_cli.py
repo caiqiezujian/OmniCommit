@@ -9,14 +9,16 @@ import sys
 
 import numpy as np
 
+from .runtime_protocol import LIVE_CHUNK_SECONDS
 from .streaming import ReplayBackend, StreamOptions, StreamSession
 
 
-def add_runtime_arguments(parser):
+def add_runtime_arguments(parser, *, include_chunk=True):
     parser.add_argument("--backend", choices=("hf", "vllm", "replay"), default="hf")
     parser.add_argument("--model", type=Path)
     parser.add_argument("--replies", type=Path, help="Replay only: JSON array of scripted replies; never real ASR")
-    parser.add_argument("--chunk-seconds", type=float, choices=(.5, .8, 1.0), default=.5)
+    if include_chunk:
+        parser.add_argument("--chunk-seconds", type=float, choices=LIVE_CHUNK_SECONDS, default=.5)
     parser.add_argument("--number-format", choices=("verbatim", "normalized"), default="verbatim")
     parser.add_argument("--context-policy", choices=("verified", "rolling"), default="verified")
     parser.add_argument("--recent-seconds", type=float, default=12)
@@ -38,12 +40,12 @@ def add_runtime_arguments(parser):
                         help="vLLM Omni initialization compatibility; requests stay audio-only")
 
 
-def runtime_options(args):
-    names = StreamOptions.__dataclass_fields__
-    return StreamOptions(**{name: getattr(args, name) for name in names})
+def runtime_options(args, options_class=StreamOptions):
+    names = options_class.__dataclass_fields__
+    return options_class(**{name: getattr(args, name) for name in names})
 
 
-def build_backend(args):
+def build_backend(args, *, manifest_validator=None, chunk_seconds_choices=None):
     if args.backend == "replay":
         replies = json.loads(args.replies.read_text(encoding="utf-8")) if args.replies else None
         if replies is not None and not isinstance(replies, list):
@@ -51,18 +53,23 @@ def build_backend(args):
         return ReplayBackend(replies)
     if not args.model:
         raise ValueError("--model is required for real inference")
+    checks = {} if manifest_validator is None else {"manifest_validator": manifest_validator}
     if args.backend == "vllm":
         from .vllm_backend import VLLMBackend
+        # One engine serves every meeting. The shortest offered step sets the
+        # audio-item count; the longest step sets the per-item sample budget.
+        steps = chunk_seconds_choices or (args.chunk_seconds,)
         return VLLMBackend(args.model,max_context_tokens=args.max_context_tokens,
             max_new_tokens=args.max_new_tokens,tensor_parallel_size=args.tensor_parallel_size,
             gpu_memory_utilization=args.gpu_memory_utilization,
-            max_audio_turns=math.ceil(args.max_context_seconds/args.chunk_seconds)+args.max_speakers+2,
-            max_audio_seconds=max(args.chunk_seconds,args.max_reference_seconds),
-            mm_processor_cache_gb=args.mm_processor_cache_gb,image_slots=args.vllm_image_slots,dtype=args.dtype)
+            max_audio_turns=math.ceil(args.max_context_seconds/min(steps))+args.max_speakers+2,
+            max_audio_seconds=max(.5,max(steps),args.max_reference_seconds),
+            mm_processor_cache_gb=args.mm_processor_cache_gb,image_slots=args.vllm_image_slots,dtype=args.dtype,
+            **checks)
     from .inference_backend import HFBackend
     return HFBackend(args.model, max_context_tokens=args.max_context_tokens,
                      max_new_tokens=args.max_new_tokens, device_map=args.device_map,
-                     dtype=args.dtype, attn_implementation=args.attention)
+                     dtype=args.dtype, attn_implementation=args.attention, **checks)
 
 
 def apply_control(session, event):
