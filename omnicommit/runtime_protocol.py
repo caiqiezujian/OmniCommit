@@ -7,6 +7,7 @@ import re
 
 LIVE_CHUNK_MS = (500, 700, 800, 1000)
 LIVE_CHUNK_SECONDS = tuple(ms / 1000 for ms in LIVE_CHUNK_MS)
+MAX_CHUNK_MS = 8000  # Same upper bound as the virtual SFT audio reader.
 END_OF_AUDIO = "<end_of_audio>"
 LIVE_AUDIO_PREFIX = "[Current live stream]\n"
 SPEAKER_REFERENCE_INTRO = "[Speaker reference: identity only; never transcribe as new speech]"
@@ -15,6 +16,24 @@ Output <|WAIT|> or <|DIRECT|><language><speaker>new text. Label each language/sp
 Wait on uncertainty or a detected language/speaker change. Keep speaker IDs consistent and never repeat committed text.
 {number_instruction}
 At <end_of_audio>, output remaining text or <|WAIT|>. Speaker references are for identification only."""
+
+
+def chunk_milliseconds(seconds):
+    if type(seconds) not in (int, float) or not .001 <= seconds <= MAX_CHUNK_MS / 1000:
+        raise ValueError(f"chunk_seconds must represent 1 to {MAX_CHUNK_MS} milliseconds")
+    ms = round(seconds * 1000)
+    if ms / 1000 != seconds:
+        raise ValueError("chunk_seconds must be a whole number of milliseconds")
+    return ms
+
+
+def web_chunk_ms_bounds(default_seconds, max_reference_seconds):
+    """Reserve slots down to 200 ms unless the operator requests a shorter default."""
+    default_ms = chunk_milliseconds(default_seconds)
+    # Use the server's actual 16 kHz sample budget before taking whole milliseconds.
+    reference_samples = round(min(MAX_CHUNK_MS / 1000, max_reference_seconds) * 16000)
+    reference_ms = reference_samples // 16
+    return min(200, default_ms), max(LIVE_CHUNK_MS[-1], default_ms, reference_ms)
 
 
 def system_prompt(number_format="verbatim"):

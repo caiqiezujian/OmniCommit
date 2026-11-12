@@ -12,7 +12,7 @@ import time
 
 import numpy as np
 
-from .runtime_protocol import (system_prompt, END_OF_AUDIO, LIVE_CHUNK_SECONDS,
+from .runtime_protocol import (system_prompt, END_OF_AUDIO, chunk_milliseconds,
                                speaker_reference_text, LIVE_AUDIO_PREFIX,
                                speaker_registry_text, last_committed_text)
 
@@ -67,12 +67,8 @@ class StreamOptions:
     context_policy: str = "verified"
     rolling_tail_seconds: float = 2.0
 
-    def _validate_chunk_seconds(self):
-        if isinstance(self.chunk_seconds, bool) or self.chunk_seconds not in LIVE_CHUNK_SECONDS:
-            raise ValueError(f"chunk_seconds must be one of {LIVE_CHUNK_SECONDS}")
-
     def __post_init__(self):
-        self._validate_chunk_seconds()
+        chunk_milliseconds(self.chunk_seconds)
         for key in ("recent_seconds", "max_context_seconds", "max_pending_seconds",
                     "max_reference_seconds", "max_total_reference_seconds", "rolling_tail_seconds"):
             value = getattr(self, key)
@@ -199,7 +195,7 @@ class StreamSession:
         return parse_reply(reply, getattr(self.backend, "allowed_tokens", None))
 
     def _minimum_input_samples(self, final_chunk):
-        return SAMPLE_RATE // 2
+        return SAMPLE_RATE // 2 if final_chunk else SAMPLE_RATE // 100
 
     def step(self, audio=None, *, end_of_audio=False, final_chunk=False):
         self._check_open()

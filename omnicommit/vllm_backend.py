@@ -89,7 +89,8 @@ class VLLMBackend:
     def generate(self, messages, audios):
         if sum(m["content"].count("<audio>") for m in messages) != len(audios):
             raise ValueError("Audio placeholders and waveform count disagree")
-        if len(audios)>self.max_audio_turns or any(len(a)>self.max_audio_seconds*16000 for a in audios):
+        max_frames = round(self.max_audio_seconds * 16000)
+        if len(audios)>self.max_audio_turns or any(len(a)>max_frames for a in audios):
             raise ContextBudgetError("Audio count/length exceeds configured vLLM capacity")
         prompt = self.tokenizer.apply_chat_template(multimodal_messages(messages),
                             tokenize=False, add_generation_prompt=True)

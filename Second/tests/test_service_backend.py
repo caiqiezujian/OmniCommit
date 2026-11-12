@@ -79,7 +79,7 @@ def test_real_backend_constructors_receive_second_validator(engine, constructor,
 
 
 @pytest.mark.parametrize(("default_seconds", "minimum", "maximum"), [
-    (1.0, .5, 1.0), (.7, .5, 1.0), (.25, .25, 1.0), (2.0, .5, 2.0)])
+    (1.0, .2, 1.0), (.7, .2, 1.0), (.08, .08, 1.0), (2.0, .2, 2.0)])
 def test_vllm_reserves_audio_capacity_for_every_page_choice(default_seconds, minimum, maximum, monkeypatch):
     parser = argparse.ArgumentParser()
     add_runtime_arguments(parser)
@@ -92,7 +92,8 @@ def test_vllm_reserves_audio_capacity_for_every_page_choice(default_seconds, min
     assert settings["max_audio_seconds"] == maximum
 
 
-def test_vllm_decodes_sparse_reply_from_token_ids_preserving_initial_space():
+@pytest.mark.parametrize("step_ms", [500, 1001])
+def test_vllm_decodes_sparse_reply_from_token_ids_preserving_initial_space(step_ms):
     engine = VLLMBackend.__new__(VLLMBackend)
     decoded = []
 
@@ -103,13 +104,13 @@ def test_vllm_decodes_sparse_reply_from_token_ids_preserving_initial_space():
     engine.tokenizer = SimpleNamespace(encode=lambda *a, **k: [7],
                                        apply_chat_template=lambda *a, **k: "prompt", decode=decode)
     engine.max_context_tokens, engine.max_new_tokens = 32, 8
-    engine.max_audio_turns, engine.max_audio_seconds = 4, .5
+    engine.max_audio_turns, engine.max_audio_seconds = 4, step_ms / 1000
     engine.stop_ids, engine.sampling, engine.TokensPrompt = [99], object(), dict
     engine.audio_counter = SimpleNamespace(count=lambda *args: (0, False))
     completion = SimpleNamespace(token_ids=[11, 12, 99], text="I will.", finish_reason="stop")
     output = SimpleNamespace(prompt_token_ids=[7], outputs=[completion])
     engine.llm = SimpleNamespace(generate=lambda *a, **kw: [output])
-    reply = engine.generate([{"role": "user", "content": "<audio>"}], [np.zeros(8000, dtype=np.float32)])
+    reply = engine.generate([{"role": "user", "content": "<audio>"}], [np.zeros(step_ms * 16, dtype=np.float32)])
     assert reply["text"] == " I will."
     assert decoded == [([11, 12], {"skip_special_tokens": False, "clean_up_tokenization_spaces": False})]
 

@@ -18,7 +18,7 @@ import numpy as np
 from .stream_cli import add_runtime_arguments, build_backend, runtime_options, apply_control
 from .streaming import StreamSession
 from .media import MediaCursor, MediaStore
-from .runtime_protocol import LIVE_CHUNK_MS, LIVE_CHUNK_SECONDS
+from .runtime_protocol import LIVE_CHUNK_MS, web_chunk_ms_bounds
 from .session_identity import SessionLedger
 
 LOG = logging.getLogger("omnicommit.web")
@@ -38,7 +38,11 @@ def create_app(backend_factory, options, *, max_sessions=1,
     active = set()
     backend = None
     reference_provider = None
-    chunk_settings = {"chunk_ms_choices": chunk_ms_choices} if chunk_ms_choices else {}
+    min_ms, max_ms = web_chunk_ms_bounds(options.chunk_seconds, options.max_reference_seconds)
+    chunk_settings = {}
+    if chunk_ms_choices:
+        chunk_settings = {"chunk_ms_choices": sorted({*chunk_ms_choices, round(options.chunk_seconds * 1000)}),
+                          "chunk_ms_min": min_ms, "chunk_ms_max": max_ms}
     media_store = MediaStore(max_slots=max(2, max_sessions * 2))
 
     @asynccontextmanager
@@ -164,8 +168,8 @@ def create_app(backend_factory, options, *, max_sessions=1,
             session_options = options
             if chunk_ms_choices:
                 chunk_ms = init.get("chunk_ms", round(options.chunk_seconds * 1000))
-                if type(chunk_ms) is not int or chunk_ms not in chunk_ms_choices:
-                    raise ValueError(f"chunk_ms must be one of {list(chunk_ms_choices)} (integer milliseconds)")
+                if type(chunk_ms) is not int or not min_ms <= chunk_ms <= max_ms:
+                    raise ValueError(f"chunk_ms must be an integer between {min_ms} and {max_ms}")
                 session_options = replace(options, chunk_seconds=chunk_ms / 1000)
             elif "chunk_ms" in init:
                 raise ValueError("This service uses a fixed chunk length")
@@ -354,19 +358,30 @@ def serve_web(parser, args, backend_factory, options, app_factory):
     import uvicorn
     app = app_factory(backend_factory, options, max_sessions=args.max_sessions,
                       auto_reference_factory=reference_factory)
+    _, max_ms = web_chunk_ms_bounds(options.chunk_seconds, options.max_reference_seconds)
     uvicorn.run(app, host=args.host, port=args.port, workers=1,
-                ws_max_size=max(65536, round(options.chunk_seconds * 16000) * 2),
+                ws_max_size=max(65536, max_ms * 32),  # mono PCM16 at 16 kHz
                 ws_max_queue=4, ssl_certfile=args.ssl_certfile,
                 ssl_keyfile=args.ssl_keyfile)
 
 
+def build_web_backend(args, *, manifest_validator=None):
+    bounds = web_chunk_ms_bounds(args.chunk_seconds, args.max_reference_seconds)
+    return build_backend(args, manifest_validator=manifest_validator,
+                         chunk_seconds_choices=[ms / 1000 for ms in bounds])
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="OmniCommit PCM streaming Web service")
-    add_runtime_arguments(parser)
+    add_runtime_arguments(parser, include_chunk=False)
+    parser.add_argument("--chunk-seconds", type=float, default=.5, help="Default meeting step in whole milliseconds, expressed in seconds")
     add_web_arguments(parser)
     args = parser.parse_args(argv)
-    serve_web(parser, args, lambda: build_backend(args, chunk_seconds_choices=LIVE_CHUNK_SECONDS),
-              runtime_options(args), create_app)
+    try:
+        options = runtime_options(args)
+    except ValueError as exc:
+        parser.error(str(exc))
+    serve_web(parser, args, lambda: build_web_backend(args), options, create_app)
 
 
 if __name__ == "__main__":

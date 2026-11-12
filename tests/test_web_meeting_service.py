@@ -35,11 +35,13 @@ def test_web_800ms_step_is_advertised_and_accepts_12800_samples():
         health = client.get("/health").json()
         assert health["protocol"] == "first" and health["chunk_seconds"] == .8
         assert health["chunk_ms_choices"] == [500, 700, 800, 1000]
+        assert (health["chunk_ms_min"], health["chunk_ms_max"]) == (200, 5000)
         with client.websocket_connect("/stream") as socket:
             socket.send_json({"type": "start", "sample_rate": 16000})
             ready = socket.receive_json()
             assert ready["type"] == "ready" and ready["chunk_seconds"] == .8
             assert ready["chunk_ms_choices"] == health["chunk_ms_choices"]
+            assert (ready["chunk_ms_min"], ready["chunk_ms_max"]) == (200, 5000)
             socket.send_bytes(np.zeros(12800, dtype="<i2").tobytes())
             first = socket.receive_json()
             assert first["type"] == "result" and first["end_seconds"] == .8
@@ -50,27 +52,28 @@ def test_web_800ms_step_is_advertised_and_accepts_12800_samples():
             assert final["event"] == "end_of_audio" and final["end_seconds"] == pytest.approx(.9)
 
 
-def test_first_meetings_use_independent_steps_and_keep_direct_replies():
+@pytest.mark.parametrize("ms", [200, 333, 700, 1500, 5000])
+def test_first_meetings_use_independent_steps_and_keep_direct_replies(ms):
     reply = DIRECT + "<en><spk1>Hello."
     app = create_app(lambda: ReplayBackend([reply, WAIT]), StreamOptions(), max_sessions=2)
     with TestClient(app) as client:
         with client.websocket_connect("/stream") as mic, client.websocket_connect("/stream") as system:
-            mic.send_json({"type": "start", "sample_rate": 16000, "chunk_ms": 700})
-            assert mic.receive_json()["chunk_seconds"] == .7
+            mic.send_json({"type": "start", "sample_rate": 16000, "chunk_ms": ms})
+            assert mic.receive_json()["chunk_seconds"] == ms / 1000
             system.send_json({"type": "start", "sample_rate": 16000, "source_kind": "system", "chunk_ms": 1000})
             assert system.receive_json()["chunk_seconds"] == 1
-            mic.send_bytes(bytes(2 * 11200))
+            mic.send_bytes(bytes(32 * ms))
             result = mic.receive_json()
             assert result["action"] == "DIRECT" and result["text"] == reply
-            assert result["end_seconds"] == .7
-            mic.send_bytes(bytes(2 * 16000))
+            assert result["end_seconds"] == ms / 1000
+            mic.send_bytes(bytes(32 * ms + 2))
             assert mic.receive_json()["type"] == "error"
             system.send_bytes(bytes(2 * 16000))
             assert system.receive_json()["end_seconds"] == 1
         assert client.get("/health").json()["chunk_seconds"] == .5
 
 
-@pytest.mark.parametrize("step", [600, "700"])
+@pytest.mark.parametrize("step", [199, 5001, "700", None, True, 200.5])
 def test_first_service_rejects_invalid_step_before_audio(step):
     with TestClient(create_app(ReplayBackend, StreamOptions())) as client, client.websocket_connect("/stream") as socket:
         socket.send_json({"type": "start", "sample_rate": 16000, "chunk_ms": step})
@@ -180,7 +183,7 @@ def test_reference_failure_disables_only_auto_reference_for_session():
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
-@pytest.mark.parametrize(("default", "choice_ms"), [(.5, None), (.8, None), (.5, 700)])
+@pytest.mark.parametrize(("default", "choice_ms"), [(.5, None), (.8, None), (.5, 700), (.5, 200)])
 def test_file_upload_playback_gating_tail_and_cleanup(default, choice_ms):
     class Recording(ReplayBackend):
         def __init__(self):

@@ -44,18 +44,19 @@ def test_wait_and_full_attribution_parser():
             parse_reply(bad)
 
 
-def test_web_vllm_reserves_capacity_for_steps_other_than_startup_default(monkeypatch):
+@pytest.mark.parametrize(("step", "minimum"), [(".8", .2), (".08", .08)])
+def test_web_vllm_reserves_capacity_for_steps_other_than_startup_default(monkeypatch, step, minimum):
     from omnicommit import web_service
 
     def inspect_launch(parser, args, backend_factory, options, app_factory):
-        assert options.chunk_seconds == .8
+        assert options.chunk_seconds == float(step)
         config = backend_factory()
-        assert config["max_audio_turns"] == 60 + options.max_speakers + 2
+        assert config["max_audio_turns"] == 30 / minimum + options.max_speakers + 2
         assert config["max_audio_seconds"] == 1.0
 
     monkeypatch.setattr(web_service, "serve_web", inspect_launch)
     monkeypatch.setattr("omnicommit.vllm_backend.VLLMBackend", lambda path, **kwargs: kwargs)
-    web_service.main(["--backend", "vllm", "--model", "mock-model", "--chunk-seconds", ".8",
+    web_service.main(["--backend", "vllm", "--model", "mock-model", "--chunk-seconds", step,
                       "--max-context-seconds", "30", "--max-reference-seconds", ".5"])
 
 

@@ -19,7 +19,7 @@ import uuid
 import numpy as np
 import soundfile as sf
 
-from .runtime_protocol import LIVE_CHUNK_SECONDS
+from .runtime_protocol import chunk_milliseconds
 
 RATE = 16000
 MAX_UPLOAD_BYTES = 1024 * 1024 * 1024
@@ -74,14 +74,18 @@ class MediaUpload:
             output.write(data)
         self.size += len(data)
 
-    def decode(self, ffmpeg='ffmpeg', timeout=3600):
-        if self.ready or self.claimed or not self.size:
+    def decode(self, ffmpeg='ffmpeg', timeout=3600, *, local_source=None):
+        """Decode an upload, or an explicitly supplied local CLI file, into temporary PCM."""
+        if self.ready or self.claimed or (local_source is None and not self.size):
             raise MediaError('Upload is empty or already decoded')
-        fmt = _container(self.raw_path)
+        source = self.raw_path if local_source is None else Path(local_source)
+        fmt = _container(source)
         command = [ffmpeg, '-nostdin', '-hide_banner', '-v', 'error',
-                   '-protocol_whitelist', 'file,pipe', '-f', fmt, '-i', str(self.raw_path),
-                   '-map', '0:a:0', '-vn', '-sn', '-dn', '-t', str(self.max_seconds + 1),
-                   '-ac', '1', '-c:a', 'pcm_s16le', '-rf64', 'auto', '-f', 'wav', '-y', str(self.pcm_path)]
+                   '-protocol_whitelist', 'file,pipe', '-f', fmt, '-i', str(source),
+                   '-map', '0:a:0', '-vn', '-sn', '-dn']
+        if local_source is None:
+            command.extend(['-t', str(self.max_seconds + 1)])
+        command.extend(['-ac', '1', '-c:a', 'pcm_s16le', '-rf64', 'auto', '-f', 'wav', '-y', str(self.pcm_path)])
         try:
             result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                     stderr=subprocess.PIPE, timeout=timeout, check=False)
@@ -90,14 +94,16 @@ class MediaUpload:
         if result.returncode != 0 or not self.pcm_path.is_file():
             raise MediaError('Audio decoding failed: ' + result.stderr.decode('utf-8', 'replace')[-1000:])
         info = sf.info(str(self.pcm_path))
-        if info.channels != 1 or info.samplerate <= 0 or info.frames <= 0 or info.frames / info.samplerate > self.max_seconds + 1e-9:
+        if (info.channels != 1 or info.samplerate <= 0 or info.frames <= 0
+                or (local_source is None and info.frames / info.samplerate > self.max_seconds + 1e-9)):
             raise MediaError('Audio is empty, corrupt, or exceeds configured duration')
         self.samples = info.frames
         self.sample_rate = info.samplerate
         self.created = time.monotonic()
         self.ready = True
         # Playback uses the user's original local file; source bytes need not be retained.
-        self.raw_path.unlink()
+        if local_source is None:
+            self.raw_path.unlink()
         return self.public()
 
     def public(self):
@@ -124,8 +130,12 @@ class MediaCursor:
         return self.done or (self.final_release is not None and self.position >= self.final_release)
 
     def _next_source_boundary(self, chunk_seconds):
-        if isinstance(chunk_seconds, bool) or chunk_seconds not in LIVE_CHUNK_SECONDS:
-            raise MediaError(f"Chunk seconds must be one of {LIVE_CHUNK_SECONDS}")
+        try:
+            chunk_ms = chunk_milliseconds(chunk_seconds)
+        except ValueError as exc:
+            raise MediaError(str(exc)) from exc
+        if chunk_ms * self.upload.sample_rate < 1000:
+            raise MediaError("The selected step contains less than one source sample")
         return round((self.chunk_index + 1) * chunk_seconds * self.upload.sample_rate)
 
     def next_chunk(self, release_seconds, chunk_seconds, *, final=False):

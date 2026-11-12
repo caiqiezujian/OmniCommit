@@ -13,11 +13,17 @@
 .log-entry[data-action="DIRECT"] .log-output{color:#175843}.log-entry pre{margin:6px 0;max-height:none}
 .segment .transcript-piece{display:inline;float:none;white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;color:inherit;background:none;border:0;margin:0;padding:0;border-radius:0;text-align:inherit}
 .transcript-piece:enabled:hover,.transcript-piece:focus-visible{text-decoration:underline;text-underline-offset:3px}.segment .transcript-piece:disabled{opacity:1}
+#chunkSettings{display:flex;align-items:center;gap:6px 10px;flex-wrap:wrap;margin:12px 0}#chunkSettings label{margin:0}#chunkMs{width:7em}
 </style></head><body>
 <header><strong id="brand">OmniCommit</strong><span id="serviceDescription">多语种 · 多说话人流式转录</span></header>
 <main><div class="grid"><section class="card"><h2>音频来源</h2>
 <div class="tabs"><button data-mode="microphone" class="selected">麦克风</button><button data-mode="system">电脑声音</button><button data-mode="file">音视频文件</button></div>
-<label id="chunkSettings" for="chunkMs" hidden>音频块时长 <select id="chunkMs"></select></label>
+<div id="chunkSettings" hidden>
+<label id="chunkLabel" for="chunkMs">音频块时长（ms）</label>
+<input id="chunkMs" type="number" inputmode="numeric" step="1" required aria-describedby="chunkRange" hidden>
+<select id="chunkPresets" aria-label="常用音频块时长"></select>
+<span id="chunkRange" class="hint" hidden></span>
+</div>
 <div id="filePanel" hidden><label>选择本地文件 <input id="file" type="file" accept="audio/*,video/*"></label><video id="media" controls playsinline></video><p class="hint">文件播放进度决定模型可接收的音频范围。识别中跳转会结束当前会话。</p></div>
 <div id="micPanel"><p id="sourceHelp">允许浏览器使用麦克风，开始后按音频块实时识别。</p><label id="mixLabel" hidden><input type="checkbox" id="mixMic"> 同时采集麦克风</label></div>
 <div class="buttons"><button id="start" class="primary">开始转录</button><button id="stop" disabled>结束并处理尾部</button></div>
@@ -53,13 +59,19 @@ const status=(t,bad=false)=>{ $('status').textContent=t;$('status').classList.to
 const turnLog = new MeetingTurnLog($, download);
 const firstTranscriptHelp = $('transcriptHelp').textContent;
 let acceptedChunkMs = null;
+const chunkInput = $('chunkMs'), chunkPresets = $('chunkPresets');
+chunkPresets.onchange = () => {
+  if (!chunkInput.hidden && chunkPresets.value) {
+    chunkInput.value = chunkPresets.value;
+    chunkPresets.value = '';
+  }
+};
 function identifyService(info) {
   if (info.protocol !== 'first' && info.protocol !== 'second') return;
   const second = info.protocol === 'second';
   const brand = second ? 'OmniCommit Second' : 'OmniCommit';
   document.title = brand + ' · 实时会议转录';
   $('brand').textContent = brand;
-  const select = $('chunkMs');
   const ready = info.type === 'ready';
   const defaultMs = Math.round(info.chunk_seconds * 1000);
   if (ready) {
@@ -68,17 +80,34 @@ function identifyService(info) {
   }
   // A late health response must not reset a choice or replace the accepted step.
   const choices = info.chunk_ms_choices;
-  if (Array.isArray(choices) && choices.length && (ready || !select.children.length)) {
-    select.replaceChildren(...choices.map(ms => {
+  if (Array.isArray(choices) && choices.length && (ready || !chunkPresets.children.length)) {
+    const editable = Number.isInteger(info.chunk_ms_min) && Number.isInteger(info.chunk_ms_max)
+      && info.chunk_ms_min > 0 && info.chunk_ms_min <= info.chunk_ms_max;
+    chunkInput.hidden = !editable;
+    $('chunkLabel').htmlFor = editable ? 'chunkMs' : 'chunkPresets';
+    $('chunkRange').hidden = !editable;
+    chunkPresets.replaceChildren();
+    if (editable) {
+      chunkInput.min = String(info.chunk_ms_min);
+      chunkInput.max = String(info.chunk_ms_max);
+      $('chunkRange').textContent = info.chunk_ms_min + '–' + info.chunk_ms_max + ' ms';
+      const prompt = document.createElement('option');
+      prompt.textContent = '常用值';
+      prompt.value = '';
+      prompt.disabled = true;
+      chunkPresets.append(prompt);
+    }
+    for (const ms of choices) {
       const option = document.createElement('option');
       option.value = String(ms);
       option.textContent = ms + ' ms';
-      return option;
-    }));
-    select.value = String(acceptedChunkMs ?? defaultMs);
+      chunkPresets.append(option);
+    }
+    chunkPresets.value = editable ? '' : String(acceptedChunkMs ?? defaultMs);
+    chunkInput.value = String(acceptedChunkMs ?? defaultMs);
     $('chunkSettings').hidden = false;
-  } else if (ready && select.children.length) {
-    select.value = String(acceptedChunkMs);
+  } else if (ready && chunkPresets.children.length) {
+    (chunkInput.hidden ? chunkPresets : chunkInput).value = String(acceptedChunkMs);
   }
   $('transcriptHelp').textContent = second
     ? '同一说话人和语种的正文连续显示。点击要修正的文字可以更改该片段的说话人。'
@@ -156,7 +185,7 @@ function renderSpeakers(){const list=$('speakerList');list.replaceChildren();for
 function transmit(){if(!socket||socket.readyState!==1||busy)return;if(controlQueue.length){busy=true;socket.send(JSON.stringify({type:'control',...controlQueue.shift()}));return;}if(queue.length){busy=true;socket.send(queue.shift());return;}if(mode==='file'&&!ending){pollFile();return;}if(ending&&!ended){ended=true;busy=true;socket.send(JSON.stringify({type:'end'}));}}
 function pcmPacket(samples){const pcm=new Int16Array(samples.length);samples.forEach((v,i)=>pcm[i]=Math.round(Math.max(-1,Math.min(1,v))*32767));return pcm.buffer;}
 function capture(samples){if(!capturing)return;partial.push(...samples);while(partial.length>=step)queue.push(pcmPacket(partial.splice(0,step)));$('pending').textContent='本地积压：'+(queue.length*step/16000).toFixed(1)+' 秒';if(queue.length*step/16000>10)stopCapture('处理积压超过 10 秒，已停止采集，正在处理已接收音频。');transmit();}
-async function cleanup(){capturing=false;initializing=false;clearInterval(polling);polling=null;if(mode==='file')$('media').pause();$('file').disabled=false;for(const s of streams)s.getTracks().forEach(t=>t.stop());streams=[];if(context&&context.state!=='closed')await context.close();context=null;node=null;sources=[];$('start').disabled=false;$('chunkMs').disabled=false;$('stop').disabled=true;$('serviceDescription').textContent='多语种 · 多说话人流式转录';document.querySelectorAll('[data-mode]').forEach(b=>b.disabled=false);render();}
+async function cleanup(){capturing=false;initializing=false;clearInterval(polling);polling=null;if(mode==='file')$('media').pause();$('file').disabled=false;for(const s of streams)s.getTracks().forEach(t=>t.stop());streams=[];if(context&&context.state!=='closed')await context.close();context=null;node=null;sources=[];$('start').disabled=false;chunkInput.disabled=chunkPresets.disabled=false;$('stop').disabled=true;$('serviceDescription').textContent='多语种 · 多说话人流式转录';document.querySelectorAll('[data-mode]').forEach(b=>b.disabled=false);render();}
 async function stopCapture(message){if(stopping||ending)return;stopping=true;$('stop').disabled=true;try{if(mode==='file'){$('media').pause();fileFinalSeconds=$('media').currentTime;fileStopping=true;status(message||'正在处理已播放音频和尾部文字…');transmit();return;}else if(capturing&&node){await new Promise((resolve,reject)=>{const timer=setTimeout(()=>{stopAck=null;reject(Error('采集器停止确认超时'));},2000);stopAck=()=>{clearTimeout(timer);resolve();};node.port.postMessage('stop');});capturing=false;if(partial.length){queue.push(pcmPacket(partial));partial=[];}}ending=true;status(message||'正在处理剩余音频和尾部文字…');transmit();}catch(e){failed=true;status(e.message,true);await cleanup();if(socket)socket.close();}}
 function control(event){if(finished){const has=id=>speakers.some(s=>s.speaker===id);if(event.op==='rename_speaker'&&has(event.speaker)&&event.name){speakers.find(s=>s.speaker===event.speaker).name=event.name;}else if(event.op==='correct_segment'&&has(event.speaker)&&segments.some(s=>s.segment_id===event.segment_id)){segments.find(s=>s.segment_id===event.segment_id).display_speaker=event.speaker;}else if(event.op==='merge_speakers'&&has(event.source)&&has(event.target)&&event.source!==event.target){for(const s of segments)if(s.display_speaker===event.source)s.display_speaker=event.target;for(const key of Object.keys(aliases))if(aliases[key]===event.source)aliases[key]=event.target;aliases[event.source]=event.target;speakers=speakers.filter(s=>s.speaker!==event.source);}else{status('修正失败：说话人或片段不存在。',true);return;}log({type:'local_correction',...event});render();status('已更新本次导出结果。');return;}if(!socket||socket.readyState!==1||ending){status('当前会话不可修改。',true);return;}controlQueue.push(event);transmit();}
 function updateFilePending(){const current=fileStopping?fileFinalSeconds:$('media').currentTime;const seconds=Math.max(0,(current||0)-lastProcessed);$('pending').textContent='播放积压：'+seconds.toFixed(1)+' 秒';}
@@ -171,8 +200,17 @@ $('media').onseeking=()=>{if(mode==='file'&&socket&&socket.readyState===1&&!endi
 async function resetPlayback(){const m=$('media');m.pause();if(!Number.isFinite(m.duration)){await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('读取文件时长超时，请检查浏览器格式支持。')),10000);m.addEventListener('loadedmetadata',()=>{clearTimeout(timer);resolve();},{once:true});});}if(Math.abs(m.currentTime)>1e-4){resettingMedia=true;try{await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('无法从文件开头开始，请重新选择文件。')),5000);m.addEventListener('seeked',()=>{clearTimeout(timer);resolve();},{once:true});m.currentTime=0;});}finally{resettingMedia=false;}}if(Math.abs(m.currentTime)>1e-4)throw Error('文件未回到开头，无法开始。');}
 async function prepareLive(){if(!window.isSecureContext)throw Error('麦克风和系统声音需要 HTTPS 或 localhost。');if(mode==='system'){const s=await navigator.mediaDevices.getDisplayMedia({video:true,audio:true});if(!s.getAudioTracks().length){s.getTracks().forEach(t=>t.stop());throw Error('没有收到共享音频，请选择带声音的来源并勾选共享音频。');}streams.push(s);if($('mixMic').checked)streams.push(await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}}));}else streams.push(await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:false,noiseSuppression:false,autoGainControl:false}}));context=new AudioContext({sampleRate:16000});if(context.sampleRate!==16000)throw Error('浏览器未提供 16 kHz 音频，请使用支持的浏览器。');const code=`class Capture extends AudioWorkletProcessor{constructor(){super();this.active=true;this.port.onmessage=e=>{if(e.data==='stop'){this.active=false;this.port.postMessage({stopped:true});}};}process(inputs){if(this.active&&inputs[0]&&inputs[0][0]){const c=inputs[0],v=new Float32Array(c[0].length);for(const channel of c)for(let i=0;i<v.length;i++)v[i]+=channel[i]/c.length;this.port.postMessage(v);}return true;}}registerProcessor('capture',Capture);`;const url=URL.createObjectURL(new Blob([code],{type:'text/javascript'}));await context.audioWorklet.addModule(url);URL.revokeObjectURL(url);node=new AudioWorkletNode(context,'capture');node.onprocessorerror=()=>captureFault();context.onstatechange=()=>{if(capturing&&context&&(context.state==='interrupted'||context.state==='closed'))captureFault();};node.port.onmessage=e=>{if(e.data.stopped){if(stopAck){stopAck();stopAck=null;}}else capture(e.data);};for(const stream of streams){const source=context.createMediaStreamSource(stream);source.connect(node);sources.push(source);stream.getTracks().forEach(t=>t.addEventListener('ended',()=>stopCapture('音频来源结束，正在处理尾部。')));}node.connect(context.destination);await context.suspend();}
 $('start').onclick=async()=>{
-  const requestedChunkMs = $('chunkSettings').hidden ? null : Number($('chunkMs').value);
-  $('chunkMs').disabled = true;
+  let requestedChunkMs = null;
+  if (!$('chunkSettings').hidden) {
+    requestedChunkMs = Number((chunkInput.hidden ? chunkPresets : chunkInput).value);
+    if (!chunkInput.hidden && (!Number.isSafeInteger(requestedChunkMs)
+        || requestedChunkMs < Number(chunkInput.min) || requestedChunkMs > Number(chunkInput.max))) {
+      status('请输入 ' + chunkInput.min + ' 至 ' + chunkInput.max + ' 之间的整数毫秒数。', true);
+      chunkInput.focus();
+      return;
+    }
+  }
+  chunkInput.disabled = chunkPresets.disabled = true;
   try{const previousSocket=socket;socket=null;if(previousSocket&&previousSocket.readyState<=1)previousSocket.close();queue=[];partial=[];controlQueue=[];busy=false;ending=false;ended=false;stopping=false;failed=false;fileEof=false;fileId=null;fileDuration=0;fileSampleRate=16000;fileSamples=0;fileStopping=false;fileFinalSeconds=null;finished=false;initializing=true;lastProcessed=0;captureError=false;render();$('warning').hidden=true;$('warning').textContent='';$('start').disabled=true;$('file').disabled=true;document.querySelectorAll('[data-mode]').forEach(b=>b.disabled=true);if(mode==='file'){if(!$('file').files.length)throw Error('请先选择音视频文件。');await resetPlayback();status('正在准备文件…');const response=await fetch('/api/media',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:$('file').files[0]});const body=await response.json();if(!response.ok)throw Error(body.detail||body.error||'文件准备失败');fileId=body.media_id;fileDuration=body.duration_seconds;fileSampleRate=body.sample_rate;fileSamples=body.samples;if(!fileId||!Number.isFinite(fileDuration)||fileDuration<=0||!Number.isInteger(fileSampleRate)||fileSampleRate<=0||!Number.isInteger(fileSamples)||fileSamples<=0)throw Error('服务器未返回文件编号。');await resetPlayback();}else await prepareLive();let firstFrame=true,reportedTrim=false;const sessionSocket=socket=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/stream');socket.binaryType='arraybuffer';socket.onopen=()=>{if(socket!==sessionSocket)return;const start = {type:'start', sample_rate:16000, source_kind:mode};
   if (fileId) start.media_id = fileId;
   if (requestedChunkMs !== null) start.chunk_ms = requestedChunkMs;

@@ -219,8 +219,11 @@ assert.equal(vm.runInContext('transcriptText()',context),'甲 [en] Yes.\n乙 [en
 
 // Start via the actual page handler. Stub only the browser capture/upload
 // devices and transport so lock timing and the real JSON handshake are covered.
-assert.match(html, /<label id="chunkSettings" for="chunkMs" hidden>/);
-const picker = elements.get('chunkMs'), chunkSettings = document.getElementById('chunkSettings');
+assert.match(html, /<label id="chunkLabel" for="chunkMs">/);
+assert.match(html, /<input id="chunkMs" type="number"/);
+const picker = elements.get('chunkPresets'), field = elements.get('chunkMs');
+const chunkSettings = document.getElementById('chunkSettings');
+field.focus = () => { field.focused = true; };
 chunkSettings.hidden = true;
 const sockets = [];
 context.location = {protocol:'http:', host:'localhost'};
@@ -243,6 +246,7 @@ async function startMeeting(source) {
   vm.runInContext('mode=selectedSource;',context);
   const starting = elements.get('start').onclick();
   assert.equal(picker.disabled, true, 'locked before capture permissions or file upload');
+  assert.equal(field.disabled, true);
   await starting;
   const ws = sockets.at(-1);
   ws.onopen();
@@ -254,9 +258,16 @@ const [legacySocket, legacyStart] = await startMeeting('microphone');
 assert.deepEqual(legacyStart, {type:'start',sample_rate:16000,source_kind:'microphone'});
 legacySocket.close();
 await vm.runInContext('cleanup()',context);
+vm.runInContext("identifyService({protocol:'first',chunk_seconds:.5,chunk_ms_choices:[500,700]})",context);
+assert.equal(field.hidden, true, 'preset-only servers still show their select');
+picker.value = '700';
+const [presetSocket, presetStart] = await startMeeting('microphone');
+assert.equal(presetStart.chunk_ms, 700);
+presetSocket.close();
+await vm.runInContext('cleanup()',context);
 for (const service of [
-  {protocol:'first',chunk_seconds:.8,chunk_ms_choices:[500,700,800,1000]},
-  {protocol:'second',chunk_seconds:.601,chunk_ms_choices:[500,601,700,800,1000]},
+  {protocol:'first',chunk_seconds:.8,chunk_ms_choices:[500,700,800,1000],chunk_ms_min:200,chunk_ms_max:5000},
+  {protocol:'second',chunk_seconds:.601,chunk_ms_choices:[500,601,700,800,1000],chunk_ms_min:100,chunk_ms_max:1800},
 ]) {
   // A fresh page receives its capabilities and default from its own service.
   picker.replaceChildren();
@@ -264,11 +275,27 @@ for (const service of [
   context.stepService = service;
   vm.runInContext('acceptedChunkMs=null; identifyService(stepService)',context);
   assert.equal(chunkSettings.hidden, false);
-  assert.equal(picker.value, String(Math.round(service.chunk_seconds * 1000)));
-  assert.deepEqual(picker.children.map(option => option.textContent), service.chunk_ms_choices.map(ms => ms + ' ms'));
+  assert.equal(field.hidden, false);
+  assert.equal(field.value, String(Math.round(service.chunk_seconds * 1000)));
+  assert.deepEqual(picker.children.map(option => option.textContent), ['常用值', ...service.chunk_ms_choices.map(ms => ms + ' ms')]);
   assert.equal(elements.get('brand').textContent, service.protocol === 'first' ? 'OmniCommit' : 'OmniCommit Second');
-  for (const [source, ms] of [['microphone',700], ['system',800], ['file',1000]]) {
-    picker.value = String(ms);
+  for (const value of ['', 'x', '400.5', String(service.chunk_ms_min - 1), String(service.chunk_ms_max + 1)]) {
+    field.value = value;
+    const before = sockets.length;
+    await elements.get('start').onclick();
+    assert.equal(sockets.length, before, 'invalid step must not open a connection');
+    assert.equal(picker.disabled, false);
+    assert.match(elements.get('status').textContent, /整数毫秒/);
+    assert.equal(field.focused, true);
+  }
+  for (const [source, ms] of [['microphone',200], ['system',800], ['file',377]]) {
+    if (source === 'system') {
+      picker.value = String(ms);
+      picker.onchange();
+      assert.equal(field.value, String(ms));
+    } else {
+      field.value = String(ms);
+    }
     vm.runInContext('identifyService(stepService)',context); // delayed health never overwrites the selection
     const [ws, start] = await startMeeting(source);
     assert.equal(start.chunk_ms, ms);
@@ -287,9 +314,10 @@ for (const service of [
       assert.equal(ws.frames[1].byteLength, ms * 32);
     }
     vm.runInContext('identifyService(stepService)',context);
-    assert.equal(picker.value, String(ms));
+    assert.equal(field.value, String(ms));
     await ws.onmessage({data:JSON.stringify({type:'result',event:'end_of_audio',action:'WAIT',text:'<|WAIT|>'})});
     assert.equal(picker.disabled, false);
+    assert.equal(field.disabled, false);
   }
 }
 elements.get('file').files = [];

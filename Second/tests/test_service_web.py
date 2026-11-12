@@ -38,17 +38,17 @@ def test_concurrent_meetings_negotiate_independent_chunk_lengths():
     with TestClient(app) as client:
         health = client.get("/health").json()
         assert health["chunk_ms_choices"] == [500, 700, 701, 800, 1000]
+        assert (health["chunk_ms_min"], health["chunk_ms_max"]) == (200, 5000)
         assert health["chunk_seconds"] == .701
         with client.websocket_connect("/stream") as mic, client.websocket_connect("/stream") as system:
-            assert start(mic, chunk_ms=500)["chunk_seconds"] == .5
+            assert start(mic, chunk_ms=200)["chunk_seconds"] == .2
             assert start(system, "system", chunk_ms=1000)["chunk_seconds"] == 1
-            assert send_audio(mic, 8000)["end_seconds"] == .5
+            assert send_audio(mic, 3200)["end_seconds"] == .2
             assert send_audio(system, 16000)["end_seconds"] == 1
-            assert send_audio(mic, 8000)["end_seconds"] == 1
-            # The 700 ms frame fits the server default and the other meeting,
-            # but exceeds this microphone session's negotiated 500 ms limit.
+            assert send_audio(mic, 3200)["end_seconds"] == .4
+            # 700 ms fits the other meeting but exceeds the negotiated 200 ms.
             rejected = send_audio(mic, 11200)
-            assert rejected["type"] == "error" and rejected["heard_seconds"] == 1
+            assert rejected["type"] == "error" and rejected["heard_seconds"] == .4
             assert send_audio(system, 16000)["end_seconds"] == 2
             system.send_json({"type": "end"})
             assert system.receive_json()["text"] == WAIT
@@ -60,7 +60,7 @@ def test_concurrent_meetings_negotiate_independent_chunk_lengths():
             assert late["type"] == "error" and late["heard_seconds"] == .701
 
 
-@pytest.mark.parametrize("invalid_ms", [None, True, "500", 500.0, 0, 600, 8001])
+@pytest.mark.parametrize("invalid_ms", [None, True, "500", 500.0, 0, 199, 5001, 8001])
 def test_invalid_chunk_choice_only_rejects_that_connection(invalid_ms):
     app = create_app(ReplayBackend, SecondStreamOptions(), max_sessions=2)
     with TestClient(app) as client, client.websocket_connect("/stream") as valid:
@@ -103,7 +103,7 @@ def test_live_sparse_text_switch_correction_and_isolation(source_kind):
 
 
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="requires FFmpeg")
-@pytest.mark.parametrize(("default_ms", "choice_ms"), [(701, None), (500, 700)])
+@pytest.mark.parametrize(("default_ms", "choice_ms"), [(701, None), (500, 700), (500, 200), (500, 333)])
 def test_file_audio_respects_training_sample_grid_and_flushes_tail(default_ms, choice_ms):
     # At 22.05 kHz 701 ms ends at sample 15457.05. The last speech
     # sample of this cell can only be delivered after sample 15458.

@@ -1,9 +1,38 @@
 # 流式推理与 Web 服务
 
-本服务接收 16 kHz 单声道新音频，每轮 0.5、0.7、0.8 或 1 秒，使用已导出的本地
+本服务接收 16 kHz 单声道新音频。网页默认每轮接收 0.5 秒，开始会议前可以选择预设或输入自定义步长（如 200 ms）。服务使用已导出的本地
 Qwen3-Omni 模型输出 DIRECT / WAIT。最后发送文本事件 `<end_of_audio>`，
 不会补一个假的未来音频块。语言、说话人标签从训练后的 tokenizer 读取，
 不会在推理时添加随机初始化的新 token。
+
+## 音视频文件逐轮诊断
+
+在原来的 GPU 推理环境中，从仓库根目录执行。把输入和模型路径替换为这场会议实际用的文件和合并模型。需要可执行的 FFmpeg，脚本直接加载模型，无需启动网页。
+
+```bash
+cd /data/yb/Code/OmniCommit
+CUDA_VISIBLE_DEVICES=0 python tools/diagnose_stream.py /data/test/meeting.mp4 \
+  --model /data/yb/Code/OmniCommit/models/omnicommit-merged \
+  --chunk-ms 1000 \
+  --output /data/yb/Code/OmniCommit/outputs/meeting.1000ms.jsonl
+```
+
+第二版使用同一条命令，将 `--model` 改成实际的 `second-merged` 目录。若仓库的 `models/omnicommit-merged` 和 `models/second-merged` 中只有一个可用模型，可省略 `--model`。`--chunk-ms` 的单位是毫秒，例如 `200`、`800` 或 `1000`。默认采用启动脚本的 vLLM、rolling 和 normalized 配置。若网页服务用了 HF 或自定义上下文预算，请传入相同的参数。做对照时在网页用文件输入，关闭自动参照，使用相同代码版本且不添加人工提交边界或说话人参照。命令行按文件顺序处理每块，运行时间由推理速度决定。
+
+用 `.jsonl` 输出时，每轮完成即写入，可在另一个终端用 `tail -f` 查看。用 `.json` 则在结束时得到事件数组。Web 日志选「逐轮日志 → 下载完整日志 JSONL」，对齐两边 `type=result` 的 `turn`、`event`、`end_seconds`、`action` 和 `text`。播放器的 `file_wait` 只表示等待文件播放。
+
+在 Bash 中也可以用 `jq` 和 `diff` 找到两边第一个不同的轮次。将下例两个文件名换成实际下载和生成的 JSONL。
+
+```bash
+fields='select(.type == "result") | [.turn, .event, .end_seconds, .action, .text]'
+diff -u <(jq -c "$fields" web-events.jsonl) <(jq -c "$fields" meeting.1000ms.jsonl)
+```
+
+- **模型回复**：`raw_model_text` 保留后端返回的原文，包括 `<|WAIT|>`。解析失败的原文保存在错误事件里。`consecutive_audio_waits` 只统计连续返回 WAIT 的音频块。
+- **上下文裁剪**：`history_start_seconds` 是当前模型保留的最早一轮音频起点。发生裁剪时，`trimmed_interval_seconds` 给出本轮移出的区间。默认 rolling 保留近期约 12 秒，并受提交边界约束，只能按完整轮次移出较早历史。
+- **预算报错**：错误行中的 `heard_seconds` 是最后成功处理的位置，`attempted_end_seconds` 是尝试处理的位置。`commit_watermark_seconds` 是当前策略使用的边界，`pending_audio_seconds` 是截至最后成功轮次仍待确认的秒数。若下一块会超过 30 秒待确认预算，服务和脚本都在该轮调用后端前停止。此时 `backend_called` 为 `false`，`raw_model_text` 为 `null`，命令退出码为 1，先前轮次保留。上下文时长和模型 token 数另有各自的上限。
+
+如果两边从同一位置持续 WAIT，可以从人工听到的新语种起点截出一段有清晰人声的音频，用同一条命令和新的输出文件单独跑。如果短片能出字，优先检查切换前的历史及训练中的切换示例。如果短片仍持续 WAIT，再与离线 ASR 对照。两条路径共用模型、提示词和会话逻辑，这个实验可以排查网页传输或显示差异，单凭一致的 WAIT 无法确定是训练数据造成的。
 
 ## 1. 环境与离线真实模型测试
 

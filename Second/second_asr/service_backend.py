@@ -35,8 +35,5 @@ def validate_manifest(tokenizer, manifest):
 
 
 def build_backend(args):
-    from omnicommit.stream_cli import build_backend as build_shared_backend
-    from .service_session import chunk_ms_choices
-
-    steps = [ms / 1000 for ms in chunk_ms_choices(args.chunk_seconds)]
-    return build_shared_backend(args, manifest_validator=validate_manifest, chunk_seconds_choices=steps)
+    from omnicommit.web_service import build_web_backend
+    return build_web_backend(args, manifest_validator=validate_manifest)
