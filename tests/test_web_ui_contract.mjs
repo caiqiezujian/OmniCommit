@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
+import {webcrypto} from 'node:crypto';
 import {fileURLToPath} from 'node:url';
 import path from 'node:path';
 
@@ -11,7 +12,8 @@ const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
 assert.doesNotMatch(html, /id="token"|Authorization|访问口令/);
 function element() {
   return {value:'', checked:false, hidden:false, disabled:false, textContent:'', dataset:{},
-    classList:{toggle(){}}, append(){}, replaceChildren(){}, click(){}, pause(){this.paused=true;},
+    classList:{toggle(){}}, children:[], append(...nodes){this.children.push(...nodes);},
+    replaceChildren(...nodes){this.children=nodes;}, click(){}, pause(){this.paused=true;},
     currentTime:0, paused:false, files:[]};
 }
 const elements = new Map();
@@ -19,10 +21,13 @@ const tabs = ['microphone', 'system', 'file'].map(mode => ({...element(),dataset
 const document = {getElementById(id){if(!elements.has(id))elements.set(id,element());return elements.get(id);},
   querySelectorAll(){return tabs;}, createElement(){return element();}, createTextNode(s){return s;}};
 const sent=[];
-const context = vm.createContext({document, console, WebSocket:{OPEN:1},
+const context = vm.createContext({document, console, crypto:webcrypto, WebSocket:{OPEN:1},
   URL:{createObjectURL(){return 'blob:x';}, revokeObjectURL(){}}, Blob, Int16Array,
   Float32Array, Math, Number, JSON, setTimeout, clearTimeout, setInterval, clearInterval,
   prompt(){return null;}});
+for (const match of html.matchAll(/<script src="\/web\/([^"]+)"><\/script>/g)) {
+  vm.runInContext(fs.readFileSync(path.join(here, '../omnicommit/web', match[1]), 'utf8'), context);
+}
 vm.runInContext(script, context);
 assert.match(html, /\[hidden\]\s*\{\s*display:\s*none\s*!important/);
 tabs[1].onclick();
@@ -99,4 +104,48 @@ assert.equal(vm.runInContext('segments[0].display_speaker', context), 'spk1');
 assert.equal(vm.runInContext('segments[0].model_speaker', context), 'spk2');
 vm.runInContext(`control({op:'rename_speaker',speaker:'spk1',name:'张老师'});`,context);
 assert.equal(vm.runInContext('speakers[0].name',context), '张老师');
+
+// Review the first page while new turns and file polling continue to arrive.
+vm.runInContext(`
+  turnLog.start('file');
+  $('logPanel').open = true;
+  $('logPanel').ontoggle();
+  for (let n = 1; n <= 123; n++) {
+    log({type:'file_wait'});
+    log({type:'result', event:'audio', turn:n, action:'WAIT', text:'<|WAIT|>'});
+  }
+`, context);
+assert.equal(elements.get('events').children.length, 50);
+assert.equal(elements.get('logRange').textContent, '第 1–50 条，共 123 条');
+elements.get('logNext').onclick();
+assert.equal(elements.get('logRange').textContent, '第 51–100 条，共 123 条');
+const downloads = [];
+context.saveLog = (name, type, body) => downloads.push({name, body});
+vm.runInContext(`turnLog.download=saveLog; $('logJsonl').onclick(); $('logTxt').onclick();`,context);
+assert.equal(downloads[0].body.trimEnd().split('\n').length, 246);
+assert.equal(downloads[1].body.trimEnd().split('\n').length, 123);
+assert.match(downloads[1].body, /第 1 轮 +<\|WAIT\|>/);
+// Rendering and export preserve the original model assignment after local edits.
+vm.runInContext(`
+  const originalFrame = {type:'result', turn:124, action:'DIRECT', text:'<|DIRECT|><en><spk1>Hello',
+    new_segments:[{display_speaker:'spk1'}]};
+  log(originalFrame);
+  originalFrame.new_segments[0].display_speaker='spk2';
+  $('logFilter').value='DIRECT'; $('logFilter').onchange();
+  $('logJsonl').onclick();
+`, context);
+assert.equal(elements.get('logRange').textContent, '第 1–1 条，共 1 条');
+assert.equal(JSON.parse(downloads[2].body.trimEnd().split('\n').at(-1)).new_segments[0].display_speaker,'spk1');
+vm.runInContext(`
+  log({type:'result',event:'audio',turn:125,action:'DIRECT',start_seconds:59.5,end_seconds:60,
+    segments:[{language:'zh',speaker:'spk1'}],text:'<|DIRECT|><zh><spk1>你好'});
+  log({type:'result',event:'audio',turn:126,action:'WAIT',start_seconds:60,end_seconds:60.5});
+  log({type:'file_wait'});
+  log({type:'result',event:'audio',turn:127,action:'WAIT',start_seconds:60.5,end_seconds:61});
+  log({type:'result',event:'end_of_audio',turn:128,action:'WAIT',start_seconds:61,end_seconds:61});
+  log({type:'error',heard_seconds:61,error:'Context audio budget exhausted'});
+`,context);
+assert.match(elements.get('logProgress').textContent,/60\.0 秒（zh · spk1）.*连续 WAIT 2 个音频块 \/ 1\.0 秒/);
+assert.equal(elements.get('logError').hidden,false);
+assert.match(elements.get('logError').textContent,/61\.0 秒.*Context audio budget exhausted/);
 console.log('web UI contract checks passed');

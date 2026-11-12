@@ -85,6 +85,20 @@ def test_web_transport_is_filtered_but_bad_result_not_hidden():
         transcript_events([{"type": "result", "text": "oops"}])
 
 
+def test_downloaded_file_log_counts_only_model_wait_and_preserves_model_attribution():
+    reference = {"segments": [seg("你好")]}
+    audio, wait, eos = [dict(row, type="result") for row in events([[seg("你好")], []])]
+    rows = [{"type": "ready"}, {"type": "file_wait"}, audio, wait,
+            {"type": "file_done"}, eos,
+            {"type": "local_correction", "op": "correct_segment", "speaker": "spk2"}]
+    prediction = transcript_events(rows)
+    assert prediction == [audio, wait, eos]
+    report = evaluate_events(reference, prediction, opcodes=same_opcodes)
+    assert report["complete_eos"] is True
+    assert (report["direct_turns"], report["wait_turns"]) == (1, 2)
+    assert report["speaker_accuracy_on_text_matches"] == 1
+
+
 def test_actual_fast_edit_distance_library():
     pytest.importorskip("rapidfuzz")
     report = evaluate_events({"segments": [seg("100", "en")]}, events([[seg("200", "en")]]))

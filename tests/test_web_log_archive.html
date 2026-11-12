@@ -1,0 +1,56 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Meeting log IndexedDB integration test</title>
+<pre id="result">Running…</pre>
+<script src="../omnicommit/web/log-archive.js"></script>
+<script>
+'use strict';
+// Serve the repository root over HTTP and open this page in a test profile.
+// A real reload verifies durability; no test runner or npm dependency is required.
+const check = (ok, message) => { if (!ok) throw new Error(message); };
+const reloadKey = 'omnicommit-log-test-ids';
+async function run() {
+  const failures = [];
+  const archive = new MeetingLogArchive({onError: (error, id) => failures.push(id)});
+  const ids = sessionStorage.getItem(reloadKey);
+  if (ids) {
+    sessionStorage.removeItem(reloadKey);
+    const [first, second] = JSON.parse(ids);
+    const rows = await archive.read(first);
+    check(rows.length === 3601, 'lost events across reload');
+    check(rows.every((row, i) => i === 0 || row.turn === i), 'event order across reload');
+    check(rows[0].segments[0].text === 'original', 'historical event was mutated');
+    check((await archive.read(second)).length === 1, 'mixed sessions');
+    const listed = await archive.list();
+    check([first, second].every(id => listed.some(info => info.id === id)), 'missing sessions');
+    document.getElementById('result').textContent = 'PASS';
+    return;
+  }
+  const first = archive.start('microphone');
+  const opening = {type: 'result', action: 'DIRECT', segments: [{text: 'original'}]};
+  archive.append(first, opening);
+  opening.segments[0].text = 'corrected';
+  for (let i = 1; i <= 3600; i++) archive.append(first, {type: 'result', action: 'WAIT', turn: i});
+  const second = archive.start('file');
+  archive.append(second, {type: 'ready'});
+  await Promise.all([archive.flush(first), archive.flush(second)]);
+  check(!failures.length, 'failed to save normal meetings');
+
+  const third = archive.start('system');
+  archive.append(third, {turn: 1});
+  await archive.flush(third);
+  const original = archive.transaction.bind(archive);
+  archive.transaction = (db, stores, mode, operation) => {
+    if (mode === 'readwrite') throw new DOMException('quota', 'QuotaExceededError');
+    return original(db, stores, mode, operation);
+  };
+  archive.append(third, {turn: 2});
+  let failed = false;
+  try { await archive.flush(third); } catch { failed = true; }
+  check(failed && failures.length === 1 && failures[0] === third, 'failed write not reported');
+  check((await archive.read(third)).length === 1, 'lost committed prefix after failed write');
+  sessionStorage.setItem(reloadKey, JSON.stringify([first, second]));
+  location.reload();
+}
+run().catch(error => { document.getElementById('result').textContent = 'FAIL ' + error.stack; });
+</script>

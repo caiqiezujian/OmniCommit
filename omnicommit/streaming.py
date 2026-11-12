@@ -90,6 +90,7 @@ class AudioTurn:
     end: float
     audio: np.ndarray
     reply: str
+    attributions: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass
@@ -111,6 +112,8 @@ class StreamSession:
         self.speakers = []
         self.last_committed_language = None
         self.last_committed_speaker = None
+        self._speakers_before_history = set()
+        self._last_attribution_before_history = (None, None)
         self.heard_seconds = 0.0
         self.verified_commit_seconds = 0.0
         self.inferred_commit_seconds = 0.0
@@ -137,13 +140,17 @@ class StreamSession:
             if self.history[0].end > self.verified_commit_seconds:
                 self.heuristic_eviction = True
                 self.evicted_this_turn = True
-            self.history.pop(0)
+            evicted = self.history.pop(0)
+            for attribution in evicted.attributions:
+                self._speakers_before_history.add(attribution[1])
+                self._last_attribution_before_history = attribution
 
     def _context(self, current_audio=None, end_of_audio=False):
         messages = [{"role": "system", "content": system_prompt(self.options.number_format)}]
-        messages[0]["content"] += speaker_registry_text(self.speakers)
-        messages[0]["content"] += last_committed_text(self.last_committed_language,
-                                                     self.last_committed_speaker)
+        # Match SFT windows: the system prefix describes the state at the
+        # START of the retained dialogue. Later changes appear in its replies.
+        messages[0]["content"] += speaker_registry_text(self._speakers_before_history)
+        messages[0]["content"] += last_committed_text(*self._last_attribution_before_history)
         audios = []
         ref_prefix = ""
         for speaker in sorted(self.references, key=lambda name: int(name[3:])):
@@ -204,7 +211,11 @@ class StreamSession:
             pending = self.heard_seconds + duration - commit
             retained = duration + sum(t.end - t.start for t in self.history)
             if pending > self.options.max_pending_seconds + 1e-8:
-                raise ContextBudgetError("Unverified pending audio exceeded budget; supply a reliable commit watermark")
+                raise ContextBudgetError(
+                    f"Unverified pending audio exceeded budget ({pending:.2f}s > "
+                    f"{self.options.max_pending_seconds:g}s; {self.options.context_policy} policy, "
+                    f"commit watermark {commit:.2f}s, attempted audio end {self.heard_seconds + duration:.2f}s)"
+                )
             if retained > self.options.max_context_seconds + 1e-8:
                 raise ContextBudgetError("Context audio budget exhausted; cannot safely evict uncommitted speech")
             # Match SFT's last short-tail padding without inventing source time.
@@ -236,7 +247,8 @@ class StreamSession:
             self.inferred_commit_seconds = max(self.inferred_commit_seconds,
                 self.heard_seconds - self.options.rolling_tail_seconds)
         if not end_of_audio:
-            self.history.append(AudioTurn(start, self.heard_seconds, pcm, parsed["text"]))
+            attributions = tuple((s["language"], s["speaker"]) for s in parsed["segments"])
+            self.history.append(AudioTurn(start, self.heard_seconds, pcm, parsed["text"], attributions))
             self._short_tail = duration < self.options.chunk_seconds - 1e-8
         else:
             self.closed = True
@@ -250,7 +262,8 @@ class StreamSession:
                     heuristic_eviction=self.heuristic_eviction,
                     evicted_this_turn=self.evicted_this_turn,
                     inferred_commit_seconds=self.inferred_commit_seconds,
-                    prompt_tokens=generated.get("prompt_tokens") if isinstance(generated, dict) else None)
+                    prompt_tokens=generated.get("prompt_tokens") if isinstance(generated, dict) else None,
+                    num_cached_tokens=generated.get("num_cached_tokens") if isinstance(generated, dict) else None)
 
     def verify_commit(self, through_seconds, *, verified=False):
         """Trusted aligner/operator API, never inferred from DIRECT alone.

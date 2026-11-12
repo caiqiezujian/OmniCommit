@@ -115,4 +115,5 @@ class VLLMBackend:
         while tokens and tokens[-1] in self.stop_ids:
             tokens.pop()
         text=self.tokenizer.decode(tokens,skip_special_tokens=False,clean_up_tokenization_spaces=False)
-        return {"text":text,"prompt_tokens":expected}
+        return {"text":text,"prompt_tokens":expected,
+                "num_cached_tokens":getattr(output, "num_cached_tokens", None)}

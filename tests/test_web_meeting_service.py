@@ -17,6 +17,18 @@ from fastapi.testclient import TestClient
 from omnicommit.web_service import create_app
 
 
+def test_meeting_page_serves_its_log_scripts():
+    with TestClient(create_app(lambda: ReplayBackend([]), StreamOptions())) as client:
+        page = client.get("/")
+        assert page.status_code == 200
+        for name in ("log-archive", "turn-log"):
+            url = f"/web/{name}.js"
+            assert f'src="{url}"' in page.text
+            script = client.get(url)
+            assert script.status_code == 200
+            assert "javascript" in script.headers["content-type"]
+
+
 def test_web_800ms_step_is_advertised_and_accepts_12800_samples():
     replies = [DIRECT + "<en><spk1>Hello.", WAIT, WAIT]
     with TestClient(create_app(lambda: ReplayBackend(replies), StreamOptions(chunk_seconds=.8))) as client:

@@ -84,6 +84,16 @@ def test_rolling_is_explicit_and_wait_chain_not_evicted():
     with pytest.raises(ContextBudgetError): session.step(pcm())
 
 
+def test_rolling_budget_reports_the_blocked_audio_interval_after_waits():
+    session = StreamSession(ReplayBackend([DIRECT + "<en><spk1>Hello"] * 64 + [WAIT] * 56),
+                            StreamOptions(context_policy="rolling"))
+    for _ in range(120):
+        session.step(pcm())
+    with pytest.raises(ContextBudgetError, match=r"30\.50s > 30s; rolling policy, commit watermark 30\.00s, attempted audio end 60\.50s"):
+        session.step(pcm())
+    assert session.heard_seconds == 60
+
+
 def test_reference_is_causal_verified_and_separate():
     replies=[DIRECT+"<zh><spk1>你好",DIRECT+"<en><spk2>Hello",DIRECT+"<en><spk1>Hello again"]
     session=StreamSession(ReplayBackend(replies),StreamOptions(recent_seconds=.5))
@@ -266,7 +276,8 @@ def test_web_bad_control_keeps_session_and_serializes_model():
             for socket in (a,b):assert socket.receive_json()["event"]=="end_of_audio"
 
 
-def test_vllm_request_cache_keys_exact_count_and_wait():
+@pytest.mark.parametrize("cache_stats", [{}, {"num_cached_tokens": 4}])
+def test_vllm_request_cache_keys_exact_count_and_wait(cache_stats):
     from types import SimpleNamespace
     from omnicommit.vllm_backend import VLLMBackend
     backend=VLLMBackend.__new__(VLLMBackend)
@@ -279,7 +290,7 @@ def test_vllm_request_cache_keys_exact_count_and_wait():
     class Engine:
         def generate(self,requests,*args,**kwargs):
             self.request=requests[0]
-            return [SimpleNamespace(prompt_token_ids=list(range(7)),outputs=[SimpleNamespace(
+            return [SimpleNamespace(**cache_stats,prompt_token_ids=list(range(7)),outputs=[SimpleNamespace(
                 token_ids=[9],finish_reason="stop")])]
     backend.tokenizer=Tok();backend.llm=Engine();backend.TokensPrompt=lambda **kw:kw
     backend.max_audio_turns=8;backend.max_audio_seconds=5;backend.max_new_tokens=8
@@ -289,6 +300,6 @@ def test_vllm_request_cache_keys_exact_count_and_wait():
     request=backend.llm.request
     assert request["multi_modal_uuids"]["audio"][0]==request["multi_modal_uuids"]["audio"][1]
     assert request["prompt_token_ids"]==[1,2,3]
-    assert result=={"text":WAIT,"prompt_tokens":7}
+    assert result=={"text":WAIT,"prompt_tokens":7,"num_cached_tokens":cache_stats.get("num_cached_tokens")}
     backend.max_context_tokens=10
     with pytest.raises(ContextBudgetError):backend.generate([{"role":"user","content":"<audio>"}],[pcm()])

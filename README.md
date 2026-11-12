@@ -176,6 +176,8 @@ bash start_server.sh /data/yb/Code/OmniCommit/outputs/merged
 
 网页默认监听 `0.0.0.0:18889`，无需访问令牌，支持麦克风、系统声音、音视频文件、实时转录、逐段修正、说话人合并/改名及 TXT/JSON 导出。远程浏览器采集麦克风或系统声音仍需要受信任的 HTTPS 或 localhost；文件模式受浏览器支持格式限制。
 
+展开“逐轮日志”可按会议回看 WAIT 和 DIRECT，或下载全部模型轮次的 TXT、全部收到事件的 JSONL。浏览器在本地保存会议日志，回看与下载方法见[网页服务说明](docs/web_meeting_service_zh.md#回看和下载逐轮日志)。
+
 自动说话人参照可选启用，使用独立 Python 环境中的 Qwen 对齐器进行**实验性**候选构建；它不验证身份或重叠发言，当前阿拉伯语和泰语不会自动建参照。默认 `rolling` 是启发式裁剪，可能遗漏尚未提交的语音；连续 WAIT 超过预算可能停止。真实 30 分钟准确率、速度和跨长间隔身份一致性尚未验收。启动参数、依赖和完整说明见 [会议 Web 服务](docs/web_meeting_service_zh.md)。
 
 ## 文档与验证

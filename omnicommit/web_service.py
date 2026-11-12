@@ -26,6 +26,7 @@ def create_app(backend_factory, options, *, max_sessions=1,
                auto_reference_factory=None):
     from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
     from fastapi.responses import FileResponse, JSONResponse
+    from fastapi.staticfiles import StaticFiles
     if max_sessions < 1:
         raise ValueError("max_sessions must be positive")
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="omnicommit-model")
@@ -63,10 +64,12 @@ def create_app(backend_factory, options, *, max_sessions=1,
 
     app = FastAPI(lifespan=lifespan)
     app.state.media_store = media_store
+    web_directory = Path(__file__).resolve().parent / "web"
+    app.mount("/web", StaticFiles(directory=web_directory), name="web")
 
     @app.get("/")
     async def index():
-        return FileResponse(Path(__file__).resolve().parent / "web" / "index.html")
+        return FileResponse(web_directory / "index.html")
 
     @app.get("/health")
     async def health():

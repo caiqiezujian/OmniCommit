@@ -13,7 +13,7 @@ dependencies = ["numpy>=1.24,<3", "scipy>=1.10,<2", "soundfile>=0.12,<1", "reque
 include = ["omnicommit*"]
 
 [tool.setuptools.package-data]
-omnicommit = ["web/*.html"]
+omnicommit = ["web/*.html", "web/*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "Data-Scripts/tests", "SFT-Scripts"]

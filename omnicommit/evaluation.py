@@ -174,7 +174,7 @@ def transcript_events(rows):
             raise ValueError("Event rows must be objects")
         if "event" in row:
             result.append(row)
-        elif row.get("type") in ("ready", "control_ack", "control_error"):
+        elif row.get("type") in ("ready", "file_wait", "file_done", "control_ack", "control_error", "local_correction"):
             continue
         elif row.get("type") == "error":
             result.append(dict(row, event="error"))
