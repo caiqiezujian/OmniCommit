@@ -264,7 +264,7 @@ bash SFT-Scripts/train_sft.sh \
 
 `--new_special_tokens` 在 SFT 前注册 WAIT、DIRECT、语种与说话人 token；`--modules_to_save word_embeddings output_layer` 保存它们训练后的权重。**不是训练结束后再往 tokenizer 里加随机新 token。** `protocol_tokens.txt` 只有两种动作，正式训练应使用数据生成的完整 `.tokens.txt`。
 
-旧驱动兼容入口仍是 `--compat-old-driver`；它会采用已有 FLEX 兼容配方，详细变化见 [SFT 说明](../SFT-Scripts/README.md)。
+音频或视觉的 FlashAttention 出错时，`--packed-sdpa` 可保留文本侧 packing 并在读取数据前检查 GPU 内核。全 unfused 配方使用 `--compat-old-driver`。八卡命令见 [SFT 说明](../SFT-Scripts/README.md)。
 
 ## 9. 导出：HF 基座 + 实际 PEFT checkpoint
 

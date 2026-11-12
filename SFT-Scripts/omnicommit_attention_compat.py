@@ -39,7 +39,7 @@ def _require_sdpa(module):
     mode = getattr(module.config, "_attn_implementation", None)
     if mode != "sdpa":
         raise RuntimeError(f"OMNICOMMIT compatibility mode requires HF attn_impl=sdpa, got {mode!r}. "
-                           "Launch with --compat-old-driver; do not override --attn_impl.")
+                           "Use the launcher's --packed-sdpa or --compat-old-driver preset.")
 
 
 def _audio_boundaries(hidden_states, cu_seqlens):
@@ -109,4 +109,4 @@ def install_attention_compat():
     audio_cls.forward = audio_forward
     vision_cls.forward = vision_forward
     print("[OMNICOMMIT attention] compatibility enabled: Omni audio=segmented math SDPA; "
-          "vision=native segmented math SDPA. Megatron must use unfused with packing/padding_free=false.", flush=True)
+          "vision=native segmented math SDPA.", flush=True)

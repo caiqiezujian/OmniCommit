@@ -18,6 +18,7 @@ def run_launcher(tmp_path, extra):
     python = fake_bin / "python3"
     python.write_bytes(('#!/usr/bin/env bash\nprintf "CALL\\n"\nprintf "ARG:%s\\n" "$@"\n'
                       'printf "CUDA:%s\\n" "$CUDA_VISIBLE_DEVICES"\n'
+                      'if [[ "$1" == *check_packed_attention.py ]]; then exit "${PACKED_PROBE_STATUS:-0}"; fi\n'
                       'printf "ENV:%s,%s,%s,%s,%s\\n" "${OMNICOMMIT_SFT_ATTENTION_COMPAT-unset}" '
                       '"${NVTE_FLASH_ATTN-unset}" "${NVTE_FUSED_ATTN-unset}" '
                       '"${NVTE_UNFUSED_ATTN-unset}" "${NVTE_MASKED_SOFTMAX_FUSION-unset}"\n').encode("utf-8"))
@@ -50,6 +51,33 @@ def test_default_launcher_uses_eight_gpus_and_8192_length(tmp_path):
         assert f"ARG:--{flag}\nARG:{value}" in run.stdout
     assert "ARG:--padding_free" not in run.stdout
     assert "ENV:unset,unset,unset,unset,unset" in run.stdout
+
+
+def test_packed_sdpa_checks_kernel_before_dataset_and_torchrun(tmp_path):
+    run = run_launcher(tmp_path, ["--packed-sdpa", "--global_batch_size", "32"])
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.index("check_packed_attention.py") < run.stdout.index("check_sft.py") < run.stdout.index("torch.distributed.run")
+    for flag, value in (("attn_impl", "sdpa"), ("attention_backend", "flash"), ("packing", "true"),
+                        ("padding_free", "true"), ("global_batch_size", "32")):
+        assert f"ARG:--{flag}\nARG:{value}" in run.stdout
+    assert "ENV:1,1,0,0,unset" in run.stdout
+
+
+def test_failed_packed_probe_does_not_start_dataset_processing(tmp_path, monkeypatch):
+    monkeypatch.setenv("PACKED_PROBE_STATUS", "17")
+    run = run_launcher(tmp_path, ["--packed-sdpa"])
+    assert run.returncode == 17
+    assert "check_sft.py" not in run.stdout and "torch.distributed.run" not in run.stdout
+
+
+@pytest.mark.parametrize("extra", [["--packed-sdpa", "--compat-old-driver"],
+                                   ["--compat-old-driver", "--packed-sdpa"],
+                                   ["--packed-sdpa", "--attention_backend=fused"],
+                                   ["--packed-sdpa", "--packing", "false"]])
+def test_packed_preset_rejects_conflicting_layout(tmp_path, extra):
+    run = run_launcher(tmp_path, extra)
+    assert run.returncode == 2
+    assert "CALL" not in run.stdout
 
 
 def test_four_gpu_selection_uses_four_processes(tmp_path):

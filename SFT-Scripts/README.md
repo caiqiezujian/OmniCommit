@@ -210,6 +210,27 @@ python SFT-Scripts/check_sft_attention.py --gpu-id 0
 
 这会执行小型注意力前后向，不加载大模型；它与默认 CPU preflight 不同。
 
+如果音频或视觉模块在 `flash_attn_gpu.varlen_fwd` 报过错，但希望在 A800 上开启 packing，可用
+`--packed-sdpa`。音频和视觉使用分段 math SDPA，Megatron 文本侧使用 FlashAttention 处理打包序列。
+复用现有的 500 ms 训练 JSONL 和 token 清单。以下示例从 MCore 基座开始新的一轮训练。
+
+```bash
+cd /data/yb/Code/OmniCommit
+read -r -e -p '当前 500 ms 训练 JSONL 的绝对路径：' train_jsonl
+bash SFT-Scripts/train_sft.sh \
+  /data/data_process/lzy/qwen3_omni_mega/train/qwen3_omni_mcore_3.12.1 \
+  "$train_jsonl" \
+  /data/yb/Code/OmniCommit/outputs/sft-500ms-packed-8gpu \
+  --gpu-ids 0,1,2,3,4,5,6,7 --packed-sdpa \
+  --micro_batch_size 2 --global_batch_size 32 \
+  --max_length 8192 --max_epochs 1 --save_interval 1000
+```
+
+启动器在第一张可见卡上检查 BF16 打包注意力的前向、梯度以及两条序列间的隔离，然后进入数据预处理。
+也可在训练容器单独运行 `CUDA_VISIBLE_DEVICES=0 python3 SFT-Scripts/check_packed_attention.py`。
+若该检查报 `device kernel image is invalid`，应先修复与当前 A800、PyTorch 和 CUDA 环境匹配的 FlashAttention 安装。
+8192 是每个 pack 的长度上限。显存按打包后的实际 token 数评估，提速可比较相同原始样本集完成一个 epoch 的用时。
+
 ## 验证边界
 
 CPU 测试覆盖真实区间读取、重采样前隔离未来采样、标签与说话人格式、

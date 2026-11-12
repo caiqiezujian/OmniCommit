@@ -5,7 +5,7 @@
 set -euo pipefail
 
 if (( $# < 3 )); then
-  echo "Usage: bash train_sft.sh MCORE_MODEL TRAIN_JSONL OUTPUT_DIR [--gpu-ids 0,1,2,3,4,5,6,7] [--compat-old-driver] [--tokens-file FILE] [native Megatron options...]" >&2
+  echo "Usage: bash train_sft.sh MCORE_MODEL TRAIN_JSONL OUTPUT_DIR [--gpu-ids 0,1,2,3,4,5,6,7] [--packed-sdpa | --compat-old-driver] [--tokens-file FILE] [native Megatron options...]" >&2
   exit 2
 fi
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -14,7 +14,7 @@ DATASET_PATH="$2"
 OUTPUT_PATH="$3"
 shift 3
 GPU_LIST="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
-COMPAT_OLD_DRIVER=0
+ATTENTION_MODE=""
 TOKENS_PATH="${DATASET_PATH}.tokens.txt"
 EXTRA_ARGS=()
 while (( $# )); do
@@ -22,7 +22,12 @@ while (( $# )); do
     --gpu-ids)
       if (( $# < 2 )); then echo "--gpu-ids requires a value" >&2; exit 2; fi
       GPU_LIST="$2"; shift 2 ;;
-    --compat-old-driver) COMPAT_OLD_DRIVER=1; shift ;;
+    --packed-sdpa|--compat-old-driver)
+      if [[ -n "$ATTENTION_MODE" && "$ATTENTION_MODE" != "$1" ]]; then
+        echo "--packed-sdpa and --compat-old-driver select different attention backends; choose one." >&2
+        exit 2
+      fi
+      ATTENTION_MODE="$1"; shift ;;
     --tokens-file)
       if (( $# < 2 )); then echo "--tokens-file requires a value" >&2; exit 2; fi
       TOKENS_PATH="$2"; shift 2 ;;
@@ -46,24 +51,32 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 export PYTHONUNBUFFERED=1
 ATTENTION_ARGS=(--attention_backend flash)
 PACKING_ARGS=(--packing true)
-if (( COMPAT_OLD_DRIVER )); then
-  # These are coupled: TE unfused does not support the THD padding-free layout.
+if [[ -n "$ATTENTION_MODE" ]]; then
+  # Keep the TE backend consistent with the sequence layout selected by each preset.
   for arg in "${EXTRA_ARGS[@]}"; do
     case "$arg" in
       --attn_impl|--attn_impl=*|--attention_backend|--attention_backend=*|--packing|--packing=*|--padding_free|--padding_free=*|--transformer_impl|--transformer_impl=*)
-        echo "--compat-old-driver controls $arg; remove that override to preserve the fallback." >&2
+        echo "$ATTENTION_MODE controls $arg; remove the conflicting override." >&2
         exit 2 ;;
     esac
   done
   export OMNICOMMIT_SFT_ATTENTION_COMPAT=1
+else
+  unset OMNICOMMIT_SFT_ATTENTION_COMPAT
+fi
+if [[ "$ATTENTION_MODE" == "--packed-sdpa" ]]; then
+  export NVTE_FLASH_ATTN=1 NVTE_FUSED_ATTN=0 NVTE_UNFUSED_ATTN=0
+  ATTENTION_ARGS=(--attn_impl sdpa --attention_backend flash)
+  PACKING_ARGS=(--packing true --padding_free true)
+  echo "[train] Packing enabled: Omni audio/vision use segmented math SDPA; Megatron uses packed FlashAttention."
+  python3 "$SCRIPT_DIR/check_packed_attention.py"
+elif [[ "$ATTENTION_MODE" == "--compat-old-driver" ]]; then
   export NVTE_FLASH_ATTN=0 NVTE_FUSED_ATTN=0 NVTE_UNFUSED_ATTN=1
   export NVTE_MASKED_SOFTMAX_FUSION=0
   ATTENTION_ARGS=(--attn_impl sdpa --attention_backend unfused)
   PACKING_ARGS=(--packing false --padding_free false)
   MICRO_BATCH=1
-  echo "[train] Old-driver compatibility: HF math SDPA; TE unfused; packing/padding_free=false; micro=1/global=16. Expect lower speed and different memory usage."
-else
-  unset OMNICOMMIT_SFT_ATTENTION_COMPAT
+  echo "[train] Old-driver compatibility: HF math SDPA; TE unfused; packing/padding_free=false."
 fi
 
 python3 "$SCRIPT_DIR/check_sft.py" "$DATASET_PATH" --rows 2 --tokens-file "$TOKENS_PATH" --framework
