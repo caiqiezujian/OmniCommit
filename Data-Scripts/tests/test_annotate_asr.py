@@ -7,6 +7,8 @@ import importlib.util
 import json
 from pathlib import Path
 import re
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -14,7 +16,6 @@ import requests
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "annotate_asr.py"
-PROMPT_DIR = SCRIPT.parent / "prompts"
 LANGUAGES = {"ar", "ja", "ko", "it", "fr", "pt", "es", "ru", "th", "en", "zh", "de"}
 SOURCE = "<zh><spk1>请继续讨论。"
 
@@ -147,12 +148,20 @@ def test_original_cloud_defaults_and_unknown_argument_compatibility(runner):
     assert runner.OUTPUT_SUFFIX == "_stream_output"
 
 
-def test_full_language_prompts_are_embedded(runner):
+def test_full_language_prompts_can_be_exported_without_cloud_dependencies(runner, tmp_path):
     assert set(runner.PROMPTS) == LANGUAGES
     assert runner.PROMPT == runner.PROMPTS["zh"]
     for language, prompt in runner.PROMPTS.items():
-        path = PROMPT_DIR / f"asr_segment_wait_direct_{language}.txt"
-        assert prompt.strip() == path.read_text(encoding="utf-8").strip(), language
+        result = subprocess.run([sys.executable, "-I", "-S", str(SCRIPT), "--print-prompt", language],
+                                cwd=tmp_path, capture_output=True, check=True)
+        assert result.stdout == prompt.encode("utf-8"), language
+
+
+def test_unknown_prompt_language_is_a_cli_error(tmp_path):
+    result = subprocess.run([sys.executable, "-I", "-S", str(SCRIPT), "--print-prompt", "unknown"],
+                            cwd=tmp_path, capture_output=True)
+    assert result.returncode == 2
+    assert b"unknown" in result.stderr and not result.stdout
 
 
 def test_all_prompt_examples_agree_with_runtime_validator(runner):

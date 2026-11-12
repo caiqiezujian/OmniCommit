@@ -19,8 +19,7 @@ ACTION_TOKENS = ["<|WAIT|>", "<|DIRECT|>"]
 LANGUAGE = re.compile(r"[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*")
 SPEAKER = re.compile(r"spk[1-9][0-9]*")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from omnicommit.runtime_protocol import SYSTEM_PROMPT, END_OF_AUDIO, system_prompt
-
+from omnicommit.runtime_protocol import END_OF_AUDIO, system_prompt
 
 
 def number(value, name):

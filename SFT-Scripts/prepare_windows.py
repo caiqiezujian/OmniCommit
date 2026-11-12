@@ -10,8 +10,8 @@ import json
 from pathlib import Path
 import sys
 
-from prepare_sft import render_segments, number, sort_tokens
-from check_sft import check_row, check_content, read_tokens
+from prepare_sft import number, sort_tokens
+from check_sft import check_row, read_tokens
 from omnicommit_audio import encode_chunk_ref
 from omnicommit.runtime_protocol import speaker_reference_text, speaker_registry_text, last_committed_text, LIVE_AUDIO_PREFIX
 

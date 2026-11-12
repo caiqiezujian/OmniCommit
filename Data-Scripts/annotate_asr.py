@@ -20,10 +20,15 @@ import itertools
 import json
 import os
 import re
-import time
+import sys
 from collections import Counter
 
-import requests
+try:
+    import requests
+except ModuleNotFoundError as exc:
+    if exc.name != "requests":
+        raise
+    requests = None  # Reviewing an embedded prompt only needs the standard library.
 
 
 RESULT_FIELD = "output"
@@ -2397,6 +2402,8 @@ def process_file(input_file, output_file, args):
 def parse_cmdline(argv=None):
     p = argparse.ArgumentParser()
 
+    p.add_argument("--print-prompt", choices=SUPPORTED_LANGUAGES, default=argparse.SUPPRESS,
+                   help="输出指定语种的完整 UTF-8 prompt 后退出")
     p.add_argument(
         "--data_path",
         default="/home/ma-user/modelarts/inputs/input_data_0/",
@@ -2438,6 +2445,10 @@ def parse_cmdline(argv=None):
     )
 
     args, _ = p.parse_known_args(argv)
+
+    if hasattr(args, "print_prompt"):
+        sys.stdout.buffer.write(PROMPTS[args.print_prompt].encode("utf-8"))
+        p.exit()
 
     if args.concurrency < 1:
         p.error("concurrency 必须大于 0")
@@ -2486,6 +2497,8 @@ def find_input_jsonl_files(input_dir):
 
 def main():
     args = parse_cmdline()
+    if requests is None:
+        raise ModuleNotFoundError("ASR annotation requires the requests package")
     input_real = os.path.realpath(args.data_path)
     output_real = os.path.realpath(args.output_dir)
     if os.path.commonpath([input_real, output_real]) in (input_real, output_real):

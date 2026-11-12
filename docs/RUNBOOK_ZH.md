@@ -52,7 +52,12 @@ python tools/run_text_pipeline_demo.py \
 
 ## 1. 云道一次调用：文本切分 + 初步标签
 
-将 `Data-Scripts/annotate_asr.py` 作为单独脚本上传。十二套 prompt 已内嵌，不需要额外上传 prompt 文件；旁边的 txt 是便于审查的同内容副本。
+将 `Data-Scripts/annotate_asr.py` 作为单独脚本上传。脚本内嵌十二套 prompt，支持在本地直接查看实际请求使用的文本。下面第二条 Bash 命令把德语 prompt 原样导出为 UTF-8。
+
+```bash
+python Data-Scripts/annotate_asr.py --print-prompt zh
+python Data-Scripts/annotate_asr.py --print-prompt de > de-prompt.txt
+```
 
 ```bash
 # 在原云道任务挂载和模型服务已经就绪的环境执行。
@@ -262,9 +267,9 @@ bash SFT-Scripts/train_sft.sh \
 
 此命令使用八卡、LoRA r8/alpha32、EP2、micro/global batch 2/16、学习率 1e-4、3 epochs、packing 和 8192 token 长度上限。云道文本教师的量化 DeepSeek 是数据标注模型，与这里被训练的 Omni 基座不同。
 
-`--new_special_tokens` 在 SFT 前注册 WAIT、DIRECT、语种与说话人 token；`--modules_to_save word_embeddings output_layer` 保存它们训练后的权重。**不是训练结束后再往 tokenizer 里加随机新 token。** `protocol_tokens.txt` 只有两种动作，正式训练应使用数据生成的完整 `.tokens.txt`。
+训练脚本默认读取构建数据时生成的 `训练文件.jsonl.tokens.txt`。`--new_special_tokens` 在 SFT 前注册 WAIT、DIRECT、语种与说话人 token，`--modules_to_save word_embeddings output_layer` 随适配器保存训练后的权重。导出时使用训练所用的同一份文件，保持 token 顺序一致。
 
-音频或视觉的 FlashAttention 出错时，`--packed-sdpa` 可保留文本侧 packing 并在读取数据前检查 GPU 内核。全 unfused 配方使用 `--compat-old-driver`。八卡命令见 [SFT 说明](../SFT-Scripts/README.md)。
+音频或视觉的 FlashAttention 出错时可选 `--packed-sdpa`。若文本侧 FlashAttention 也报错，使用 `--packed-no-flash` 按会话计算打包文本的注意力；关闭 packing 的兼容配方是 `--compat-old-driver`。八卡命令见 [SFT 说明](../SFT-Scripts/README.md)。
 
 ## 9. 导出：HF 基座 + 实际 PEFT checkpoint
 

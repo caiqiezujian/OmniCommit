@@ -76,7 +76,7 @@ WAIT事件处理状态与已经提交的归属状态分开维护，避免同一�
 
 七、验收与续跑
 12份独立prompt各有6个例子，包括多个连续DIRECT、保护表达、语种和说话人变化以及末尾WAIT。
-prompt单独文本放在Data-Scripts/prompts，仅供查看；实际云道脚本使用内置版本。
+在仓库根目录运行 python Data-Scripts/annotate_asr.py --print-prompt zh 即可查看实际请求使用的中文 prompt。可将 zh 换为其他支持的语种，无需音频、模型或云道环境。
 既有续跑行为保持：当前输出文件中已经写出的成功或失败记录均跳过，不自动重新标注。
 最新脚本启动标识为OMNICOMMIT_ASR_DIRECT_FULL_PREFIX_2048_V3；旧文件不会因替换脚本自动补前缀，新格式输出使用新目录。
 旧版含wait_reasons的历史结果不会因为替换脚本而被自动改写；使用新版本时应区分已有结果的版本。
