@@ -1,31 +1,33 @@
 # OmniCommit
 
-**多语言、多说话人流式 ASR：学习何时等待，何时提交转录。**
+OmniCommit 使用 Qwen3-Omni 对多语言、多说话人的增量音频进行原语言转录。模型每轮听一块新音频，提交新增转录或输出 `<|WAIT|>`。
 
-OmniCommit 使用 Qwen3-Omni 对增量音频进行原语言转录。每轮接收一个新音频块，模型只输出以下一种结果：
+## 在 main 选择训练入口
 
-```text
-<|WAIT|>
-<|DIRECT|><zh><spk1>新增转录
-```
+先看训练 JSONL 中**有正文的 assistant 回复**。第一版以 `<|DIRECT|>` 开头，每次提交都带完整语种和说话人标签。第二版直接提交正文，首次转录或归属变化时带标签，同一归属跨轮续写。两套协议的 token 清单各自由自己的数据构建器生成。
 
-WAIT 不输出文本；DIRECT 输出尚未提交的文本，并为每段标明语种和说话人。同一个说话人切换语种时保留编号。语种或说话人变化时，DIRECT 内的新归属使用完整 `<语言><说话人>` 前缀。真实模型能否正确判断等待、语种及身份，需要实际训练和评测。
+| 训练协议 | ms-swift 3.12.1 · MCore 基座 | ms-swift 4.1.3 · 原始 HF 基座 |
+|---|---|---|
+| 第一版 · WAIT / DIRECT | [SFT-Scripts/train_sft.sh](SFT-Scripts/train_sft.sh) | [SFT-Scripts/train_sft_swift4.sh](SFT-Scripts/train_sft_swift4.sh) |
+| 第二版 · WAIT / 正文 | [Second/SFT-Scripts/train_sft.sh](Second/SFT-Scripts/train_sft.sh) | [Second/SFT-Scripts/train_sft_swift4.sh](Second/SFT-Scripts/train_sft_swift4.sh) |
 
-本仓库包含：本地 HF Omni 批量前缀推理、切换时间约束下的标签构建、旧版文本模型标注/对齐、FLEX 风格音频/文本交错 SFT、模型导出、流式推理与 Web。默认示例路径均为占位路径，必须换成实际服务器路径。仓库不包含用户音频、训练数据、模型权重或线上服务。
+四个入口都用 Megatron 训练，三个位置参数依次是对应格式的**基座目录、训练 JSONL、输出目录**。每个入口自动调用同目录的 `check_sft.py` 和 `omnicommit_sft_plugin.py`。3.12.1 默认每 3000 步保存，使用 `--save_interval` 调整。4.1.3 默认每 1000 步保存，使用 `--save_steps` 调整。
 
-## 先选择当前输入
+第一版按下文构建数据、训练、合并 LoRA 和启动 Web 服务。若已有每个语义段的时间戳，希望按 500、700、800 或 1000 ms 重铸第二版训练数据，请从第二版手册开始。示例命令中的数据与模型路径按服务器实际挂载填写。[第一版训练手册](SFT-Scripts/README.md) · [第二版数据构建与训练](Second/README.md)
+
+## 第一版的输入与数据构建
 
 | 当前已有数据 | 下一步 |
 |---|---|
-| 原始音频、完整带标签转录，以及仅在真实语种/说话人变化处的 `time_ms` | **当前新路线**：`collect_hf_prefixes.py` 本地批量识别，随后 `build_prefix_sft.py` 校验、过滤并直接生成 SFT。单语单人不需要变化时间戳。 |
+| 原始音频、完整带标签转录，以及仅在真实语种/说话人变化处的 `time_ms` | 用 `collect_hf_prefixes.py` 本地批量识别，随后 `build_prefix_sft.py` 校验、过滤并直接生成 SFT。单语单人可省略变化时间戳。 |
 | 计划继续使用旧版文本模型标注路线 | 用 `Data-Scripts/annotate_asr.py` 一次调用文本模型切分并构建初步标签，再取得各单元声学时间戳。 |
 | 每行已有 `audios`、`messages`、`output`、`timestamps` | 使用 `Data-Scripts/build_asr_sft.py`，直接重铸并生成精简 SFT JSONL。 |
 | 已有精简的 SFT JSONL 和对应 `.tokens.txt` | 直接进行音频、结构和真实训练模板长度检查，之后运行 SFT。 |
 | 需要将长录音拆成训练窗口并加入说话人参照 | 使用保留中间元数据的分阶段路线；精简 JSONL 不能直接提供安全拆窗信息。 |
 
-新路线的实际字段、批量推理、缓存恢复和逐步命令见 [本地 Omni 前缀到 SFT](docs/hf_prefix_sft_zh.md)。旧版详细字段见 [数据格式](docs/data-format.md)。原有 API 教师实验也保留，见 [方法与边界](docs/method.md)；三条路线的输入不能直接混用。
+HF 前缀路线支持批量推理和缓存恢复。文本标注、API 教师实验的输入字段和操作步骤见各自手册。[本地 Omni 前缀到 SFT](docs/hf_prefix_sft_zh.md) · [数据格式](docs/data-format.md) · [方法与边界](docs/method.md)
 
-## 当前主线
+## 第一版的前缀推理与标签构建
 
 ```text
 完整音频 + 带语种/说话人的参考转录 + 真实变化处 time_ms
@@ -165,7 +167,7 @@ bash SFT-Scripts/train_sft.sh \
 
 训练前通过 `--new_special_tokens` 注册清单；结束后必须保留同一清单和对应权重，不能仅在训练后手动增加随机 token。
 
-## 4. 导出和 Web
+## 4. 第一版模型导出和 Web
 
 使用原始未量化 HF 基座和实际保存的 `checkpoint-N` 导出；替换下方占位路径：
 
@@ -186,17 +188,17 @@ bash start_server.sh /data/yb/Code/OmniCommit/outputs/merged
 
 网页默认监听 `0.0.0.0:18889`，无需访问令牌，支持麦克风、系统声音、音视频文件、实时转录、逐段修正、说话人合并/改名及 TXT/JSON 导出。远程浏览器采集麦克风或系统声音仍需要受信任的 HTTPS 或 localhost；文件模式受浏览器支持格式限制。
 
-展开“逐轮日志”可按会议回看 WAIT 和 DIRECT，或下载全部模型轮次的 TXT、全部收到事件的 JSONL。浏览器在本地保存会议日志，回看与下载方法见[网页服务说明](docs/web_meeting_service_zh.md#回看和下载逐轮日志)。
+“逐轮日志”默认展开，可按会议回看 WAIT 和 DIRECT，下载全部模型轮次的 TXT 或收到事件的 JSONL。浏览器在本地保存会议日志。[网页服务说明](docs/web_meeting_service_zh.md#回看和下载逐轮日志)
 
 自动说话人参照可选启用，使用独立 Python 环境中的 Qwen 对齐器进行**实验性**候选构建；它不验证身份或重叠发言，当前阿拉伯语和泰语不会自动建参照。默认 `rolling` 是启发式裁剪，可能遗漏尚未提交的语音；连续 WAIT 超过预算可能停止。真实 30 分钟准确率、速度和跨长间隔身份一致性尚未验收。启动参数、依赖和完整说明见 [会议 Web 服务](docs/web_meeting_service_zh.md)。
 
 ## 文档与验证
 
-- [数据格式](docs/data-format.md)：原始数据、标注、时间戳与两种 SFT 格式。
+- [第一版数据格式](docs/data-format.md) 和 [第二版逐语义段时间戳格式](Second/README.md)。
 - [时间戳直接生成 SFT](docs/timestamped_to_sft_zh.md)：行内时间戳、重铸与错误处理。
 - [分阶段执行手册](docs/RUNBOOK_ZH.md)：标注、对齐、拆窗、训练与导出。
 - [SFT 文档](SFT-Scripts/README.md)：token、训练参数和导出。
 - [会议 Web 服务](docs/web_meeting_service_zh.md) 与 [流式状态说明](docs/streaming_runtime.md)：运行和限制。
 - [方法与验证边界](docs/method.md)、[FLEX 对应关系](docs/FLEX_ADAPTATION.md)：研究路线和实现差异。
 
-在隔离的数据开发环境可以执行 `python -m pytest -q` 和 `node tests/test_web_ui_contract.mjs`。测试中的 replay、合成音频和模拟模型只验证代码接口与状态，**不代表真实听音质量、GPU 训练、模型导出、实时吞吐或 30 分钟说话人稳定性已验证**。
+在数据开发环境中，从仓库根目录执行 `python -m pytest -q` 检查第一版流程，`python -m pytest -q Second/tests` 检查第二版，再用 `node tests/test_web_ui_contract.mjs` 检查网页交互。真实听音质量、GPU 训练和长会议表现需要在部署环境验收。

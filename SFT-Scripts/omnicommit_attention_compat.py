@@ -39,7 +39,7 @@ def _require_sdpa(module):
     mode = getattr(module.config, "_attn_implementation", None)
     if mode != "sdpa":
         raise RuntimeError(f"OMNICOMMIT compatibility mode requires HF attn_impl=sdpa, got {mode!r}. "
-                           "Use the launcher's --packed-sdpa or --compat-old-driver preset.")
+                           "Use the launcher's --packed-no-flash, --packed-sdpa or --compat-old-driver preset.")
 
 
 def _audio_boundaries(hidden_states, cu_seqlens):

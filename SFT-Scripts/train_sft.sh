@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# SWIFT 3.12.1 / Megatron SFT with virtual audio input and unmerged adapter saves.
+# First protocol (WAIT / DIRECT). ms-swift 3.12.1 Megatron reads an MCore base.
+# The sibling omnicommit_sft_plugin.py registers omnicommit_qwen3_omni.
 # Default: eight local GPUs, global batch 16, sequence length 8192.
 # System prompts come from the prepared JSONL; no separate --system override.
 set -euo pipefail
 
 if (( $# < 3 )); then
-  echo "Usage: bash train_sft.sh MCORE_MODEL TRAIN_JSONL OUTPUT_DIR [--gpu-ids 0,1,2,3,4,5,6,7] [--packed-sdpa | --compat-old-driver] [--tokens-file FILE] [native Megatron options...]" >&2
+  echo "Usage: bash train_sft.sh MCORE_MODEL TRAIN_JSONL OUTPUT_DIR [--gpu-ids 0,1,2,3,4,5,6,7] [--packed-no-flash | --packed-sdpa | --compat-old-driver] [--tokens-file FILE] [native Megatron options...]" >&2
   exit 2
 fi
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,9 +23,9 @@ while (( $# )); do
     --gpu-ids)
       if (( $# < 2 )); then echo "--gpu-ids requires a value" >&2; exit 2; fi
       GPU_LIST="$2"; shift 2 ;;
-    --packed-sdpa|--compat-old-driver)
+    --packed-no-flash|--packed-sdpa|--compat-old-driver)
       if [[ -n "$ATTENTION_MODE" && "$ATTENTION_MODE" != "$1" ]]; then
-        echo "--packed-sdpa and --compat-old-driver select different attention backends; choose one." >&2
+        echo "$ATTENTION_MODE and $1 select different attention backends; choose one." >&2
         exit 2
       fi
       ATTENTION_MODE="$1"; shift ;;
@@ -51,6 +52,8 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 export PYTHONUNBUFFERED=1
 ATTENTION_ARGS=(--attention_backend flash)
 PACKING_ARGS=(--packing true)
+unset OMNICOMMIT_PACKED_NO_FLASH
+PACKED_NO_FLASH=0
 if [[ -n "$ATTENTION_MODE" ]]; then
   # Keep the TE backend consistent with the sequence layout selected by each preset.
   for arg in "${EXTRA_ARGS[@]}"; do
@@ -70,18 +73,25 @@ if [[ "$ATTENTION_MODE" == "--packed-sdpa" ]]; then
   PACKING_ARGS=(--packing true --padding_free true)
   echo "[train] Packing enabled: Omni audio/vision use segmented math SDPA; Megatron uses packed FlashAttention."
   python3 "$SCRIPT_DIR/check_packed_attention.py"
-elif [[ "$ATTENTION_MODE" == "--compat-old-driver" ]]; then
+elif [[ "$ATTENTION_MODE" == "--packed-no-flash" || "$ATTENTION_MODE" == "--compat-old-driver" ]]; then
   export NVTE_FLASH_ATTN=0 NVTE_FUSED_ATTN=0 NVTE_UNFUSED_ATTN=1
   export NVTE_MASKED_SOFTMAX_FUSION=0
   ATTENTION_ARGS=(--attn_impl sdpa --attention_backend unfused)
-  PACKING_ARGS=(--packing false --padding_free false)
   MICRO_BATCH=1
-  echo "[train] Old-driver compatibility: HF math SDPA; TE unfused; packing/padding_free=false."
+  if [[ "$ATTENTION_MODE" == "--packed-no-flash" ]]; then
+    PACKED_NO_FLASH=1
+    PACKING_ARGS=(--packing true --padding_free true)
+    echo "[train] Packing enabled: HF segmented math SDPA; packed Thinker uses per-example PyTorch SDPA, no FlashAttention."
+    python3 "$SCRIPT_DIR/check_no_flash_packing.py"
+  else
+    PACKING_ARGS=(--packing false --padding_free false)
+    echo "[train] Old-driver compatibility: HF math SDPA; TE unfused; packing/padding_free=false."
+  fi
 fi
 
 python3 "$SCRIPT_DIR/check_sft.py" "$DATASET_PATH" --rows 2 --tokens-file "$TOKENS_PATH" --framework
 echo "[train] Original audio is read by range; no small WAV files will be written. GPUs=$GPU_LIST"
-python3 -m torch.distributed.run \
+OMNICOMMIT_PACKED_NO_FLASH="$PACKED_NO_FLASH" python3 -m torch.distributed.run \
   --nproc_per_node "$GPU_COUNT" --nnodes 1 --master_port "${MASTER_PORT:-29571}" \
   --module swift.cli._megatron.sft \
   --load "$MODEL_PATH" \

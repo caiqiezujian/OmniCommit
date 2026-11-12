@@ -9,5 +9,9 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install -r requirements-dev.txt
-      - run: python -m pytest -q
-      - run: find SFT-Scripts -name '*.sh' -exec bash -n {} \;
+      - name: OmniCommit tests
+        run: python -m pytest -q
+      - name: Second streaming ASR tests
+        run: python -m pytest -q Second/tests
+      - name: Check both sets of training launchers
+        run: find SFT-Scripts Second/SFT-Scripts -name '*.sh' -print0 | xargs -0 -n 1 bash -n

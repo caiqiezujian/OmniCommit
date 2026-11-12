@@ -1,8 +1,13 @@
-# OmniCommit SFT
+# 第一版 SFT · WAIT / DIRECT
 
-本目录将已经审查的流式轨迹转成音频、文本交错的 SFT 数据。两个 Megatron 入口共用 Qwen3-Omni 训练模板和虚拟音频区间。ms-swift 4.1.3 读取 HF 原始基座，ms-swift 3.12.1 使用 FLEX 的 MCore 训练入口。
-不依赖其他 FLEX 目录；请保留本仓库的 `omnicommit/`，SFT 和服务共用其中的
-`runtime_protocol.py`，确保系统提示、说话人参照和结束标记一致。准备和检查不调用教师模型。
+本目录训练的模型输出 `<|WAIT|>` 或 `<|DIRECT|><语言><说话人>新增正文`。数据构建、训练和服务共用 `omnicommit/runtime_protocol.py` 中的协议。直接提交正文的第二版有独立的构建器和训练入口。[第二版手册](../Second/README.md)
+
+| 训练环境 | 启动脚本 | 第一个位置参数 | 默认保存间隔 |
+|---|---|---|---|
+| ms-swift 3.12.1 / Megatron | [train_sft.sh](train_sft.sh) | MCore 基座目录 | 3000 步，可传 `--save_interval` |
+| ms-swift 4.1.3 / Megatron | [train_sft_swift4.sh](train_sft_swift4.sh) | 原始 HF 基座目录 | 1000 步，可传 `--save_steps` |
+
+两个入口都用本目录的 `check_sft.py` 做预检，随后加载模板 `omnicommit_qwen3_omni`。它读取每轮音频的虚拟区间，将波形送入 SWIFT 原生 Qwen3-Omni 编码器。词表取自训练 JSONL 随附的 `.tokens.txt`。[训练模板](omnicommit_sft_plugin.py) · [数据预检](check_sft.py)
 
 ## ms-swift 4.1.3 八卡训练
 
@@ -47,9 +52,9 @@ python Data-Scripts/build_asr_sft.py /data/timestamped.jsonl \
 
 精简文件丢弃了 `safe_cut`、原始区间和说话人参照等离线元数据，**不能直接传给 `prepare_windows.py` 拆窗**；需要从原始标注及时间戳重新构建富元数据路线，再安全拆窗。两种路线生成的文件都必须在目标训练环境检查真实模板长度。
 
-## 分阶段文本路线：v2、结束轮和长会议
+## 第一版的轨迹格式、结束轮和长会议
 
-新版 `recast_asr.py` 输出 `schema_version:2`：每个真实音频块为 `event:"audio"`，
+第一版的分阶段构建器 `recast_asr.py` 输出 `schema_version:2`，这里的版本号用于标识中间轨迹格式。每个真实音频块为 `event:"audio"`，
 最后另有 `event:"end_of_audio"`、`start_ms == end_ms == duration_ms` 的结束轮。
 准备器为这个结束轮生成 user 文本 `<end_of_audio>`，不新增音频、虚构时间或补一段未来音频。
 目标为剩余的 DIRECT 内容，或无剩余时的 WAIT。它是普通输入控制文本，不是第三种动作 token。
@@ -111,8 +116,8 @@ python SFT-Scripts/audit_encoded_lengths.py /data/sft/train.jsonl \
 ```bash
 # base 使用原始未量化 HF 目录。在 4.1.3 中与训练入口的第一个参数一致。
 bash SFT-Scripts/merge_lora.sh \
-  /models/qwen3_omni_original_hf /outputs/omnicommit/checkpoint-N \
-  /models/omnicommit-merged \
+  /models/qwen3_omni_original_hf /data/yb/Code/OmniCommit/outputs/sft-001/checkpoint-N \
+  /data/yb/Code/OmniCommit/outputs/merged \
   --special-tokens /data/sft/train.jsonl.tokens.txt --gpu-ids 0
 ```
 
@@ -124,7 +129,7 @@ bash SFT-Scripts/merge_lora.sh \
 未经验证的中间导出保留在 `.incomplete-*` 路径，不会发布为正式模型；这是输出暂存，
 不会备份或覆盖原模型。CPU 测试使用微型合成张量，不等于已完成真实模型合并与推理。
 
-## 数据准备和旧版 3.12.1 环境
+## 数据准备和 ms-swift 3.12.1 环境
 
 数据准备、音频检查：
 
@@ -208,7 +213,7 @@ python SFT-Scripts/audit_encoded_lengths.py /data/sft/train.jsonl \
 bash SFT-Scripts/train_sft.sh \
   /models/qwen3_omni_mcore_3.12.1 \
   /data/sft/train.jsonl \
-  /outputs/omnicommit_sft_001 \
+  /data/yb/Code/OmniCommit/outputs/sft-001 \
   --gpu-ids 0,1,2,3,4,5,6,7
 ```
 
@@ -255,8 +260,33 @@ bash SFT-Scripts/train_sft.sh \
 
 启动器在第一张可见卡上检查 BF16 打包注意力的前向、梯度以及两条序列间的隔离，然后进入数据预处理。
 也可在训练容器单独运行 `CUDA_VISIBLE_DEVICES=0 python3 SFT-Scripts/check_packed_attention.py`。
-若该检查报 `device kernel image is invalid`，应先修复与当前 A800、PyTorch 和 CUDA 环境匹配的 FlashAttention 安装。
+若这个检查也报 `device kernel image is invalid`，可以改用下面的 `--packed-no-flash`。
 8192 是每个 pack 的长度上限。显存按打包后的实际 token 数评估，提速可比较相同原始样本集完成一个 epoch 的用时。
+
+### 全关 FlashAttention 并保留 packing
+
+`--packed-no-flash` 适用于已有的 SWIFT 3.12.1 / Qwen3-Omni Megatron 训练容器。
+音频和视觉继续使用分段 math SDPA。文本模型沿用 SWIFT 的 packing 和位置编码，按每个原始会话的边界分别计算因果注意力，
+再将输出按原顺序拼回。文本计算使用 PyTorch 的 Efficient Attention 或 Math 后端。该配方使用 CP=1、attention dropout=0。
+
+```bash
+cd /data/yb/Code/OmniCommit
+# 可独立在一张空闲卡上运行。正式训练的启动脚本也会在读取数据前执行这一检查。
+CUDA_VISIBLE_DEVICES=0 python3 SFT-Scripts/check_no_flash_packing.py
+
+read -r -e -p '当前 500 ms 训练 JSONL 的绝对路径：' train_jsonl
+bash SFT-Scripts/train_sft.sh \
+  /data/data_process/lzy/qwen3_omni_mega/train/qwen3_omni_mcore_3.12.1 \
+  "$train_jsonl" \
+  /data/yb/Code/OmniCommit/outputs/sft-500ms-packed-no-flash \
+  --gpu-ids 0,1,2,3,4,5,6,7 --packed-no-flash \
+  --micro_batch_size 1 --global_batch_size 32 \
+  --max_length 8192 --max_epochs 1 --save_interval 1000
+```
+
+`[no-flash-packing] PASS` 表示实际安装的 Megatron 文本注意力层通过小型 BF16 打包前后向检查。
+建议先用同一套 token 清单和一份具有代表性的训练子集验证完整模型，再进行全量训练。
+单条样本接近 8192 token 时，Math 后端可能需要大量显存。实际可用的 micro batch 和每小时完成的原始录音数以目标 GPU 测量为准。
 
 ## 验证边界
 

@@ -49,23 +49,43 @@ def load_template(model_dir, tokens, *, packing):
         template = get_template("omnicommit_qwen3_omni", processor, **options)
     else:
         raise ValueError(f"No supported training template loader for ms-swift major version {major}")
-    ids = protocol_ids(getattr(processor, "tokenizer", processor), tokens)
+    tokenizer = getattr(processor, "tokenizer", processor)
+    ids = protocol_ids(tokenizer, tokens)
     template.set_mode("train")
     if packing:
         template.use_megatron = template.packing = template.padding_free = True
-    return template, ids
+    return template, tokenizer, ids
 
 
-def check_encoded_protocol(row, encoded, token_ids):
-    expected = [token_ids[token] for message in row["messages"] if message["role"] == "assistant"
-                for token in re.findall(r"<[^<>]+>", message["content"])]
+def check_encoded_protocol(row, encoded, token_ids, tokenizer):
+    replies = [message["content"] for message in row["messages"] if message["role"] == "assistant"]
+    expected = [token_ids[token] for reply in replies for token in re.findall(r"<[^<>]+>", reply)]
     protocol = set(token_ids.values())
-    actual = [value for value in encoded["labels"] if value in protocol]
+    labels = [int(value) for value in encoded["labels"]]
+    actual = [value for value in labels if value in protocol]
     if actual != expected:
         raise ValueError("Supervised actions/language/speaker tokens differ from the original assistant turns")
     mask = encoded["feature_attention_mask"]
     if encoded["input_features"].shape[0] != len(row["audios"]) or mask.shape[0] != len(row["audios"]):
         raise ValueError("Encoded audio features/masks do not match the input audio chunk count")
+
+    # Locate actual assistant payloads so a masked response cannot be confused
+    # with identically worded reference speech in the user input.
+    ids = [int(value) for value in encoded["input_ids"]]
+    marker = tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False)
+    stop = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    starts = [i + len(marker) for i, value in enumerate(ids)
+              if value == marker[0] and ids[i:i + len(marker)] == marker]
+    if len(starts) != len(replies):
+        raise ValueError(f"Expected {len(replies)} encoded assistant turns, found {len(starts)}")
+    for turn, (start, expected) in enumerate(zip(starts, replies), 1):
+        end = ids.index(stop, start)
+        payload = ids[start:end]
+        if labels[start:end] != payload:
+            raise ValueError(f"Assistant turn {turn} has masked or changed target IDs")
+        decoded = tokenizer.decode(payload, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+        if decoded != expected:
+            raise ValueError(f"Assistant turn {turn} differs from the JSONL transcript after tokenization")
 
 
 def check_packed_batch(template, examples, max_length):
@@ -125,7 +145,7 @@ def main(argv=None):
     tokens_path = args.tokens_file or Path(str(args.dataset) + ".tokens.txt")
     inventory = read_tokens(tokens_path)
     tokens = tokens_path.read_text(encoding="utf-8-sig").splitlines()
-    template, token_ids = load_template(args.model.resolve(strict=True), tokens, packing=args.check_packing)
+    template, tokenizer, token_ids = load_template(args.model.resolve(strict=True), tokens, packing=args.check_packing)
     examples = []
     count, valid, maximum, errors = 0, 0, 0, []
     with args.dataset.open(encoding="utf-8-sig") as source:
@@ -140,7 +160,7 @@ def main(argv=None):
                                           return_length=args.check_packing)
                 metrics = audit_encoded(encoded, args.max_length)
                 if args.check_packing:
-                    check_encoded_protocol(row, encoded, token_ids)
+                    check_encoded_protocol(row, encoded, token_ids, tokenizer)
                     if len(examples) < 2:
                         examples.append(encoded)
                 maximum = max(maximum, metrics["length"])

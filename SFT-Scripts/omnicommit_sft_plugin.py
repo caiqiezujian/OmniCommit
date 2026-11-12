@@ -1,7 +1,7 @@
-"""SWIFT external template plugin for SFT from original audio + chunk ranges.
+"""Qwen3-Omni SWIFT template for the first OmniCommit protocol (WAIT / DIRECT).
 
-Supports the inspected SWIFT 3.12.1 and 4.x template import layouts. This is
-not a new trainer; Megatron and the native Omni feature/packing paths remain.
+Both ms-swift 3.12.1 and 4.1.3 launchers load this plugin to materialize
+virtual audio ranges before native Omni feature extraction and packing.
 """
 from pathlib import Path
 from copy import deepcopy
@@ -18,6 +18,10 @@ if os.environ.get("OMNICOMMIT_SFT_ATTENTION_COMPAT") == "1":
     from omnicommit_attention_compat import install_attention_compat, install_swift_loader_compat
     install_attention_compat()
     install_swift_loader_compat()
+
+if os.environ.get("OMNICOMMIT_PACKED_NO_FLASH") == "1":
+    from omnicommit_packed_adapter import install_packed_no_flash
+    install_packed_no_flash()
 
 try:
     from swift.template.register import TEMPLATE_MAPPING, register_template

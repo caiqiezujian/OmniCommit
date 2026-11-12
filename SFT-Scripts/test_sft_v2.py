@@ -149,18 +149,43 @@ def test_actual_encoded_length_audit_rejects_truncation_and_no_labels():
         audit_encoded({"input_ids": [1], "labels": [-100]}, 2)
 
 
-def test_packing_audit_detects_masked_wait_or_reordered_tags():
-    torch = pytest.importorskip("torch")
+def test_packing_audit_detects_masked_actions_tags_or_transcript():
     row = {"audios": ["one", "two"], "messages": [
         {"role": "assistant", "content": "<|WAIT|>"},
         {"role": "assistant", "content": "<|DIRECT|><zh><spk1>开始。"}]}
     ids = {"<|WAIT|>": 41, "<|DIRECT|>": 42, "<zh>": 43, "<spk1>": 44}
-    encoded = {"labels": [-100, 41, 42, 43, 44, 88], "input_features": torch.ones(2, 1, 4),
-               "feature_attention_mask": torch.ones(2, 4)}
-    check_encoded_protocol(row, encoded, ids)
-    for labels in ([-100, -100, 42, 43, 44, 88], [-100, 41, 42, 44, 43, 88]):
+    pieces = {value: token for token, value in ids.items()}
+    pieces.update({88: "开始。", 89: "结束。"})
+
+    class Tokenizer:
+        def encode(self, text, *, add_special_tokens):
+            assert text == "<|im_start|>assistant\n" and not add_special_tokens
+            return [10, 11]
+
+        def convert_tokens_to_ids(self, text):
+            assert text == "<|im_end|>"
+            return 9
+
+        def decode(self, payload, *, skip_special_tokens, clean_up_tokenization_spaces):
+            assert not skip_special_tokens and not clean_up_tokenization_spaces
+            return "".join(pieces[token] for token in payload)
+
+    tokenizer = Tokenizer()
+    inputs = [42, 10, 11, 41, 9, 10, 11, 42, 43, 44, 88, 9]
+    labels = [-100, -100, -100, 41, 9, -100, -100, 42, 43, 44, 88, 9]
+    encoded = {"input_ids": inputs, "labels": labels, "input_features": np.ones((2, 1, 4)),
+               "feature_attention_mask": np.ones((2, 4))}
+    check_encoded_protocol(row, encoded, ids, tokenizer)
+    for index, value in ((3, -100), (8, 44)):
+        altered = labels.copy()
+        altered[index] = value
         with pytest.raises(ValueError, match="actions/language/speaker"):
-            check_encoded_protocol(row, dict(encoded, labels=labels), ids)
+            check_encoded_protocol(row, dict(encoded, labels=altered), ids, tokenizer)
+    with pytest.raises(ValueError, match="turn 2 has masked"):
+        check_encoded_protocol(row, dict(encoded, labels=[*labels[:-2], -100, 9]), ids, tokenizer)
+    with pytest.raises(ValueError, match="turn 2 differs"):
+        check_encoded_protocol(row, dict(encoded, input_ids=[*inputs[:-2], 89, 9],
+                                         labels=[*labels[:-2], 89, 9]), ids, tokenizer)
 
 
 @pytest.mark.parametrize("damaged", [None, "text_position_ids", "cu_seq_lens_k", "input_features", "labels"])

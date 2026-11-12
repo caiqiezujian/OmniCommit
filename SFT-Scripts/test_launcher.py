@@ -18,6 +18,8 @@ def run_launcher(tmp_path, extra):
     python = fake_bin / "python3"
     python.write_bytes(('#!/usr/bin/env bash\nprintf "CALL\\n"\nprintf "ARG:%s\\n" "$@"\n'
                       'printf "CUDA:%s\\n" "$CUDA_VISIBLE_DEVICES"\n'
+                      'printf "PACKED_NO_FLASH:%s\\n" "${OMNICOMMIT_PACKED_NO_FLASH-unset}"\n'
+                      'if [[ "$1" == *check_no_flash_packing.py ]]; then exit "${NO_FLASH_PROBE_STATUS:-0}"; fi\n'
                       'if [[ "$1" == *check_packed_attention.py ]]; then exit "${PACKED_PROBE_STATUS:-0}"; fi\n'
                       'printf "ENV:%s,%s,%s,%s,%s\\n" "${OMNICOMMIT_SFT_ATTENTION_COMPAT-unset}" '
                       '"${NVTE_FLASH_ATTN-unset}" "${NVTE_FUSED_ATTN-unset}" '
@@ -70,7 +72,32 @@ def test_failed_packed_probe_does_not_start_dataset_processing(tmp_path, monkeyp
     assert "check_sft.py" not in run.stdout and "torch.distributed.run" not in run.stdout
 
 
+def test_no_flash_packing_disables_flash_and_enables_adapter_only_for_training(tmp_path, monkeypatch):
+    monkeypatch.setenv("OMNICOMMIT_PACKED_NO_FLASH", "from-parent")
+    run = run_launcher(tmp_path, ["--packed-no-flash", "--global_batch_size", "32"])
+    assert run.returncode == 0, run.stderr
+    assert "check_packed_attention.py" not in run.stdout
+    assert run.stdout.index("check_no_flash_packing.py") < run.stdout.index("check_sft.py") < run.stdout.index("torch.distributed.run")
+    assert run.stdout.count("PACKED_NO_FLASH:unset") == 2
+    assert run.stdout.count("PACKED_NO_FLASH:1") == 1
+    assert "ENV:1,0,0,1,0" in run.stdout
+    for flag, value in (("attention_backend", "unfused"), ("attn_impl", "sdpa"), ("packing", "true"),
+                        ("padding_free", "true"), ("micro_batch_size", "1"), ("global_batch_size", "32")):
+        assert f"ARG:--{flag}\nARG:{value}" in run.stdout
+
+
+def test_failed_no_flash_probe_stops_before_preprocessing(tmp_path, monkeypatch):
+    monkeypatch.setenv("NO_FLASH_PROBE_STATUS", "18")
+    run = run_launcher(tmp_path, ["--packed-no-flash"])
+    assert run.returncode == 18
+    assert "check_sft.py" not in run.stdout and "torch.distributed.run" not in run.stdout
+
+
 @pytest.mark.parametrize("extra", [["--packed-sdpa", "--compat-old-driver"],
+                                   ["--packed-no-flash", "--packed-sdpa"],
+                                   ["--compat-old-driver", "--packed-no-flash"],
+                                   ["--packed-no-flash", "--attention_backend=flash"],
+                                   ["--packed-no-flash", "--packing", "false"],
                                    ["--compat-old-driver", "--packed-sdpa"],
                                    ["--packed-sdpa", "--attention_backend=fused"],
                                    ["--packed-sdpa", "--packing", "false"]])

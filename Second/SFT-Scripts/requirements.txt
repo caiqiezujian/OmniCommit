@@ -1,0 +1,6 @@
+# Lightweight preparation, virtual audio loading, and CPU tests.
+numpy>=1.23,<3
+soundfile>=0.12,<1
+scipy>=1.9,<2
+# Reuse the FLEX ms-swift==3.12.1 / Transformers==4.57.1 / Megatron environment
+# for train_sft.sh or the ms-swift==4.1.3 Megatron environment for train_sft_swift4.sh.

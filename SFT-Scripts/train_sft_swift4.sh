@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Native ms-swift 4.1.3 Megatron launcher for the OmniCommit streaming template.
+# First protocol (WAIT / DIRECT). ms-swift 4.1.3 Megatron reads an original HF base.
+# The sibling omnicommit_sft_plugin.py registers omnicommit_qwen3_omni.
 set -euo pipefail
 
 if (( $# < 3 )); then
