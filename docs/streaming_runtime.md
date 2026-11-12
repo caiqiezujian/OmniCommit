@@ -34,6 +34,36 @@ diff -u <(jq -c "$fields" web-events.jsonl) <(jq -c "$fields" meeting.1000ms.jso
 
 如果两边从同一位置持续 WAIT，可以从人工听到的新语种起点截出一段有清晰人声的音频，用同一条命令和新的输出文件单独跑。如果短片能出字，优先检查切换前的历史及训练中的切换示例。如果短片仍持续 WAIT，再与离线 ASR 对照。两条路径共用模型、提示词和会话逻辑，这个实验可以排查网页传输或显示差异，单凭一致的 WAIT 无法确定是训练数据造成的。
 
+### 日德切换的 500 ms 缓存对照
+
+把下面三条推理命令中的输入文件和模型目录换成同一场会议和同一份 checkpoint。每条命令单独启动一个进程，依次运行。示例将精度统一为 BF16。如果原服务使用 FP16，就把三条命令中的 `bfloat16` 都改为 `float16`。两次 vLLM 推理都给多模态预处理缓存分配 1 GiB。
+
+```bash
+cd /data/yb/Code/OmniCommit
+
+CUDA_VISIBLE_DEVICES=0 python tools/diagnose_stream.py /data/test/ja-de.mp4 \
+  --model /data/yb/Code/OmniCommit/models/omnicommit-merged \
+  --backend hf --chunk-ms 500 --dtype bfloat16 \
+  --output outputs/ja-de.500ms.hf.jsonl
+
+CUDA_VISIBLE_DEVICES=0 python tools/diagnose_stream.py /data/test/ja-de.mp4 \
+  --model /data/yb/Code/OmniCommit/models/omnicommit-merged \
+  --backend vllm --chunk-ms 500 --dtype bfloat16 --mm-processor-cache-gb 1 \
+  --prefix-caching --output outputs/ja-de.500ms.vllm-on.jsonl
+
+CUDA_VISIBLE_DEVICES=0 python tools/diagnose_stream.py /data/test/ja-de.mp4 \
+  --model /data/yb/Code/OmniCommit/models/omnicommit-merged \
+  --backend vllm --chunk-ms 500 --dtype bfloat16 --mm-processor-cache-gb 1 \
+  --no-prefix-caching --output outputs/ja-de.500ms.vllm-off.jsonl
+
+python tools/compare_stream_traces.py \
+  outputs/ja-de.500ms.hf.jsonl \
+  outputs/ja-de.500ms.vllm-on.jsonl \
+  outputs/ja-de.500ms.vllm-off.jsonl
+```
+
+每份日志的 `ready.enable_prefix_caching` 记录引擎初始化后的实际设置：HF 为 `null`，vLLM 默认开启。开关只控制跨请求的 KV 前缀复用，三个实验都保留流式会话的历史音频和先前回复。比较脚本逐对报告最早出现差异的轮次、音频区间和原始回复。优先看两份 vLLM 日志；首次分歧之后，先前输出也已不同，后面的差异可能来自各自累积的历史。HF 同时更换了推理后端，适合作为独立参照。
+
 ## 1. 环境与离线真实模型测试
 
 在已用于 FLEX 的推理环境执行；不要用这些命令升级 torch/CUDA。

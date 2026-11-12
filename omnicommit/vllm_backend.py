@@ -23,7 +23,7 @@ class VLLMBackend:
     def __init__(self, model_path, *, max_context_tokens=4096, max_new_tokens=256,
                  tensor_parallel_size=1, gpu_memory_utilization=.85,
                  max_audio_turns=80, max_audio_seconds=5.0,
-                 mm_processor_cache_gb=1.0, image_slots=1, dtype="auto",
+                 enable_prefix_caching=True, mm_processor_cache_gb=1.0, image_slots=1, dtype="auto",
                  manifest_validator=validate_token_manifest):
         os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
         import vllm
@@ -59,10 +59,13 @@ class VLLMBackend:
             raise ValueError("Tokenizer audio wrapper differs from FLEX/SWIFT SFT layout")
         self.llm = LLM(model=str(path), dtype=dtype, tensor_parallel_size=tensor_parallel_size,
             gpu_memory_utilization=gpu_memory_utilization, max_model_len=max_context_tokens,
-            max_num_seqs=1, enforce_eager=True, enable_prefix_caching=True,
+            max_num_seqs=1, enforce_eager=True, enable_prefix_caching=enable_prefix_caching,
             limit_mm_per_prompt={"audio":{"count":max_audio_turns,
                 "length":round(max_audio_seconds*16000)},"image":image_slots,"video":0},
             mm_processor_cache_gb=mm_processor_cache_gb, seed=0)
+        config = self.llm.llm_engine.vllm_config
+        self.enable_prefix_caching = config.cache_config.enable_prefix_caching
+        self.mm_processor_cache_gb = config.model_config.multimodal_config.mm_processor_cache_gb
         # Counting must not mutate the live engine's mirrored MM sender cache.
         self.counter = InputPreprocessor(self.llm.llm_engine.model_config,
                                           self.tokenizer, mm_processor_cache=None)

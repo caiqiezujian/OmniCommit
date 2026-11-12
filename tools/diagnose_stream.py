@@ -86,6 +86,9 @@ def run_file(args, write):
             observed = ObservedBackend(backend)
             session = session_factory(observed, options)
             write({"type": "ready", "protocol": protocol, "backend": type(backend).__name__,
+                   "requested_dtype": args.dtype,
+                   "enable_prefix_caching": getattr(backend, "enable_prefix_caching", None),
+                   "mm_processor_cache_gb": getattr(backend, "mm_processor_cache_gb", None),
                    "model": str(args.model) if args.model else None,
                    "source_kind": "file", "input": str(args.input.resolve()),
                    "chunk_ms": round(options.chunk_seconds * 1000), **asdict(options),

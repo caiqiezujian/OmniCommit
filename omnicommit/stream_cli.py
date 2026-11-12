@@ -35,6 +35,9 @@ def add_runtime_arguments(parser, *, include_chunk=True):
     parser.add_argument("--attention", choices=("sdpa", "flash_attention_2", "eager"), default="sdpa")
     parser.add_argument("--tensor-parallel-size", type=int, default=1, help="vLLM only")
     parser.add_argument("--gpu-memory-utilization", type=float, default=.85, help="vLLM only")
+    parser.add_argument("--prefix-caching", "--enable-prefix-caching", dest="enable_prefix_caching",
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help="Reuse KV blocks for shared prefixes across vLLM requests (default: enabled)")
     parser.add_argument("--mm-processor-cache-gb", type=float, default=1, help="vLLM only")
     parser.add_argument("--vllm-image-slots", type=int, choices=(0,1), default=1,
                         help="vLLM Omni initialization compatibility; requests stay audio-only")
@@ -64,6 +67,7 @@ def build_backend(args, *, manifest_validator=None, chunk_seconds_choices=None):
             gpu_memory_utilization=args.gpu_memory_utilization,
             max_audio_turns=math.ceil(args.max_context_seconds/min(steps))+args.max_speakers+2,
             max_audio_seconds=max(.5,max(steps),args.max_reference_seconds),
+            enable_prefix_caching=args.enable_prefix_caching,
             mm_processor_cache_gb=args.mm_processor_cache_gb,image_slots=args.vllm_image_slots,dtype=args.dtype,
             **checks)
     from .inference_backend import HFBackend

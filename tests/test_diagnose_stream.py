@@ -47,6 +47,7 @@ def test_cli_file_matches_websocket_turn_for_turn(tmp_path, protocol, extension)
     assert code == 0 and rows[0]["type"] == "ready"
     assert rows[0]["protocol"] == protocol and rows[0]["chunk_ms"] == 200
     assert rows[0]["context_policy"] == "rolling" and rows[0]["number_format"] == "normalized"
+    assert rows[0]["enable_prefix_caching"] is None and rows[0]["mm_processor_cache_gb"] is None
     if protocol == "first":
         app_factory, options_type = create_app, StreamOptions
     else:
