@@ -3,7 +3,7 @@
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 if (( $# < 1 )); then
-  echo "Usage: bash start_server.sh MERGED_HF_MODEL [--chunk-ms MS] [other service options]" >&2
+  echo "Usage: bash start_server.sh MERGED_HF_MODEL [--chunk-ms MS] [--gap-asr-model LOCAL_CT2_DIR] [other service options]" >&2
   exit 2
 fi
 model="$1"

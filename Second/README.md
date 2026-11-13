@@ -190,6 +190,25 @@ CUDA_VISIBLE_DEVICES=0 bash start_server.sh \
 
 网页地址为 `http://服务器内网IP:18890`，无需访问令牌。浏览器使用麦克风或共享系统声音需要受信任的 HTTPS 或 localhost。已有证书时，可在启动命令末尾加 `--ssl-certfile /path/server.crt --ssl-keyfile /path/server.key`。上传音视频还需要服务器上可执行的 `ffmpeg`。HF 推理可给同一命令追加 `--backend hf`。
 
+### 800 ms 网页漏段补识别
+
+在现有推理环境安装可选依赖，准备本地多语 CTranslate2 Whisper 模型。下面使用 [faster-whisper-small](https://huggingface.co/Systran/faster-whisper-small)。服务器无法联网时，可将完整模型目录复制到同一路径。
+
+~~~bash
+cd /data/yb/Code/OmniCommit/Second
+python -m pip install "faster-whisper>=1.1,<2"
+hf download Systran/faster-whisper-small --local-dir /data/yb/Code/OmniCommit/models/faster-whisper-small
+
+CUDA_VISIBLE_DEVICES=0 bash start_server.sh \
+  /data/yb/Code/OmniCommit/models/second-merged \
+  --chunk-ms 800 \
+  --gap-asr-model /data/yb/Code/OmniCommit/models/faster-whisper-small
+~~~
+
+打开网页选择麦克风、系统声音或文件。`/health` 的 `gap_recovery` 为 `true` 时，服务在 CPU 上使用 INT8 模型复核局部音频。每个会话在有声 WAIT 累计约 1.6 秒、短段停顿或结束时，可连同跨块音频发起复核。末尾一个 DIRECT 内的短尾音也可在停顿或结束时复核。持续的纯静音不会累积触发时长。检测使用分帧能量估计，背景音乐和低音量讲话都会影响触发。
+
+网页标记“补识别”的正文按音频顺序插入，同时显示时间范围。补识别模型给出每个词的时间和整窗的估计语种，语种不确定时记录为 `und`。说话人默认为待确认，可以用已有的片段修正入口指定已知说话人。模型日志保留对应的原始 WAIT；导出 JSON 的 `segments` 是合并后的正文，`events` 还保留候选补回和被主模型替代的过程。主模型在附近回合补出相同词时，服务根据局部音频范围与文字重叠合并。完全夹在两次连续 DIRECT 中且没有停顿的漏词，可能没有足够信号触发复核。
+
 ~~~bash
 curl http://127.0.0.1:18890/health
 ~~~

@@ -27,7 +27,7 @@ LOG = logging.getLogger("omnicommit.web")
 def create_app(backend_factory, options, *, max_sessions=1,
                auto_reference_factory=None, session_factory=StreamSession,
                media_cursor_factory=MediaCursor,
-               protocol_name="first", chunk_ms_choices=LIVE_CHUNK_MS):
+               protocol_name="first", chunk_ms_choices=LIVE_CHUNK_MS, gap_service_factory=None):
     from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
     from fastapi.responses import FileResponse, JSONResponse
     from fastapi.staticfiles import StaticFiles
@@ -38,6 +38,7 @@ def create_app(backend_factory, options, *, max_sessions=1,
     active = set()
     backend = None
     reference_provider = None
+    gap_service = None
     min_ms, max_ms = web_chunk_ms_bounds(options.chunk_seconds, options.max_reference_seconds)
     chunk_settings = {}
     if chunk_ms_choices:
@@ -47,7 +48,7 @@ def create_app(backend_factory, options, *, max_sessions=1,
 
     @asynccontextmanager
     async def lifespan(app):
-        nonlocal backend, reference_provider
+        nonlocal backend, reference_provider, gap_service
         async def expire_uploads():
             while True:
                 await asyncio.sleep(60)
@@ -57,6 +58,8 @@ def create_app(backend_factory, options, *, max_sessions=1,
             backend = await asyncio.get_running_loop().run_in_executor(executor, backend_factory)
             if auto_reference_factory is not None:
                 reference_provider = auto_reference_factory()
+            if gap_service_factory is not None:
+                gap_service = gap_service_factory()
             expiry_task = asyncio.create_task(expire_uploads())
             yield
         finally:
@@ -66,6 +69,8 @@ def create_app(backend_factory, options, *, max_sessions=1,
             # In-flight generation finishes before shutdown; no model racing.
             executor.shutdown(wait=True, cancel_futures=True)
             reference_executor.shutdown(wait=True, cancel_futures=True)
+            if gap_service is not None:
+                gap_service.close()
             reference_model = getattr(reference_provider, "model", None)
             if hasattr(reference_model, "close"):
                 reference_model.close()
@@ -83,6 +88,7 @@ def create_app(backend_factory, options, *, max_sessions=1,
     @app.get("/health")
     async def health():
         return {"ready": backend is not None, "protocol": protocol_name, "active_sessions": len(active),
+                "gap_recovery": gap_service is not None,
                 "max_sessions": max_sessions, "chunk_seconds": options.chunk_seconds, **chunk_settings,
                 "context_policy": options.context_policy,
                 "backend": type(backend).__name__ if backend else None,
@@ -131,6 +137,8 @@ def create_app(backend_factory, options, *, max_sessions=1,
         await websocket.accept()
         session = None
         ledger = None
+        gaps = None
+        receive_task = None
         cursor = None
         upload = None
         source_heard = None
@@ -185,9 +193,12 @@ def create_app(backend_factory, options, *, max_sessions=1,
                 source_heard = cursor.start_seconds
             session = session_factory(backend, session_options)
             ledger = SessionLedger(session)
+            if gap_service is not None:
+                gaps = gap_service.new_session(session, ledger)
             active.add(session)
             admitted = True
             await websocket.send_json({"type": "ready", "protocol": protocol_name,
+                "gap_recovery": gaps is not None,
                 "chunk_seconds": session_options.chunk_seconds, **chunk_settings,
                 **({"file_start_seconds": cursor.start_seconds, "file_end_seconds": cursor.end_seconds}
                    if cursor is not None else {}),
@@ -199,13 +210,29 @@ def create_app(backend_factory, options, *, max_sessions=1,
                 # A user may pause file playback for longer than two minutes.
                 # Live capture keeps an inactivity limit; files wait for an
                 # explicit resume/end or a transport disconnect.
-                packet = await websocket.receive() if cursor is not None else await asyncio.wait_for(websocket.receive(), timeout=120)
+                receive = websocket.receive()
+                receive_task = asyncio.ensure_future(receive if cursor is not None else asyncio.wait_for(receive, 120))
+                # A paused file can have a completed recovery with no next audio
+                # packet. Only the session owner publishes or changes its context.
+                while gaps is not None and gaps.task is not None:
+                    done, _ = await asyncio.wait((receive_task, gaps.task),
+                                                 return_when=asyncio.FIRST_COMPLETED)
+                    if gaps.task in done:
+                        gaps.collect()
+                        patch = gaps.take_patch()
+                        if patch:
+                            await websocket.send_json(dict(type="gap_update", **patch))
+                    if receive_task in done:
+                        break
+                packet = await receive_task
+                receive_task = None
                 if packet.get("type") == "websocket.disconnect":
                     break
                 # Apply a finished reference before building the next model prompt.
                 # This is a serial point: no session.step is running for this session.
                 collect_reference()
                 binary = packet.get("bytes")
+                ending = False
                 if binary is not None:
                     if cursor is not None:
                         raise ValueError("File sessions accept only playback-gated server audio")
@@ -220,6 +247,7 @@ def create_app(backend_factory, options, *, max_sessions=1,
                     if any(key in event for key in range_keys):
                         raise ValueError("The file range can only be selected when starting a session")
                     if event.get("type") == "end":
+                        ending = True
                         if cursor is not None and not cursor.finished:
                             raise ValueError("Drain the played file audio before ending")
                         if cursor is not None and session.turn_count == 0:
@@ -227,6 +255,8 @@ def create_app(backend_factory, options, *, max_sessions=1,
                                                        "source_heard_seconds": source_heard})
                             break
                         attempted_source_end = source_heard
+                        if gaps is not None:
+                            await gaps.finish()
                         call = lambda: session.step(end_of_audio=True)
                     elif event.get("type") == "file_next":
                         if cursor is None:
@@ -307,6 +337,12 @@ def create_app(backend_factory, options, *, max_sessions=1,
                         auto_reference_failed = True
                         LOG.warning("Automatic reference preparation failed: %s", exc)
                         result["automatic_reference"] = {"status": "error", "verified": False, "error": str(exc)}
+                if gaps is not None:
+                    if not ending:
+                        gaps.observe(pcm, result)
+                    patch = gaps.take_patch()
+                    result["new_segments"].extend(patch.pop("new_segments", []))
+                    result.update(patch)
                 result["service_seconds"] = time.perf_counter() - submitted
                 if cursor is not None:
                     result["file_complete"] = cursor.finished
@@ -328,6 +364,11 @@ def create_app(backend_factory, options, *, max_sessions=1,
             except Exception:
                 pass
         finally:
+            if receive_task is not None:
+                receive_task.cancel()
+                await asyncio.gather(receive_task, return_exceptions=True)
+            if gaps is not None:
+                gaps.close()
             if task is not None:
                 try:
                     await asyncio.shield(task)

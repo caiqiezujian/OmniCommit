@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 
 from omnicommit.runtime_protocol import speaker_registry_text
 from omnicommit.streaming import StreamOptions, StreamSession
@@ -25,6 +26,17 @@ class SecondStreamSession(StreamSession):
 
     def __init__(self, backend, options=None):
         super().__init__(backend, options or SecondStreamOptions())
+        self._recovered_text = {}
+
+    def remember_recovery(self, item):
+        self._recovered_text[item["segment_id"]] = (item["audio_end_seconds"], item["text"])
+        if self.options.context_policy == "rolling":
+            # Same heuristic budget as a live DIRECT. This is not a verified watermark.
+            self.inferred_commit_seconds = max(self.inferred_commit_seconds,
+                item["audio_end_seconds"] - self.options.rolling_tail_seconds)
+
+    def forget_recovery(self, segment_id):
+        self._recovered_text.pop(segment_id, None)
 
     def _context_system_prompt(self):
         prompt = system_prompt(self.options.number_format)
@@ -33,6 +45,15 @@ class SecondStreamSession(StreamSession):
             prompt += speaker_registry_text(self._speakers_before_history)
             prompt += (f"\nAt the start of the retained live dialogue the last committed voice was "
                        f"<{lang}><{speaker}>. Subsequent untagged text inherits the preceding live attribution.")
+        cutoff = self.history[0].start if self.history else self.heard_seconds
+        self._recovered_text = {key: value for key, value in self._recovered_text.items()
+                                if value[0] > cutoff}
+        if self._recovered_text:
+            # An outside recognizer has no meeting speaker ID. Do not invent an
+            # assistant header or change attribution of subsequent bare text.
+            recent = sorted(self._recovered_text.values())[-8:]
+            text = json.dumps([value[:320] for _, value in recent], ensure_ascii=False)
+            prompt += "\nRecent words already transcribed from earlier audio; continue after them: " + text
         return prompt
 
     def _model_reply(self, reply, end_of_audio):

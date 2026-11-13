@@ -22,8 +22,14 @@ class SecondMediaCursor(MediaCursor):
         return ((self.chunk_index + 1) * chunk_ms * rate + 999) // 1000
 
 
-def create_app(backend_factory, options, *, max_sessions=1, auto_reference_factory=None):
+def create_app(backend_factory, options, *, max_sessions=1, auto_reference_factory=None,
+               gap_backend_factory=None):
+    def make_gap_service():
+        from .gap_service import GapService
+        return GapService(gap_backend_factory())
+
     return meeting_app(backend_factory, options, max_sessions=max_sessions,
                        auto_reference_factory=auto_reference_factory,
                        session_factory=SecondStreamSession, media_cursor_factory=SecondMediaCursor,
+                       gap_service_factory=make_gap_service if gap_backend_factory else None,
                        protocol_name="second")

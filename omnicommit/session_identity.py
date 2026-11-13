@@ -67,7 +67,7 @@ class SessionLedger:
             speaker = self.resolve(raw)
             if not any(x['speaker'] == speaker for x in speakers):
                 speakers.append({'speaker': speaker, 'name': self.names.get(speaker, speaker)})
-        return {'segments': [dict(s) for s in self.segments], 'speakers': speakers,
+        return {'segments': [dict(s) for s in self.segments if not s.get('superseded')], 'speakers': speakers,
                 'aliases': dict(self.aliases), 'reference_evidence': dict(self.reference_evidence)}
 
     def correct_segment(self, segment_id, speaker):
@@ -75,6 +75,8 @@ class SessionLedger:
             raise ValueError('Unknown segment ID')
         target = self._known(speaker)
         item = self.segments[segment_id - 1]
+        if item.get('superseded'):
+            raise ValueError('Segment has been superseded')
         old = item['display_speaker']
         if old != target:
             self._invalidate(old, target, item['model_speaker'])

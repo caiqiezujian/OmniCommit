@@ -434,4 +434,51 @@ assert.equal(rangeEnd.value,'');
 elements.get('file').files = [];
 await elements.get('start').onclick();
 assert.equal(picker.disabled, false, 'unlocked after a failed file start');
+
+// The fallback can report text on a WAIT (including EOS), deliver it out of
+// order and retract it if a later model commit covers the same speech.
+transcript.querySelector = selector => {
+  const id = selector.match(/data-segment-id="(\d+)"/)[1];
+  return transcript.children.find(row => String(row.dataset.segmentId) === id);
+};
+transcript.insertBefore = function(row, before) {
+  assert.ok(this.children.includes(before));
+  this.children.splice(this.children.indexOf(before), 0, row);
+  row.remove = () => this.children.splice(this.children.indexOf(row), 1);
+};
+const [gapSocket] = await startMeeting('microphone');
+await frame(gapSocket, {type:'ready',protocol:'second',chunk_seconds:.8,gap_recovery:true});
+assert.equal(elements.get('gapStatus').hidden,false);
+const result = {type:'result',event:'audio',start_seconds:0,end_seconds:3.2};
+const mainSegment = (segment_id, turn, text) => ({
+  segment_id, turn, segment_index:0, language:'en', model_speaker:'spk1', display_speaker:'spk1', text
+});
+const recovery = {segment_id:3, turn:2, segment_index:1, origin:'recovery', audio_start_seconds:.8,
+  audio_end_seconds:1.6, language:'de', model_speaker:null, display_speaker:null, text:'Danke.'};
+await frame(gapSocket, {...result,turn:4,action:'DIRECT',text:' Now.',new_segments:[
+  mainSegment(1,1,'Start.'), mainSegment(2,4,' Now.')]});
+await frame(gapSocket, {...result,turn:5,action:'WAIT',text:'<|WAIT|>',new_segments:[],
+  gap_events:[{status:'pending',start_seconds:.8,end_seconds:1.6}]});
+vm.runInContext('busy=true',context);
+const framesBeforeBackground = gapSocket.frames.length, latencyBefore = elements.get('latency').textContent;
+await frame(gapSocket, {type:'gap_update',new_segments:[recovery],
+  gap_events:[{status:'recovered',start_seconds:.8,end_seconds:1.6}]});
+assert.equal(vm.runInContext('busy', context), true);
+assert.equal(elements.get('latency').textContent, latencyBefore);
+assert.equal(gapSocket.frames.length,framesBeforeBackground);
+assert.deepEqual(visibleBodies(),['Start.','Danke.',' Now.']);
+assert.equal(transcript.children[1].dataset.origin,'recovery');
+assert.match(transcript.children[1].children[0].textContent,/说话人待确认 · de · 补识别/);
+assert.match(elements.get('gapStatus').textContent,/0.80–1.60.*已补回正文/);
+const lastCommit = mainSegment(4,5,'Danke.'); lastCommit.language='de';
+const late = {...recovery,segment_id:5,turn:6,text:'Ende.'};
+await frame(gapSocket, {...result,event:'end_of_audio',turn:7,action:'WAIT',text:'<|WAIT|>',
+  removed_segment_ids:[3],new_segments:[lastCommit,late]});
+assert.deepEqual(visibleBodies(),['Start.',' Now.','Danke.','Ende.']);
+vm.runInContext("$('exportTxt').onclick(); $('exportJson').onclick()",context);
+assert.match(downloads.at(-2).body,/说话人待确认 \[de\] \[补识别\] Ende\./);
+const effective = JSON.parse(downloads.at(-1).body);
+assert.deepEqual(effective.segments.map(s=>s.segment_id),[1,2,4,5]);
+assert.deepEqual(effective.speakers.map(s=>s.speaker),['spk1']);
+assert.equal(effective.events.at(-1).text,'<|WAIT|>');
 console.log('web UI contract checks passed');

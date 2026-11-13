@@ -13,6 +13,7 @@
 .log-entry[data-action="DIRECT"] .log-output{color:#175843}.log-entry pre{margin:6px 0;max-height:none}
 #chunkSettings{display:flex;align-items:center;gap:6px 10px;flex-wrap:wrap;margin:12px 0}#chunkSettings label{margin:0}#chunkMs{width:7em}
 .file-range{display:flex;gap:12px;flex-wrap:wrap;margin:12px 0}.file-range label{margin:0;flex:1 1 9em}.file-range input{display:block;width:100%;margin-top:4px}
+.segment[data-origin="recovery"] strong{color:#32614c}
 </style></head><body>
 <header><strong id="brand">OmniCommit</strong><span id="serviceDescription">多语种 · 多说话人流式转录</span></header>
 <main><div class="grid"><section class="card"><h2>音频来源</h2>
@@ -34,7 +35,8 @@
 <p id="status" class="status" role="status">等待开始</p><p id="warning" class="error" role="alert" hidden></p><p id="autoStatus" class="hint"></p><p id="references" class="hint"></p><p class="hint">麦克风与电脑声音需要 HTTPS 或 localhost；电脑声音需在共享窗口中勾选共享音频。</p>
 <div class="controls"><div class="metric" id="processed">已处理：0.0 秒</div><div class="metric" id="pending">本地积压：0.0 秒</div><div class="metric" id="latency">最近推理：—</div></div>
 </section><section class="card"><h2>实时转录</h2><div class="buttons"><button id="exportTxt">导出 TXT</button><button id="exportJson">导出 JSON</button></div>
-<p class="hint" id="transcriptHelp">正文只显示已提交的文字；说话人与语种由模型识别，长会议结果需要实际验证。</p><div id="transcript" class="transcript" aria-live="polite"></div>
+<p class="hint" id="transcriptHelp">正文只显示已提交的文字；说话人与语种由模型识别，长会议结果需要实际验证。</p>
+<p id="gapStatus" class="hint" role="status" hidden></p><div id="transcript" class="transcript" aria-live="polite"></div>
 <details><summary>说话人管理</summary><div id="speakerList"></div><label>说话人编号 <input id="speaker" placeholder="例如 spk1"></label><label>显示名称 <input id="speakerName" placeholder="例如 张老师"></label><button id="rename">修改名称</button><label>合并来源 <input id="mergeSource" placeholder="例如 spk3"></label><label>合并到 <input id="mergeTarget" placeholder="例如 spk1"></label><button id="merge">合并说话人</button><p class="hint">会话进行中修正将同步服务端；当前会话结束后无法再修改服务端缓存。</p></details>
 <details id="logPanel" open><summary id="logTitle">逐轮日志 · WAIT / DIRECT</summary>
 <div class="log-toolbar">
@@ -82,6 +84,8 @@ function identifyService(info) {
   if (ready) {
     acceptedChunkMs = defaultMs;
     $('serviceDescription').textContent = '多语种 · 多说话人流式转录 · 每块 ' + acceptedChunkMs + ' ms';
+    $('gapStatus').hidden = !second || typeof info.gap_recovery !== 'boolean';
+    $('gapStatus').textContent = info.gap_recovery ? '漏段补识别已开启' : '漏段补识别已关闭';
   }
   // A late health response must not reset a choice or replace the accepted step.
   const choices = info.chunk_ms_choices;
@@ -129,14 +133,14 @@ function log(row){
   turnLog.append(row);
 }
 function download(name,type,text){const u=URL.createObjectURL(new Blob([text],{type}));const a=document.createElement('a');a.href=u;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(u),1000);}
-function safeName(s){const item=speakers.find(x=>x.speaker===s);return item&&item.name?item.name:s;}
+function safeName(s){if(!s)return '说话人待确认';const item=speakers.find(x=>x.speaker===s);return item&&item.name?item.name:s;}
 function correctionButton(segment, label) {
   const button = document.createElement('button');
   button.type = 'button';
   button.textContent = label;
   button.disabled = (!socket || socket.readyState !== 1 || ending) && !finished;
   button.onclick = () => {
-    const id = prompt('将此段归属改为哪个说话人编号？', segment.display_speaker);
+    const id = prompt('将此段归属改为哪个说话人编号？', segment.display_speaker || '');
     if (id) control({op:'correct_segment', segment_id:segment.segment_id, speaker:id.trim()});
   };
   return button;
@@ -162,25 +166,84 @@ function transcriptLines(segment) {
   const segmenter = sentenceSegmenters.get(language);
   return lines.flatMap(line => Array.from(segmenter.segment(line), sentence => sentence.segment));
 }
-function appendTranscript(box, segment) {
+function gapInterval(start, end) {
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return '';
+  const offset = mode === 'file' ? fileStartSeconds : 0;
+  return (offset ? '原文件 ' : '') + (offset + start).toFixed(2) + '–' + (offset + end).toFixed(2) + ' 秒';
+}
+function showGapEvents(events) {
+  const labels = {pending:'正在补识别', recovered:'已补回正文', unresolved:'有声音，未能确认正文',
+    skipped:'已跳过补识别', error:'补识别失败'};
+  if (!events?.length) return;
+  const messages = events.map(event => [gapInterval(event.start_seconds, event.end_seconds),
+    labels[event.status] || event.status, event.message].filter(Boolean).join(' · '));
+  $('gapStatus').hidden = false;
+  $('gapStatus').textContent = messages.join(' / ');
+}
+function appendTranscript(box, segment, before = null) {
   for (const text of transcriptLines(segment)) {
     const row = document.createElement('div');
     row.className = 'segment';
-    row.dataset.speaker = segment.display_speaker;
+    row.dataset.speaker = segment.display_speaker || '';
     row.dataset.language = segment.language;
     row.dataset.segmentId = segment.segment_id;
     const heading = document.createElement('strong');
     heading.textContent = safeName(segment.display_speaker) + ' · ' + segment.language;
+    if (segment.origin === 'recovery') {
+      row.dataset.origin = 'recovery';
+      heading.textContent += ' · 补识别';
+      heading.title = gapInterval(segment.audio_start_seconds, segment.audio_end_seconds);
+    }
     row.append(heading, correctionButton(segment, '修正说话人'), document.createTextNode(text));
-    box.append(row);
+    if (before) box.insertBefore(row, before);
+    else box.append(row);
   }
 }
 function transcriptText() {
-  const lines = segments.flatMap(s => transcriptLines(s).map(text => safeName(s.display_speaker) + ' [' + s.language + '] ' + text));
+  const lines = segments.flatMap(s => transcriptLines(s).map(text =>
+    safeName(s.display_speaker) + ' [' + s.language + '] ' + (s.origin === 'recovery' ? '[补识别] ' : '') + text));
   if (!lines.length && turnLog.protocol === 'second') return '';
   return lines.join('\n') + '\n';
 }
-function renderSpeakers(){const list=$('speakerList');list.replaceChildren();for(const s of speakers){const chip=document.createElement('span');chip.className='speaker';chip.textContent=s.speaker+(s.name?' · '+s.name:'');list.append(chip);}}function render(snapshot){if(snapshot){segments=snapshot.segments||segments;speakers=snapshot.speakers||speakers;aliases=snapshot.aliases||aliases;}const box=$('transcript');box.replaceChildren();for(const s of segments)appendTranscript(box, s);renderSpeakers();}
+function compareSegments(a, b) {
+  return a.turn - b.turn || a.segment_index - b.segment_index || a.segment_id - b.segment_id;
+}
+function renderSpeakers(){const list=$('speakerList');list.replaceChildren();for(const s of speakers){const chip=document.createElement('span');chip.className='speaker';chip.textContent=s.speaker+(s.name?' · '+s.name:'');list.append(chip);}}
+function render(snapshot){
+  if(snapshot){
+    if(snapshot.segments)segments=snapshot.segments.slice().sort(compareSegments);
+    speakers=snapshot.speakers||speakers;aliases=snapshot.aliases||aliases;
+  }
+  const box=$('transcript');box.replaceChildren();for(const s of segments)appendTranscript(box, s);renderSpeakers();
+}
+function updateTranscript(result) {
+  if (result.snapshot) {render(result.snapshot); return;}
+  const incoming = result.new_segments || [], removed = new Set(result.removed_segment_ids || []);
+  if (!incoming.length && !removed.size) return;
+  const box = $('transcript'), follow = box.scrollHeight - box.scrollTop - box.clientHeight < 48;
+  if (removed.size) {
+    segments = segments.filter(segment => !removed.has(segment.segment_id));
+    for (const row of Array.from(box.children)) {
+      if (removed.has(Number(row.dataset.segmentId))) row.remove();
+    }
+  }
+  let addedSpeaker = false;
+  for (const seg of incoming) {
+    let before = null;
+    if (segments.length && compareSegments(segments[segments.length - 1], seg) > 0) {
+      const next = segments.findIndex(other => compareSegments(other, seg) > 0);
+      before = box.querySelector('[data-segment-id="' + segments[next].segment_id + '"]');
+      segments.splice(next, 0, seg);
+    } else segments.push(seg);
+    if (seg.display_speaker && !speakers.some(s => s.speaker === seg.display_speaker)) {
+      speakers.push({speaker:seg.display_speaker,name:''});
+      addedSpeaker = true;
+    }
+    appendTranscript(box, seg, before);
+  }
+  if (follow) box.scrollTop = box.scrollHeight;
+  if (addedSpeaker) renderSpeakers();
+}
 function transmit(){if(!socket||socket.readyState!==1||busy)return;if(controlQueue.length){busy=true;socket.send(JSON.stringify({type:'control',...controlQueue.shift()}));return;}if(queue.length){busy=true;socket.send(queue.shift());return;}if(mode==='file'&&!ending){pollFile();return;}if(ending&&!ended){ended=true;busy=true;socket.send(JSON.stringify({type:'end'}));}}
 function pcmPacket(samples){const pcm=new Int16Array(samples.length);samples.forEach((v,i)=>pcm[i]=Math.round(Math.max(-1,Math.min(1,v))*32767));return pcm.buffer;}
 function capture(samples){if(!capturing)return;partial.push(...samples);while(partial.length>=step)queue.push(pcmPacket(partial.splice(0,step)));$('pending').textContent='本地积压：'+(queue.length*step/16000).toFixed(1)+' 秒';if(queue.length*step/16000>10)stopCapture('处理积压超过 10 秒，已停止采集，正在处理已接收音频。');transmit();}
@@ -305,7 +368,7 @@ $('start').onclick=async()=>{
     fileId=null;fileDuration=0;fileSampleRate=16000;fileSamples=0;fileStopping=false;fileFinalSeconds=null;
     fileStartSeconds=0;fileEndSeconds=null;finished=false;initializing=true;lastProcessed=0;captureError=false;
     render();
-    $('warning').hidden=true;$('warning').textContent='';
+    $('warning').hidden=true;$('warning').textContent='';$('gapStatus').hidden=true;
     $('processed').textContent='已处理：0.0 秒';
     $('start').disabled=$('file').disabled=$('fileStart').disabled=$('fileEnd').disabled=true;
     document.querySelectorAll('[data-mode]').forEach(b=>b.disabled=true);
@@ -393,18 +456,8 @@ $('start').onclick=async()=>{
             $('warning').textContent='本次会议首次启发式裁剪发生在 '+(row.source_start_seconds ?? row.start_seconds).toFixed(1)+' 秒。逐轮日志标出了每次裁剪，可能遗漏的语音需核查。';
           }
         }
-        if(row.snapshot)render(row.snapshot);
-        else if(row.new_segments){
-          const box=$('transcript'),follow=box.scrollHeight-box.scrollTop-box.clientHeight<48;
-          let added=false;
-          for(const seg of row.new_segments){
-            segments.push(seg);
-            if(!speakers.some(s=>s.speaker===seg.display_speaker)){speakers.push({speaker:seg.display_speaker,name:''});added=true;}
-            appendTranscript(box, seg);
-          }
-          if(follow)box.scrollTop=box.scrollHeight;
-          if(added)renderSpeakers();
-        }
+        updateTranscript(row);
+        showGapEvents(row.gap_events);
         $('processed').textContent='已处理：'+(row.end_seconds||0).toFixed(1)+' 秒';
         if (mode === 'file') {
           lastProcessed=row.source_end_seconds ?? fileStartSeconds+(row.end_seconds||0);
@@ -415,6 +468,9 @@ $('start').onclick=async()=>{
         if(row.event==='end_of_audio'){
           finished=true;status('本次转录已结束');await cleanup();
         }else transmit();
+      }else if(row.type==='gap_update'){
+        updateTranscript(row);
+        showGapEvents(row.gap_events);
       }else if(row.type==='file_wait'){
         busy=false;
       }else if(row.type==='file_done'){
