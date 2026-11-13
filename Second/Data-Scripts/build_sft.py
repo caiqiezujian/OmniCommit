@@ -19,7 +19,7 @@ def json_line(value):
     return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":")) + "\n"
 
 
-def prepare_record(record, audio_root, steps, number_format):
+def prepare_record(record, audio_root, steps, number_format, release_on="semantic-unit"):
     audios = record.get("audios") if isinstance(record, dict) else None
     if not (isinstance(audios, list) and len(audios) == 1 and
             isinstance(audios[0], str) and audios[0].strip()):
@@ -32,7 +32,7 @@ def prepare_record(record, audio_root, steps, number_format):
     if info.frames < 1 or info.samplerate < 1:
         raise ValueError(f"Invalid audio length or sample rate: {path}")
     duration_ms = info.frames * 1000 / info.samplerate
-    units = parse_record(record, duration_ms)
+    units = parse_record(record, duration_ms, release_on=release_on)
     tokens = {WAIT}
     for unit in units:
         for lang, speaker, _ in unit.spans:
@@ -56,6 +56,8 @@ def main(argv=None):
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--audio-root", type=Path, help="Base for relative audio paths (default: input directory)")
     parser.add_argument("--chunk-ms", nargs="+", type=int, default=[500], metavar="MS")
+    parser.add_argument("--release-on", choices=("semantic-unit", "timed-span"), default="semantic-unit",
+                        help="Commit at semantic segment ends or at each validated sub-span end when available")
     parser.add_argument("--number-format", choices=["normalized", "verbatim"], default="normalized")
     args = parser.parse_args(argv)
     steps = args.chunk_ms
@@ -89,7 +91,8 @@ def main(argv=None):
             try:
                 line = raw.decode("utf-8-sig" if line_number == 1 else "utf-8")
                 record = json.loads(line)
-                rows, tokens, (gap_start, gap_end) = prepare_record(record, audio_root, steps, args.number_format)
+                rows, tokens, (gap_start, gap_end) = prepare_record(
+                    record, audio_root, steps, args.number_format, args.release_on)
             except (ValueError, KeyError, TypeError, OSError, OverflowError, RecursionError) as exc:
                 # Serialize errors as ASCII so even malformed Unicode input can be reported.
                 errors.write(json.dumps({"line": line_number, "error": str(exc)}, ensure_ascii=True) + "\n")
@@ -114,7 +117,7 @@ def main(argv=None):
         for path in tokens_files:
             with path.open("x", encoding="utf-8", newline="\n") as handle:
                 handle.write("".join(t + "\n" for t in sort_tokens(inventory)))
-        report = {"input": str(args.input.resolve()), "number_format": args.number_format,
+        report = {"input": str(args.input.resolve()), "number_format": args.number_format, "release_on": args.release_on,
                   "kept": kept, "rejected": bad, "chunk_ms": steps, "by_chunk_ms": counts,
                   "longest_unannotated_gap": longest_gap}
         with summary.open("x", encoding="utf-8", newline="\n") as handle:

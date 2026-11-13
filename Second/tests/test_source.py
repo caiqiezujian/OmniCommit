@@ -71,6 +71,21 @@ class SourceTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_record(row, 1300)
 
+    def test_inverted_span_end_across_overlapping_parents(self):
+        row = record()
+        row["timestamps"][1]["spans"] = [
+            {"start_ms": 350, "end_ms": 405, "language": "zh", "speaker": "spk1", "text_plain": "张伟，"}]
+        self.assertEqual(parse_record(row, 1300)[1].end_ms, 810)
+        with self.assertRaisesRegex(ValueError, "out of chronological order across segments"):
+            parse_record(row, 1300, release_on="timed-span")
+
+    def test_spacing_only_child_keeps_parent_intact(self):
+        row = record()
+        spans = row["timestamps"][-1]["spans"]
+        spans[:] = [{"start_ms": 910, "end_ms": 995, "language": "en", "speaker": "spk2", "text_plain": " "},
+                    {"start_ms": 1000, "end_ms": 1210, "language": "en", "speaker": "spk2", "text_plain": "OK."}]
+        self.assertEqual(parse_record(row, 1250, release_on="timed-span"), parse_record(row, 1250))
+
     def test_invalid_reference_timing_or_attribution(self):
         cases = [
             lambda r: r["timestamps"][0].update(end_ms=0),

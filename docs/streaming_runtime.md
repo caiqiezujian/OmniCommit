@@ -79,6 +79,27 @@ CUDA_VISIBLE_DEVICES=0 python3 tools/diagnose_switch_segment.py outputs/ja-de.50
 
 查看 `comparison.txt`，比较同一后端在全程和仅德语条件下的首次出字、首次显式输出 `<de>` 的时刻及其原文。结束事件单列。首次提交 `<de>` 衡量标签响应时间，正文准确性请结合 `clip.wav` 判断。新会话可以重新编号说话人。
 
+### Second 在切换后漏转录时
+
+对于同一段小语种单播正确、带前文漏字的样本，先选一份完整会议文件，记录切换附近确实有人说话的区间。用与服务相同的 checkpoint、步长、精度和上下文参数运行。本轮 Second 实验使用 800 ms，下面的路径和时间区间请换成实测值。
+
+```bash
+cd /data/yb/Code/OmniCommit
+CUDA_VISIBLE_DEVICES=0 python tools/diagnose_stream.py /data/test/meeting.wav \
+  --model /data/yb/Code/OmniCommit/models/second-merged \
+  --protocol second --backend vllm --prefix-caching --chunk-ms 800 \
+  --output outputs/switch-full.800ms.jsonl
+
+CUDA_VISIBLE_DEVICES=0 python tools/probe_wait_streaks.py outputs/switch-full.800ms.jsonl \
+  --start-seconds 58 --end-seconds 96 \
+  --wait-turns 3 --lead-turns 1 --max-probes 12 \
+  --output outputs/switch-probes.800ms.jsonl
+```
+
+第二条命令从第一份日志读取步长，并在独立诊断中回放原始音频包。800 ms 下，三个完整 WAIT 块对应 2.4 秒，加一个前导块，最多回听 3.2 秒。前导块可能包含已提交的上一种语言。按原录音时间核对候选中的新词，区分首词是否真的恢复、是否重复旧词、是否在静音处幻听，以及是否只改了标签。新会话的说话人编号只在本次回放内有效。另挑一组无语种切换的真实停顿作为对照。若极短的 B 被夹在 A 和 C 之间、模型始终输出正文，则用上一小节的指定区间回放检查。
+
+对缓存做对照时，保持语音包和会话历史相同，只切换 `--prefix-caching` 与 `--no-prefix-caching`。查找第一处原始输出分歧，并对照 prompt 长度、缓存命中 token 数、生成耗时和排队时间。冷会话回放改变了模型看到的历史，适合验证上下文效应。服务默认保留近期音频和说话人身份；若候选恢复有效，后续线上实验还应衡量每分钟额外解码次数、P95 首个正确词显示延迟及说话人错绑率。
+
 ## 1. 环境与离线真实模型测试
 
 在已用于 FLEX 的推理环境执行；不要用这些命令升级 torch/CUDA。

@@ -111,6 +111,32 @@ def test_whole_samples_and_real_tail(tmp_path):
     assert len(chunk_wav_bytes(row["audios"][-1])) > 44
 
 
+def test_span_release_at_cli_with_mixed_attribution_and_fallback(tmp_path):
+    audio = tmp_path / "conversation.wav"
+    write_audio(audio, frames=32000)
+    head, early, tail = "<zh><spk1>明白。", "<it><spk2> Sì,", " certo."
+    record = {
+        "audios": [audio.name], "messages": [{"role": "assistant", "content": head + early + tail}],
+        "output": {"segments": [{"source_text": head + early, "action": "WAIT"}, {"source_text": tail}]},
+        "timestamps": [
+            {"start_ms": 0, "end_ms": 1250, "spans": [
+                {"start_ms": 0, "end_ms": 400, "text": head, "language": "zh", "speaker": "spk1"},
+                {"start_ms": 810, "end_ms": 1000, "text_plain": " Sì,", "language": "it", "speaker": "spk2"},
+            ]},
+            {"start_ms": 1270, "end_ms": 1760},
+        ],
+    }
+    source = tmp_path / "stamps.jsonl"
+    source.write_text(json.dumps(record), encoding="utf-8")
+    for mode, expected in [("semantic-unit", [WAIT, WAIT, head + early, tail, WAIT]),
+                           ("timed-span", [head, early, WAIT, tail, WAIT])]:
+        out = tmp_path / mode
+        result = run_cli(tmp_path, "Data-Scripts/build_sft.py", source, "--output-dir", out, "--release-on", mode)
+        assert result.returncode == 0, result.stderr
+        assert json.loads((out / "summary.json").read_text(encoding="utf-8"))["release_on"] == mode
+        assert replies(json.loads((out / "train.500ms.jsonl").read_text(encoding="utf-8"))) == expected
+
+
 def test_crop_before_resampling_and_padding(tmp_path):
     import numpy as np
     import soundfile as sf

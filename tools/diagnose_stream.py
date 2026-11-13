@@ -4,6 +4,7 @@ import argparse
 from contextlib import closing, contextmanager
 from dataclasses import asdict
 from itertools import chain
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -12,6 +13,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from omnicommit.diagnostic_media import iter_media_chunks
 from omnicommit.diagnostic_runtime import add_diagnostic_arguments, resolve_runtime
 from omnicommit.streaming import SAMPLE_RATE
+
+
+def pcm_sha256(pcm):
+    return hashlib.sha256(pcm.astype("<f4", copy=False)).hexdigest()
 
 
 @contextmanager
@@ -87,6 +92,9 @@ def run_file(args, write):
             session = session_factory(observed, options)
             write({"type": "ready", "protocol": protocol, "backend": type(backend).__name__,
                    "requested_dtype": args.dtype,
+                   "engine_options": {key: getattr(args, key) for key in (
+                       "attention", "device_map", "tensor_parallel_size", "gpu_memory_utilization",
+                       "vllm_image_slots")},
                    "enable_prefix_caching": getattr(backend, "enable_prefix_caching", None),
                    "mm_processor_cache_gb": getattr(backend, "mm_processor_cache_gb", None),
                    "model": str(args.model) if args.model else None,
@@ -110,6 +118,8 @@ def run_file(args, write):
                 state = context_state(session)
                 row = {"type": "result", **result, **state, "raw_model_text": observed.raw_text,
                        "consecutive_audio_waits": consecutive_waits, "last_direct_seconds": last_direct}
+                if not eos:
+                    row["pcm_sha256"] = pcm_sha256(pcm)
                 if state["history_start_seconds"] > previous_head:
                     row["trimmed_interval_seconds"] = [previous_head, state["history_start_seconds"]]
                 write(row)

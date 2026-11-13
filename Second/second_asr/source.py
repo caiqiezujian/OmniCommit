@@ -122,7 +122,7 @@ def _check_metadata(item, chars, context):
                 raise ValueError(f"{context}.{plural} differs from reference")
 
 
-def _check_spans(spans, chars, begin, end, context):
+def _checked_spans(spans, chars, begin, end, context):
     if not isinstance(spans, list) or not spans:
         raise ValueError(f"{context}.spans must be a nonempty array")
     offset, previous = 0, (begin, begin)
@@ -142,12 +142,15 @@ def _check_spans(spans, chars, begin, end, context):
             raise ValueError(f"{context} span attribution differs from reference")
         _check_metadata(span, part, f"{context} span")
         offset += length
+        yield Unit(*bounds, ((part[0][0], part[0][1], "".join(ch for _, _, ch in part)),))
     if offset != len(chars):
         raise ValueError(f"{context} spans do not cover the entire unit")
 
 
-def parse_record(record, duration_ms):
-    """Recover complete timed semantic units; old action/flush labels do not gate release."""
+def parse_record(record, duration_ms, *, release_on="semantic-unit"):
+    """Recover release units from reference text and the selected timestamp granularity."""
+    if release_on not in ("semantic-unit", "timed-span"):
+        raise ValueError(f"unknown release granularity {release_on!r}")
     if not isinstance(record, dict):
         raise ValueError("record must be an object")
     if not _finite_number(duration_ms) or duration_ms <= 0:
@@ -190,11 +193,19 @@ def parse_record(record, duration_ms):
         if begin < previous[0] or end < previous[1]:
             raise ValueError(f"{context} is out of chronological order")
         _check_metadata(timestamp, chars, f"{context} timestamp")
+        parts = []
         if timestamp.get("spans") is not None:
-            _check_spans(timestamp["spans"], chars, begin, end, context)
-        spans = tuple((language, speaker, "".join(ch for _, _, ch in group))
-                      for (language, speaker), group in groupby(chars, key=lambda c: c[:2]))
-        units.append(Unit(begin, end, spans))
+            parts = list(_checked_spans(timestamp["spans"], chars, begin, end, context))
+        # Pure spacing is not a legal assistant turn; keep its parent intact.
+        if release_on == "semantic-unit" or not parts or any(not p.spans[0][2].strip() for p in parts):
+            spans = tuple((language, speaker, "".join(ch for _, _, ch in group))
+                          for (language, speaker), group in groupby(chars, key=lambda c: c[:2]))
+            parts = [Unit(begin, end, spans)]
+        # Parents and their children can each look monotonic while two children
+        # on opposite sides of an overlapping parent boundary run backwards.
+        if units and (parts[0].start_ms < units[-1].start_ms or parts[0].end_ms < units[-1].end_ms):
+            raise ValueError(f"{context} release intervals are out of chronological order across segments")
+        units.extend(parts)
         offset += len(plain)
         previous = begin, end
     if offset != len(reference):
