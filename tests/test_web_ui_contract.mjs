@@ -320,6 +320,96 @@ for (const service of [
     assert.equal(field.disabled, false);
   }
 }
+// Ranged playback sends source-clock release boundaries, even when inference
+// is behind the player. Each new start has its own model session.
+const rangeStart = elements.get('fileStart'), rangeEnd = elements.get('fileEnd');
+rangeStart.focus = rangeEnd.focus = () => {};
+media.duration = 100;
+let uploads = 0;
+context.fetch = async () => {
+  uploads++;
+  return {ok:true, json:async () =>
+    ({media_id:'range-file', duration_seconds:100, sample_rate:44100, samples:4410000})};
+};
+async function frame(ws, row) {await ws.onmessage({data:JSON.stringify(row)});}
+function last(ws) {return JSON.parse(ws.frames.at(-1));}
+const readyRange = {type:'ready', chunk_seconds:.5, backend:'replay', file_start_seconds:58.125, file_end_seconds:96};
+for (const protocol of ['first', 'second']) {
+  rangeStart.value='58.125';rangeEnd.value='1:36';field.value='500';
+  const [ws, start] = await startMeeting('file');
+  assert.equal(start.file_start_seconds, 58.125);
+  assert.equal(start.file_end_seconds, 96);
+  assert.equal(rangeStart.disabled && rangeEnd.disabled, true);
+  assert.equal(media.currentTime, 58.125);
+  media.currentTime = 12;  // preview moved between upload and server confirmation
+  await frame(ws, {...readyRange, protocol});
+  assert.equal(media.currentTime, 58.125);
+  media.currentTime=58.625;
+  vm.runInContext('pollFile()',context);
+  assert.deepEqual(last(ws), {type:'file_next', release_seconds:58.625});
+  await frame(ws, {type:'result',event:'audio',turn:1,action:'WAIT',text:'<|WAIT|>',
+    start_seconds:0,end_seconds:.5,source_start_seconds:58.125,source_end_seconds:58.625});
+  assert.match(elements.get('processed').textContent, /已处理：0.5 秒 · 原文件 58.63 秒/);
+  assert.match(elements.get('pending').textContent, /0.0 秒/);
+  assert.match(vm.runInContext("logHeading(turnLog.current.model[0])",context), /原文件 58.125–58.625 s/);
+  media.currentTime=96.157;
+  media.ontimeupdate();  // model is still busy; playback should stop anyway
+  assert.equal(media.paused, true);
+  await frame(ws,{type:'file_wait'});
+  vm.runInContext('transmit()',context);
+  assert.deepEqual(last(ws),{type:'file_next',release_seconds:96,final:true});
+  await frame(ws,{type:'file_done'});
+  assert.deepEqual(last(ws),{type:'end'});
+  await frame(ws,{type:'result',event:'end_of_audio',end_seconds:37.875,source_end_seconds:96});
+  assert.equal(rangeStart.disabled || rangeEnd.disabled, false);
+  ws.close();
+}
+
+for (const [start, end, message] of [['-1','','请输入'],['a','','请输入'],['1:60','','请输入'],
+  ['2','1','晚于起点'],['2','2','晚于起点'],['100','','早于'],['1','101','超出']]) {
+  rangeStart.value=start;rangeEnd.value=end;
+  const count=sockets.length;
+  const filesBefore=uploads;
+  await elements.get('start').onclick();
+  assert.equal(sockets.length,count);
+  assert.equal(uploads, filesBefore);
+  assert.match(elements.get('status').textContent,new RegExp(message));
+  assert.equal(rangeStart.disabled||rangeEnd.disabled,false);
+}
+rangeStart.value='0:00:58.125';rangeEnd.value='';
+const [openEnd, toEnd] = await startMeeting('file');
+assert.equal(toEnd.file_start_seconds,58.125);
+assert.equal('file_end_seconds' in toEnd,false);
+await frame(openEnd,{...readyRange,file_end_seconds:100,protocol:'second'});
+media.currentTime=59.375;
+await elements.get('stop').onclick();
+assert.deepEqual(last(openEnd),{type:'file_next',release_seconds:59.375,final:true});
+await frame(openEnd,{type:'file_done'});
+await frame(openEnd,{type:'result',event:'end_of_audio',end_seconds:1.25,source_end_seconds:59.375});
+rangeStart.value='';rangeEnd.value='1:36';
+const [openStart, until] = await startMeeting('file');
+assert.equal('file_start_seconds' in until,false);
+assert.equal(until.file_end_seconds,96);
+await frame(openStart,{...readyRange,file_start_seconds:0,protocol:'first'});
+await elements.get('stop').onclick();
+await frame(openStart,{type:'file_done'});
+await frame(openStart,{type:'file_end_empty',heard_seconds:0,source_heard_seconds:0});
+assert.match(elements.get('status').textContent,/尚未播放音频/);
+assert.equal(rangeEnd.disabled,false);
+
+// An old server may ignore unknown start fields. Do not release the prefix
+// under that server: only a matching ready handshake enables playback.
+rangeStart.value='58';rangeEnd.value='96';
+const [oldServer] = await startMeeting('file');
+await frame(oldServer,{type:'ready',chunk_seconds:.5,protocol:'second'});
+assert.equal(oldServer.frames.length,1);
+assert.equal(oldServer.readyState,3);
+assert.equal(media.paused,true);
+assert.match(elements.get('status').textContent,/没有确认/);
+// A new file clears the previous file's interval.
+elements.get('file').onchange();
+assert.equal(rangeStart.value,'');
+assert.equal(rangeEnd.value,'');
 elements.get('file').files = [];
 await elements.get('start').onclick();
 assert.equal(picker.disabled, false, 'unlocked after a failed file start');

@@ -186,7 +186,7 @@ bash SFT-Scripts/merge_lora.sh \
 bash start_server.sh /data/yb/Code/OmniCommit/outputs/merged
 ```
 
-网页默认监听 `0.0.0.0:18889`，无需访问令牌，支持麦克风、系统声音、音视频文件、实时转录、逐段修正、说话人合并/改名及 TXT/JSON 导出。远程浏览器采集麦克风或系统声音仍需要受信任的 HTTPS 或 localhost；文件模式受浏览器支持格式限制。
+网页默认监听 `0.0.0.0:18889`，无需访问令牌，支持麦克风、系统声音、音视频文件、实时转录、逐段修正、说话人合并/改名及 TXT/JSON 导出。文件输入可指定开始和结束时间，例如从 `58` 播放到 `1:36`，以新会话单独识别该段。远程浏览器采集麦克风或系统声音仍需要受信任的 HTTPS 或 localhost；文件模式受浏览器支持格式限制。
 
 “逐轮日志”默认展开，可按会议回看 WAIT 和 DIRECT，下载全部模型轮次的 TXT 或收到事件的 JSONL。浏览器在本地保存会议日志。[网页服务说明](docs/web_meeting_service_zh.md#回看和下载逐轮日志)
 

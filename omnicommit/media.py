@@ -112,24 +112,41 @@ class MediaUpload:
 
 
 class MediaCursor:
-    def __init__(self, upload):
+    """Read a selected source interval with chunk boundaries relative to its first sample."""
+
+    def __init__(self, upload, *, start_seconds=0.0, end_seconds=None):
         if not upload.ready or not upload.claimed:
             raise MediaError('A ready claimed upload is required')
+        rate = upload.sample_rate
+        duration = upload.samples / rate
+        if end_seconds is None:
+            end_seconds = duration
+        for value in (start_seconds, end_seconds):
+            if type(value) not in (int, float) or not 0 <= value <= duration:
+                raise MediaError('File range must be in seconds within the decoded audio duration')
+        # Keep only complete source frames inside [start, end). nextafter
+        # accommodates the rounding in (frame / rate) * rate at either edge.
+        self.start_frame = math.ceil(math.nextafter(start_seconds * rate, -math.inf))
+        self.end_frame = math.floor(math.nextafter(end_seconds * rate, math.inf))
+        if self.start_frame >= self.end_frame:
+            raise MediaError('File range must have a start before its end and contain at least one source sample')
         self.upload = upload
-        self.position = 0
-        self.last_release = 0
+        self.start_seconds = self.start_frame / rate
+        self.end_seconds = self.end_frame / rate
+        self.position = self.start_frame
+        self.last_release = self.start_frame
         self.final_release = None
         self.chunk_index = 0
         self.chunk_seconds = None
 
     @property
-    def done(self): return self.position == self.upload.samples
+    def done(self): return self.position == self.end_frame
 
     @property
     def finished(self):
         return self.done or (self.final_release is not None and self.position >= self.final_release)
 
-    def _next_source_boundary(self, chunk_seconds):
+    def _chunk_end_offset(self, chunk_seconds):
         try:
             chunk_ms = chunk_milliseconds(chunk_seconds)
         except ValueError as exc:
@@ -139,26 +156,29 @@ class MediaCursor:
         return round((self.chunk_index + 1) * chunk_seconds * self.upload.sample_rate)
 
     def next_chunk(self, release_seconds, chunk_seconds, *, final=False):
-        if isinstance(release_seconds, bool) or not isinstance(release_seconds, (int, float)) or not math.isfinite(release_seconds):
+        if type(release_seconds) not in (int, float):
             raise MediaError('Invalid playback position')
-        nominal_end = self._next_source_boundary(chunk_seconds)
+        nominal_end = self.start_frame + self._chunk_end_offset(chunk_seconds)
         if self.chunk_seconds is not None and chunk_seconds != self.chunk_seconds:
             raise MediaError('Chunk length cannot change within a session')
         self.chunk_seconds = chunk_seconds
         if not isinstance(final, bool):
             raise MediaError('final must be boolean')
         source_rate = self.upload.sample_rate
-        release = math.floor(release_seconds * source_rate + 1e-7)
-        if release < self.last_release or release < 0 or release > self.upload.samples + 1:
+        if not 0 <= release_seconds <= (self.upload.samples + 1) / source_rate:
             raise MediaError('Playback position must be monotonic and within media')
-        release = min(release, self.upload.samples)
+        release = math.floor(math.nextafter(release_seconds * source_rate, math.inf))
+        # Player seek and timer callbacks can land just outside the selection.
+        release = min(self.end_frame, max(self.start_frame, release))
+        if release < self.last_release:
+            raise MediaError('Playback position must be monotonic and within media')
         if self.final_release is not None and release != self.final_release:
             raise MediaError('Cannot change playback position after final release')
         if final:
             self.final_release = release
         self.last_release = release
         if self.finished: return None
-        end = min(nominal_end, self.upload.samples)
+        end = min(nominal_end, self.end_frame)
         if end > release:
             if self.final_release is None or release <= self.position:
                 return None

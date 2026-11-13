@@ -133,6 +133,8 @@ def create_app(backend_factory, options, *, max_sessions=1,
         ledger = None
         cursor = None
         upload = None
+        source_heard = None
+        attempted_source_end = None
         auto_reference_failed = False
         reference_task = None
         reference_started = None
@@ -165,6 +167,9 @@ def create_app(backend_factory, options, *, max_sessions=1,
             source_kind = init.get("source_kind", "microphone")
             if source_kind not in ("microphone", "system", "file"):
                 raise ValueError("Unknown audio source")
+            range_keys = ("file_start_seconds", "file_end_seconds")
+            if source_kind != "file" and any(key in init for key in range_keys):
+                raise ValueError("A file range requires an uploaded file session")
             session_options = options
             if chunk_ms_choices:
                 chunk_ms = init.get("chunk_ms", round(options.chunk_seconds * 1000))
@@ -175,13 +180,17 @@ def create_app(backend_factory, options, *, max_sessions=1,
                 raise ValueError("This service uses a fixed chunk length")
             if source_kind == "file":
                 upload = media_store.claim(init.get("media_id"))
-                cursor = media_cursor_factory(upload)
+                cursor = media_cursor_factory(upload, start_seconds=init.get("file_start_seconds", 0),
+                                              end_seconds=init.get("file_end_seconds"))
+                source_heard = cursor.start_seconds
             session = session_factory(backend, session_options)
             ledger = SessionLedger(session)
             active.add(session)
             admitted = True
             await websocket.send_json({"type": "ready", "protocol": protocol_name,
                 "chunk_seconds": session_options.chunk_seconds, **chunk_settings,
+                **({"file_start_seconds": cursor.start_seconds, "file_end_seconds": cursor.end_seconds}
+                   if cursor is not None else {}),
                 "context_policy": session_options.context_policy, "backend": type(backend).__name__,
                 "warning": "Rolling mode is an unverified tail heuristic" if session_options.context_policy == "rolling" else "Verified watermarks required before safe context eviction",
                 "automatic_reference": "experimental_qwen" if reference_provider is not None else "disabled",
@@ -208,9 +217,16 @@ def create_app(backend_factory, options, *, max_sessions=1,
                     event = json.loads(packet.get("text", ""))
                     if "chunk_ms" in event:
                         raise ValueError("chunk_ms can only be selected when starting a session")
+                    if any(key in event for key in range_keys):
+                        raise ValueError("The file range can only be selected when starting a session")
                     if event.get("type") == "end":
                         if cursor is not None and not cursor.finished:
                             raise ValueError("Drain the played file audio before ending")
+                        if cursor is not None and session.turn_count == 0:
+                            await websocket.send_json({"type": "file_end_empty", "heard_seconds": 0,
+                                                       "source_heard_seconds": source_heard})
+                            break
+                        attempted_source_end = source_heard
                         call = lambda: session.step(end_of_audio=True)
                     elif event.get("type") == "file_next":
                         if cursor is None:
@@ -226,6 +242,7 @@ def create_app(backend_factory, options, *, max_sessions=1,
                             await websocket.send_json({"type": "file_done" if cursor.finished else "file_wait"})
                             continue
                         pcm = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+                        attempted_source_end = cursor.position / upload.sample_rate
                         call = lambda: session.step(pcm, final_chunk=cursor.finished)
                     elif event.get("type") == "control":
                         try:
@@ -262,6 +279,13 @@ def create_app(backend_factory, options, *, max_sessions=1,
                 # Cancellation must not free a session while its worker runs.
                 result = await asyncio.shield(task)
                 task = None
+                if cursor is not None:
+                    # Track the decoded source frames separately. The model sees
+                    # session-relative 16 kHz packets; a short tail may round differently.
+                    result["source_start_seconds"] = source_heard
+                    result["source_end_seconds"] = attempted_source_end
+                    source_heard = attempted_source_end
+                    attempted_source_end = None
                 result["new_segments"] = ledger.record(result)
                 collect_reference()
                 if pending_evidence is not None:
@@ -293,9 +317,14 @@ def create_app(backend_factory, options, *, max_sessions=1,
             pass
         except Exception as exc:
             try:
-                await websocket.send_json({"type": "error", "error": str(exc),
+                failure = {"type": "error", "error": str(exc),
                     "heard_seconds": session.heard_seconds if session else 0,
-                    "audio_dropped_silently": False})
+                    "audio_dropped_silently": False}
+                if source_heard is not None:
+                    failure["source_heard_seconds"] = source_heard
+                    if attempted_source_end is not None:
+                        failure.update(source_start_seconds=source_heard, source_end_seconds=attempted_source_end)
+                await websocket.send_json(failure)
             except Exception:
                 pass
         finally:

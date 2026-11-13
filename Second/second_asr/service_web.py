@@ -9,8 +9,8 @@ from .service_session import SecondStreamSession
 
 
 class SecondMediaCursor(MediaCursor):
-    def _next_source_boundary(self, chunk_seconds):
-        # Use the same ceiling of the absolute grid as the timestamp recaster.
+    def _chunk_end_offset(self, chunk_seconds):
+        # Apply the recaster's ceiling rule to the grid starting at the selected sample.
         # At 44.1 kHz a millisecond boundary can be a fractional sample.
         try:
             chunk_ms = chunk_milliseconds(chunk_seconds)

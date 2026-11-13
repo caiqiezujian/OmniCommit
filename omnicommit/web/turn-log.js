@@ -28,7 +28,9 @@ function indexLogRow(history, row) {
 function logHeading(row) {
   if (row.type !== 'result') return row.type;
   const fields = ['第 ' + row.turn + ' 轮'];
-  if (Number.isFinite(row.start_seconds) && Number.isFinite(row.end_seconds)) {
+  if (Number.isFinite(row.source_start_seconds) && Number.isFinite(row.source_end_seconds)) {
+    fields.push('原文件 ' + row.source_start_seconds.toFixed(3) + '–' + row.source_end_seconds.toFixed(3) + ' s');
+  } else if (Number.isFinite(row.start_seconds) && Number.isFinite(row.end_seconds)) {
     fields.push(row.start_seconds.toFixed(2) + '–' + row.end_seconds.toFixed(2) + ' s');
   }
   if (row.event === 'end_of_audio') fields.push('音频结束');
@@ -227,7 +229,8 @@ class MeetingTurnLog {
     if (lastDirect) {
       const segments = lastDirect.segments || [];
       const lastSpan = segments[segments.length - 1];
-      const when = Number.isFinite(lastDirect.end_seconds) ? lastDirect.end_seconds.toFixed(1) + ' 秒' : '第 ' + lastDirect.turn + ' 轮';
+      const when = Number.isFinite(lastDirect.source_end_seconds) ? '原文件 ' + lastDirect.source_end_seconds.toFixed(2) + ' 秒'
+        : Number.isFinite(lastDirect.end_seconds) ? lastDirect.end_seconds.toFixed(1) + ' 秒' : '第 ' + lastDirect.turn + ' 轮';
       details.push('最后一次' + (commit === 'DIRECT' ? ' DIRECT ' : '提交正文') + '在 ' + when
         + (lastSpan ? '（' + lastSpan.language + ' · ' + lastSpan.speaker + '）' : ''));
     }
@@ -235,7 +238,8 @@ class MeetingTurnLog {
     g('logProgress').textContent = details.join('；');
     g('logError').hidden = !error;
     if (error) {
-      const position = Number.isFinite(error.heard_seconds) ? '，最后处理到 ' + error.heard_seconds.toFixed(1) + ' 秒' : '';
+      const position = Number.isFinite(error.source_heard_seconds) ? '，最后处理到原文件 ' + error.source_heard_seconds.toFixed(2) + ' 秒'
+        : Number.isFinite(error.heard_seconds) ? '，最后处理到 ' + error.heard_seconds.toFixed(1) + ' 秒' : '';
       g('logError').textContent = '服务已报错' + position + '：' + error.error;
     }
     g('logRange').textContent = this.loading ? '正在读取会议日志…'
