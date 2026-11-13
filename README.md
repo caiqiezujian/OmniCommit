@@ -192,6 +192,8 @@ bash start_server.sh /data/yb/Code/OmniCommit/outputs/merged
 
 要排查语种切换后连续 WAIT，可以用同一份模型和音视频文件在命令行独立推理。两版模型共用 `tools/diagnose_stream.py`，支持整数毫秒步长和逐轮 JSONL。[命令与日志字段](docs/streaming_runtime.md#音视频文件逐轮诊断)
 
+要核对训练目标是否也在切换处连续 WAIT，运行 `SFT-Scripts/audit_switches.py`。它从最终训练 JSONL 读取每一轮，并可按原录音时间叠加可信标注和模型日志、导出切换片段。[切换审查命令与读法](docs/switch_audit_zh.md)
+
 自动说话人参照可选启用，使用独立 Python 环境中的 Qwen 对齐器进行**实验性**候选构建；它不验证身份或重叠发言，当前阿拉伯语和泰语不会自动建参照。默认 `rolling` 是启发式裁剪，可能遗漏尚未提交的语音；连续 WAIT 超过预算可能停止。真实 30 分钟准确率、速度和跨长间隔身份一致性尚未验收。启动参数、依赖和完整说明见 [会议 Web 服务](docs/web_meeting_service_zh.md)。
 
 ## 文档与验证

@@ -1,5 +1,7 @@
 # 第一版 SFT · WAIT / DIRECT
 
+核查训练数据中的切换延迟、首轮提交量、标签归属，以及与同一录音推理日志的差异，可使用 [切换审查脚本](audit_switches.py)。两版训练数据共用此入口。[运行说明](../docs/switch_audit_zh.md)
+
 本目录训练的模型输出 `<|WAIT|>` 或 `<|DIRECT|><语言><说话人>新增正文`。数据构建、训练和服务共用 `omnicommit/runtime_protocol.py` 中的协议。直接提交正文的第二版有独立的构建器和训练入口。[第二版手册](../Second/README.md)
 
 | 训练环境 | 启动脚本 | 第一个位置参数 | 默认保存间隔 |
