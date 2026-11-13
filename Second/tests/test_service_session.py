@@ -119,6 +119,48 @@ def test_reference_and_display_corrections_preserve_live_model_state():
     assert line["text"] == " See you."
 
 
+@pytest.mark.parametrize("pending_speech", [False, True])
+def test_rolling_minute_of_digital_silence_then_speech(pending_speech):
+    # Quiet recorded speech is deliberately far below usual VAD thresholds.
+    # Storage compaction must not erase a single nonzero audio sample.
+    silence = np.zeros(12800, dtype=np.float32)
+    quiet = silence.copy()
+    quiet[len(quiet) // 2] = 1 / 32768.
+    count = 75
+    model = Script(chain(repeat(WAIT, count + int(pending_speech)), ["<en><spk7>Back.", WAIT]))
+    s = SecondStreamSession(model, SecondStreamOptions(chunk_seconds=.8, context_policy="rolling"))
+    if pending_speech:
+        s.step(quiet)
+    for _ in range(count):
+        row = s.step(silence)
+        assert row["text"] == WAIT and not row["segments"]
+    assert s.heard_seconds == pytest.approx(60 + .8 * pending_speech)
+    assert sum(t.end-t.start for t in s.history) < 15
+    assert s.verified_commit_seconds == s.inferred_commit_seconds == 0
+    assert not s.heuristic_eviction and not s.last_committed_language
+    event = s.step(HALF_SECOND, final_chunk=True)
+    assert event["start_seconds"] == pytest.approx(60 + .8 * pending_speech)
+    assert event["segments"] == [{"language": "en", "speaker": "spk7", "text": "Back."}]
+    if pending_speech:
+        assert np.array_equal(model.audios[0], quiet)
+        assert (s.history[0].start, s.history[0].end) == (0., .8)
+    assert s.step(end_of_audio=True)["text"] == WAIT
+
+
+def test_quiet_nonzero_wait_still_consumes_pending_budget():
+    quiet = np.full(8000, 1 / 32768., dtype=np.float32)
+    model = Script(repeat(WAIT))
+    s = SecondStreamSession(model, SecondStreamOptions(max_pending_seconds=1., context_policy="rolling"))
+    s.step(quiet)
+    for _ in range(4):
+        s.step(np.zeros_like(quiet))
+    s.step(quiet)
+    with pytest.raises(ContextBudgetError, match="pending"):
+        s.step(quiet)
+    assert s.verified_commit_seconds == s.inferred_commit_seconds == 0
+    assert sum(np.any(t.audio) for t in s.history) == 2
+
+
 def test_30_minute_rolling_meeting_keeps_reference_and_reconstructs_sparse_history():
     # Speaker 7 returns after nearly 30 minutes of speech by speaker 3.
     # The replies are scripted to test context and identity plumbing, not ASR accuracy.

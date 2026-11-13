@@ -8,7 +8,7 @@ from dataclasses import replace
 import logging
 import math
 
-from .gap_recovery import GapTracker, LATE_MAIN_SECONDS, reconcile
+from .gap_recovery import GapTracker, LATE_MAIN_SECONDS, RATE, reconcile
 
 
 LOG = logging.getLogger("omnicommit.gap")
@@ -30,12 +30,9 @@ def _spans(request, words):
         if not math.isfinite(word["probability"]) or not word["probability"] >= .40:
             previous_kept = False
             continue
-        lang = word["language"] if word["language_probability"] >= .45 else "und"
         value = dict(text=text, start_seconds=start, end_seconds=end)
-        if (not previous_kept or groups[-1]["language"] != lang
-                or groups[-1]["end_seconds"] + .35 < start):
-            groups.append(dict(text="", language=lang, words=[], start_seconds=start,
-                               end_seconds=end))
+        if not previous_kept or groups[-1]["end_seconds"] + .35 < start:
+            groups.append(dict(text="", words=[], start_seconds=start, end_seconds=end))
         group = groups[-1]
         group["text"] += text
         group["words"].append(value)
@@ -51,6 +48,19 @@ class GapService:
 
     def new_session(self, session, ledger):
         return GapSession(self, session, ledger)
+
+    def recognize(self, request):
+        # Both stages run on the CPU worker. Measure only the WAIT portion:
+        # speech in the Japanese lead or the next DIRECT cannot trigger a decode.
+        lo = round((request.wait_start_seconds - request.start_seconds) * RATE)
+        hi = round((request.wait_end_seconds - request.start_seconds) * RATE)
+        speech = self.backend.speech_ranges(request.audio)
+        duration = sum(max(0, min(end, hi) - max(start, lo)) for start, end in speech)
+        if duration < round(.10 * RATE):
+            return None
+        # Decode the original samples to retain the first syllable and the
+        # original word timestamps even if the speech detector clips an onset.
+        return self.backend.transcribe(request.audio)
 
     def close(self):
         self.executor.shutdown(wait=True, cancel_futures=True)
@@ -80,7 +90,7 @@ class GapSession:
     def _launch(self, request):
         self.request = request
         self.task = asyncio.get_running_loop().run_in_executor(
-            self.service.executor, self.service.backend.transcribe, request.audio)
+            self.service.executor, self.service.recognize, request)
 
     def _schedule(self, request):
         if request is None:
@@ -92,7 +102,7 @@ class GapSession:
         else:
             self._event(request, "unresolved", "补识别队列已满，主转录继续")
             return
-        self._event(request, "pending")
+        self._event(request, "pending", "正在检查待提交区间是否有人声")
 
     def observe(self, pcm, result):
         self.main.append({key: result[key] for key in ("turn", "action", "segments",
@@ -115,7 +125,7 @@ class GapSession:
             position = span["sort_after_segment"] + .5
         item = dict(segment_id=len(self.ledger.segments) + 1, turn=when,
                     segment_index=position, origin="recovery", text=span["text"],
-                    language=span["language"], model_speaker=None, display_speaker=None,
+                    language=None, model_speaker=None, display_speaker=None,
                     audio_start_seconds=span["start_seconds"], audio_end_seconds=span["end_seconds"])
         self.ledger.segments.append(item)
         self.added.append(dict(item))
@@ -147,12 +157,10 @@ class GapSession:
         request = self.request
         try:
             words = self.task.result()
-            spans = _spans(request, words)
-            supported = getattr(self.session.backend, "allowed_tokens", None)
-            for span in spans:
-                if supported is not None and "<" + span["language"] + ">" not in supported:
-                    span["language"] = "und"
-            if not self.main or self.main[0]["turn"] > request.first_turn:
+            spans = _spans(request, words or [])
+            if words is None:
+                self._event(request, "skipped", "待提交区间未检出足够人声，保留 WAIT")
+            elif not self.main or self.main[0]["turn"] > request.first_turn:
                 self._event(request, "unresolved", "复核结果已超出近期音频窗口")
             else:
                 kept = reconcile(request, spans, self.main)

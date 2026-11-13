@@ -197,6 +197,9 @@ class StreamSession:
     def _minimum_input_samples(self, final_chunk):
         return SAMPLE_RATE // 2 if final_chunk else SAMPLE_RATE // 100
 
+    def _pending_seconds(self, commit):
+        return self.heard_seconds - commit
+
     def step(self, audio=None, *, end_of_audio=False, final_chunk=False):
         self._check_open()
         self.evicted_this_turn = False
@@ -219,7 +222,7 @@ class StreamSession:
             commit = self.verified_commit_seconds
             if self.options.context_policy == "rolling":
                 commit = max(commit, self.inferred_commit_seconds)
-            pending = self.heard_seconds + duration - commit
+            pending = self._pending_seconds(commit) + duration
             retained = duration + sum(t.end - t.start for t in self.history)
             if pending > self.options.max_pending_seconds + 1e-8:
                 raise ContextBudgetError(

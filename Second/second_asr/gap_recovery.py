@@ -25,6 +25,10 @@ class GapRequest:
     lead_text: str
     lead_end_seconds: float
     eligible_after_seconds: float
+    # Only these received WAIT packets can supply evidence of missing speech.
+    # The rest of the snapshot is context for decoding and text reconciliation.
+    wait_start_seconds: float
+    wait_end_seconds: float
 
 
 @dataclass
@@ -66,7 +70,6 @@ class GapTracker:
         self.wait_seconds = wait_seconds
         self._lead = None
         self._lead_text = ""
-        self._language = None
         self._pending = []
         self._voiced = 0.
         self._last_voice = None
@@ -77,7 +80,7 @@ class GapTracker:
         self._voiced = 0.
         self._last_voice = None
 
-    def _request(self, reason):
+    def _request(self, reason, right_context=None):
         if not self._pending:
             return None
         if self._voiced + 1e-8 < min(.10, self.wait_seconds):
@@ -86,37 +89,23 @@ class GapTracker:
             self._reset()
             return None
         packets = ([self._lead] if self._lead else []) + self._pending
+        if right_context is not None:
+            packets.append(right_context)
         audio = np.concatenate([p.pcm for p in packets])
         audio.setflags(write=False)
         first, last = packets[0], packets[-1]
         request = GapRequest(audio, first.start, last.end, first.turn, last.turn,
                              reason, self._lead_text,
-                             self._lead.end if self._lead else first.start, self._eligible)
+                             self._lead.end if self._lead else first.start, self._eligible,
+                             self._pending[0].start, self._pending[-1].end)
         self._eligible = last.end
         self._lead = last.tail(.50)
         self._lead_text = ""
         self._reset()
         return request
 
-    def _direct_tail(self, reason):
-        # A successful DIRECT can cover only the earlier part of the packet.
-        # Probe only at a pause/end, once, when its last 0.5s contained speech.
-        if self._pending or self._lead is None or not self._lead_text:
-            return None
-        packet = self._lead
-        lead_text, self._lead_text = self._lead_text, ""
-        if (packet.end <= self._eligible + 1e-7
-                or _activity(packet.tail(.5).pcm)[0] < .12):
-            return None
-        audio = packet.pcm.copy()
-        audio.setflags(write=False)
-        request = GapRequest(audio, packet.start, packet.end, packet.turn, packet.turn,
-                             reason, lead_text, packet.end, self._eligible)
-        self._eligible = packet.end
-        return request
-
     def finish(self):
-        return self._request("end_of_audio") if self._pending else self._direct_tail("direct_end")
+        return self._request("end_of_audio")
 
     def observe(self, pcm, result):
         if pcm is None:
@@ -127,17 +116,10 @@ class GapTracker:
         packet = _Packet(float(result["start_seconds"]), samples.copy(), result["turn"])
         action = result["action"]
         if action == "DIRECT":
-            spans = result["segments"]
-            new_lang = spans[0]["language"]
-            req = None
-            if self._pending and self._language is not None and new_lang != self._language:
-                # A short voiced WAIT followed by another language may be an insertion.
-                # Retain this packet as right context in case the missing word spans it.
-                self._pending.append(packet)
-                req = self._request("language_change")
-            self._reset()
-            self._language = spans[-1]["language"]
-            self._lead_text = "".join(span["text"] for span in spans)
+            # The next emission may already cover the gap. Give reconciliation
+            # its words and audio even if attribution stayed exactly the same.
+            req = self._request("main_resumed", right_context=packet)
+            self._lead_text = "".join(span["text"] for span in result["segments"])
             self._lead = packet.tail(1.)
             self._eligible = req.end_seconds if req is not None else self._lead.start
             return req
@@ -146,10 +128,9 @@ class GapTracker:
         voiced, voice_end = _activity(samples)
         if not self._pending and not voiced:
             # No speech in this complete packet; do not bridge it with stale PCM.
-            req = self._direct_tail("direct_pause")
             self._lead = packet.tail(.35)
             self._lead_text = ""
-            return req
+            return None
         self._pending.append(packet)
         self._voiced += voiced
         if voice_end:
@@ -261,18 +242,13 @@ def reconcile(request, spans, main_turns=()):
         head = low
         while head < high and units[head].start < request.lead_end_seconds:
             head += 1
-        lead_overlap = _overlap(lead, values[low:head])
-        if request.reason in ("direct_pause", "direct_end"):
-            # This whole interval was possibly transcribed. Never emit a competing
-            # paraphrase or translation for already published text. Accept only
-            # a timed suffix after we locate the published words inside the clip.
-            if not lead_overlap:
-                return []
-            if low + lead_overlap < high:
-                last_known, next_word = units[low + lead_overlap-1:low + lead_overlap+1]
-                if next_word.start < last_known.end - .04:
-                    return []
-        low += lead_overlap
+        overlap = _overlap(lead, values[low:head])
+        low += overlap
+        if not overlap:
+            # A different rendering of the Japanese lead-in, for example, is
+            # not evidence of a missing German word. Keep cross-boundary words.
+            while low < high and units[low].end <= request.wait_start_seconds + 1e-7:
+                low += 1
     before = after = None
     for turn in main_turns:
         n = turn["turn"]
@@ -303,12 +279,15 @@ def reconcile(request, spans, main_turns=()):
             right_match = _overlap(remaining, emitted)
             if right_match >= min_match:
                 high -= right_match
-                if (request.reason == "language_change" and n == request.last_turn
+                if (request.reason == "main_resumed" and n == request.last_turn
                         and low < high and units[high-1].end <= units[high].start + .04):
                     first_index = next(i for tokens, i in segments if tokens)
                     before = n, first_index
         if post_window:
             break  # Only the first subsequent emission can plausibly discharge this gap.
+    # The right-context DIRECT did not request a recovery of its own.
+    while high > low and units[high - 1].start >= request.wait_end_seconds - 1e-7:
+        high -= 1
     pieces = _slice_spans(spans, units, low, high)
     for piece in pieces:
         if before is not None:

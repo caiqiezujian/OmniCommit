@@ -32,13 +32,26 @@ class WhisperGapBackend:
         if not self.model.model.is_multilingual:
             raise ValueError("--gap-asr-model must be multilingual; English-only Whisper cannot recover language switches")
 
+    def speech_ranges(self, pcm):
+        """Return unpadded speech intervals in input samples, on the original time axis."""
+        from faster_whisper.vad import get_speech_timestamps
+
+        pcm = np.asarray(pcm, dtype=np.float32)
+        if pcm.ndim != 1 or not pcm.size or not np.isfinite(pcm).all():
+            raise ValueError("Gap VAD expects nonempty finite mono 16 kHz PCM")
+        # The optional faster-whisper package ships Silero's CPU ONNX weights.
+        # Avoid padding speech across the boundary between a DIRECT and a WAIT.
+        intervals = get_speech_timestamps(pcm, sampling_rate=16000, speech_pad_ms=0,
+                                          min_speech_duration_ms=64, min_silence_duration_ms=96)
+        return [(int(part["start"]), int(part["end"])) for part in intervals]
+
     def transcribe(self, pcm):
-        """Return timed words. The language is Whisper's estimate for the window."""
+        """Return local word timings, transcript text and word confidence."""
         pcm = np.asarray(pcm, dtype=np.float32)
         if pcm.ndim != 1 or not pcm.size or not np.isfinite(pcm).all():
             raise ValueError("Gap ASR expects nonempty finite mono 16 kHz PCM")
         duration = len(pcm) / 16000
-        segments, info = self.model.transcribe(
+        segments, _ = self.model.transcribe(
             pcm, task="transcribe", language=None, condition_on_previous_text=False,
             word_timestamps=True, beam_size=1, temperature=0.0,
         )
@@ -51,6 +64,5 @@ class WhisperGapBackend:
                 start, end = max(0.0, start), min(duration, end)
                 if start < end and word.word.strip():
                     words.append({"text": word.word, "start": start, "end": end,
-                                  "language": info.language, "probability": float(word.probability),
-                                  "language_probability": float(info.language_probability)})
+                                  "probability": float(word.probability)})
         return words

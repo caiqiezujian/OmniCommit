@@ -4,6 +4,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 
+import numpy as np
+
 from omnicommit.runtime_protocol import speaker_registry_text
 from omnicommit.streaming import StreamOptions, StreamSession
 
@@ -37,6 +39,35 @@ class SecondStreamSession(StreamSession):
 
     def forget_recovery(self, segment_id):
         self._recovered_text.pop(segment_id, None)
+
+    def _pending_seconds(self, commit):
+        if self.options.context_policy != "rolling":
+            return super()._pending_seconds(commit)
+        # Source times stay absolute: compacted silence creates holes in the
+        # retained history, even when speech before those holes is still pending.
+        return sum(max(0., t.end - max(commit, t.start)) for t in self.history)
+
+    def _trim(self):
+        super()._trim()
+        options = self.options
+        if options.context_policy != "rolling" or not self.history:
+            return
+        commit = max(self.verified_commit_seconds, self.inferred_commit_seconds)
+        pending = self._pending_seconds(commit)
+        retained = sum(t.end - t.start for t in self.history)
+        cutoff = self.heard_seconds - options.recent_seconds
+        retained_turns = []
+        for turn in self.history:
+            need_space = (retained + options.chunk_seconds > options.max_context_seconds + 1e-8
+                          or pending + options.chunk_seconds > options.max_pending_seconds + 1e-8)
+            if (turn.end <= cutoff or need_space) and turn.reply == WAIT and not np.any(turn.audio):
+                # A literal all-zero input with no text can be omitted without
+                # inferring a speech watermark or discarding an earlier voiced WAIT.
+                retained -= turn.end - turn.start
+                pending -= max(0., turn.end - max(commit, turn.start))
+            else:
+                retained_turns.append(turn)
+        self.history[:] = retained_turns
 
     def _context_system_prompt(self):
         prompt = system_prompt(self.options.number_format)

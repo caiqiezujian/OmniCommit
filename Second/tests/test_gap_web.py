@@ -21,14 +21,20 @@ VOICE = (6000 * np.sin(2 * np.pi * 220 * np.arange(12800) / 16000)).astype("<i2"
 
 
 class GapBackend:
-    def __init__(self, words, hold=False, fail=False):
+    def __init__(self, words, hold=False, fail=False, speech_ranges=None):
         self.words = words
         self.fail = fail
+        self.ranges = speech_ranges
+        self.decodes = 0
         self.release = threading.Event()
         if not hold:
             self.release.set()
 
+    def speech_ranges(self, pcm):
+        return [(0, len(pcm))] if self.ranges is None else self.ranges
+
     def transcribe(self, pcm):
+        self.decodes += 1
         assert self.release.wait(timeout=10)
         if self.fail:
             raise RuntimeError("offline decode failed")
@@ -72,12 +78,14 @@ def test_idle_delivery_and_delayed_primary_replace():
         assert update["type"] == "gap_update"
         recovered, = update["new_segments"]
         assert recovered["origin"] == "recovery" and recovered["model_speaker"] is None
+        assert recovered["language"] is None  # even a backend that supplies an estimate cannot label a gap
         assert recovered["text"].strip() == "Guten Morgen."
         assert packet(ws)["text"] == WAIT
         assert "Guten Morgen." in main.prompt
         late = packet(ws)
         assert late["removed_segment_ids"] == [recovered["segment_id"]]
         assert late["new_segments"][0]["display_speaker"] == "spk2"
+        assert late["new_segments"][0]["language"] == "de"
         ws.send_json({"type": "end"})
         final = ws.receive_json()
         while final["type"] == "gap_update":
@@ -102,3 +110,25 @@ def test_end_drains_short_voiced_wait_even_when_backend_fails(failed):
         else:
             assert result["new_segments"][0]["text"] == "Danke."
             assert result["gap_events"][-1]["status"] == "recovered"
+
+
+def test_noise_during_wait_cannot_trigger_decode_via_speech_in_direct_lead():
+    main = Primary(["<ja><spk1>はい。", WAIT, WAIT, WAIT])
+    # The energy detector sees loud sound throughout. Independent VAD only
+    # finds speech in the preceding Japanese phrase (0.0–0.6).
+    offline = GapBackend([], speech_ranges=[(0, 9600)])
+    with TestClient(app(main, offline)) as client, client.websocket_connect("/stream") as ws:
+        start(ws)
+        assert packet(ws)["new_segments"][0]["language"] == "ja"
+        assert packet(ws)["action"] == "WAIT"
+        row = packet(ws)
+        events = list(row.get("gap_events", []))
+        ws.send_json({"type": "end"})
+        while True:
+            row = ws.receive_json()
+            events.extend(row.get("gap_events", []))
+            assert not row.get("new_segments")
+            if row.get("event") == "end_of_audio":
+                break
+        assert any(e["status"] == "skipped" for e in events)
+        assert not offline.decodes

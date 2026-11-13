@@ -153,7 +153,7 @@ function transcriptLines(segment) {
     // Older browsers: split at sentence punctuation, keeping decimal points and word spacing.
     return lines.flatMap(line => line.match(/.+?(?:[。！？!?؟]+[”’"'」』）)]*\s*|\.+[”’"'」』）)]*(?=\s|$)\s*|$)/gu));
   }
-  const language = segment.language;
+  const language = segment.language || undefined;
   if (!sentenceSegmenters.has(language)) {
     const options = {granularity:'sentence'};
     try {
@@ -185,10 +185,10 @@ function appendTranscript(box, segment, before = null) {
     const row = document.createElement('div');
     row.className = 'segment';
     row.dataset.speaker = segment.display_speaker || '';
-    row.dataset.language = segment.language;
+    row.dataset.language = segment.language || '';
     row.dataset.segmentId = segment.segment_id;
     const heading = document.createElement('strong');
-    heading.textContent = safeName(segment.display_speaker) + ' · ' + segment.language;
+    heading.textContent = safeName(segment.display_speaker) + (segment.language ? ' · ' + segment.language : '');
     if (segment.origin === 'recovery') {
       row.dataset.origin = 'recovery';
       heading.textContent += ' · 补识别';
@@ -201,7 +201,7 @@ function appendTranscript(box, segment, before = null) {
 }
 function transcriptText() {
   const lines = segments.flatMap(s => transcriptLines(s).map(text =>
-    safeName(s.display_speaker) + ' [' + s.language + '] ' + (s.origin === 'recovery' ? '[补识别] ' : '') + text));
+    safeName(s.display_speaker) + (s.language ? ' [' + s.language + ']' : '') + ' ' + (s.origin === 'recovery' ? '[补识别] ' : '') + text));
   if (!lines.length && turnLog.protocol === 'second') return '';
   return lines.join('\n') + '\n';
 }

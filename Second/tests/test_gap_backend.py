@@ -32,15 +32,13 @@ def test_clip_transcription_is_local_and_preserves_timed_word_text(tmp_path, mon
             words = [SimpleNamespace(start=-.02, end=.4, word=" Guten", probability=.9),
                      SimpleNamespace(start=.45, end=.85, word=" Tag!", probability=.95),
                      SimpleNamespace(start=.85, end=.90, word=" bogus", probability=.7)]
-            return iter([SimpleNamespace(words=words)]), SimpleNamespace(language="de", language_probability=.92)
+            return iter([SimpleNamespace(words=words)]), object()
 
     monkeypatch.setitem(sys.modules, "faster_whisper", SimpleNamespace(WhisperModel=Model))
     backend = WhisperGapBackend(local_model(tmp_path))
     assert backend.transcribe(np.ones(12800, dtype=np.float32)) == [
-        {"text": " Guten", "start": 0.0, "end": .4, "probability": .9,
-         "language": "de", "language_probability": .92},
-        {"text": " Tag!", "start": .45, "end": .8, "probability": .95,
-         "language": "de", "language_probability": .92},
+        {"text": " Guten", "start": 0.0, "end": .4, "probability": .9},
+        {"text": " Tag!", "start": .45, "end": .8, "probability": .95},
     ]
 
 
@@ -49,6 +47,25 @@ def test_missing_local_tokenizer_rejected_before_optional_import(tmp_path):
     (tmp_path / "tokenizer.json").unlink()
     with pytest.raises(ValueError, match="tokenizer.json"):
         local_whisper_directory(tmp_path)
+
+
+def test_speech_ranges_check_original_window_without_time_padding(monkeypatch):
+    pcm = np.zeros(32000, dtype=np.float32)
+    intervals = [{"start": 3520, "end": 9600}, {"start": 16000, "end": 24192}]
+
+    def timestamps(audio, *, sampling_rate, speech_pad_ms, min_speech_duration_ms, min_silence_duration_ms):
+        assert audio is pcm
+        assert sampling_rate == 16000 and speech_pad_ms == 0
+        assert min_speech_duration_ms < 100 and min_silence_duration_ms < 200
+        return intervals
+
+    monkeypatch.setitem(sys.modules, "faster_whisper.vad", SimpleNamespace(get_speech_timestamps=timestamps))
+    backend = object.__new__(WhisperGapBackend)
+    assert backend.speech_ranges(pcm) == [(3520, 9600), (16000, 24192)]
+    intervals.clear()
+    assert backend.speech_ranges(pcm) == []
+    with pytest.raises(ValueError, match="mono"):
+        backend.speech_ranges(pcm.reshape(2, -1))
 
 
 def test_english_only_gap_model_is_rejected(tmp_path, monkeypatch):

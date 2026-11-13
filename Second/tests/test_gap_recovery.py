@@ -36,6 +36,8 @@ def test_trigger_once_with_lead_and_absolute_bounds():
     assert (req.first_turn, req.last_turn) == (1, 3)
     assert req.end_seconds == pytest.approx(2.4)
     assert req.lead_end_seconds == pytest.approx(.8)
+    assert req.wait_start_seconds == pytest.approx(.8)
+    assert req.wait_end_seconds == pytest.approx(2.4)
     assert req.audio.shape == (38400,)
     assert not req.audio.flags.writeable
 
@@ -58,7 +60,8 @@ def test_short_insert_between_languages_is_not_masked_by_next_direct():
     assert tracker.observe(voice(), turn(1, "はい", "ja")) is None
     assert tracker.observe(voice(), turn(2)) is None
     req = tracker.observe(voice(), turn(3, "Salut", "fr"))
-    assert req.reason == "language_change"
+    assert req.reason == "main_resumed"
+    assert (req.wait_start_seconds, req.wait_end_seconds) == pytest.approx((.8, 1.6))
     assert req.end_seconds == pytest.approx(2.4)
     assert tracker.finish() is None
 
@@ -129,19 +132,56 @@ def test_delayed_catchup_after_waits_has_bounded_word_and_time_evidence():
     assert reconcile(req, [hyp], [turn(9, hyp["text"])])[0]["text"] == hyp["text"]
 
 
-@pytest.mark.parametrize("pause", [False, True])
-def test_direct_tail_checked_once_at_pause_or_end_with_temporal_anchor(pause):
+def test_silent_wait_after_direct_never_requests_or_repeats_at_end():
     tracker = GapTracker()
     assert tracker.observe(voice(), turn(1, "はい。", "ja")) is None
-    req = tracker.observe(np.zeros(12800), turn(2)) if pause else tracker.finish()
-    assert req.reason == ("direct_pause" if pause else "direct_end")
-    assert req.first_turn == req.last_turn == 1
+    for n in range(2, 35):
+        assert tracker.observe(np.zeros(12800), turn(n)) is None
     assert tracker.finish() is None
-    words = [("はい。", .03, .3), (" Danke.", .48, .78)]
-    assert reconcile(req, [span(words[:1])]) == []
-    assert reconcile(req, [span(words[1:])]) == []
-    assert reconcile(req, [span([words[0], (" Danke.", .06, .70)])]) == []
-    assert reconcile(req, [span(words)])[0]["text"] == " Danke."
+    assert tracker.observe(voice(), turn(35, "はい。", "ja")) is None
+    assert tracker.finish() is None
+
+
+@pytest.mark.parametrize("lead", [False, True])
+def test_resumed_main_checks_voiced_wait_regardless_of_prior_language(lead):
+    tracker = GapTracker()
+    n = 1
+    if lead:
+        tracker.observe(voice(), turn(n, "Eins."))
+        n += 1
+    assert tracker.observe(voice(), turn(n)) is None
+    current = turn(n+1, "Drei.")
+    req = tracker.observe(voice(), current)
+    assert req.reason == "main_resumed"
+    assert (req.wait_start_seconds, req.wait_end_seconds) == pytest.approx(((n-1)*.8, n*.8))
+    base = req.wait_start_seconds
+    recovered = [("Zwei.", base+.05, base+.5), (" Drei.", base+.85, base+1.)]
+    assert reconcile(req, [span(recovered)], [current])[0]["text"] == "Zwei."
+    assert reconcile(req, [span(recovered[1:])], [current]) == []
+    assert tracker.finish() is None
+
+
+def test_unmatched_lead_and_resumed_main_rephrasing_cannot_invent_gap_text():
+    tracker = GapTracker()
+    tracker.observe(voice(), turn(1, "今日は。", "ja"))
+    tracker.observe(voice(), turn(2))
+    current = turn(3, "Bonjour.", "fr")
+    req = tracker.observe(voice(), current)
+    different = [("Today.", .05, .5), (" Guten", .7, .95), (" Morgen.", 1.2, 1.5),
+                 (" Hello.", 1.7, 2.)]
+    kept = reconcile(req, [span(different)], [current])
+    assert [s["text"] for s in kept] == [" Guten Morgen."]
+
+
+def test_silence_flushes_preceding_voiced_wait_once():
+    tracker = GapTracker()
+    tracker.observe(voice(), turn(1, "会議", "ja"))
+    tracker.observe(voice(), turn(2))
+    req = tracker.observe(np.zeros(12800), turn(3))
+    assert req.reason == "pause" and req.wait_start_seconds == pytest.approx(.8)
+    for n in range(4, 8):
+        assert tracker.observe(np.zeros(12800), turn(n)) is None
+    assert tracker.finish() is None
 
 
 def test_do_not_call_on_every_direct_or_when_tail_lacks_speech():
