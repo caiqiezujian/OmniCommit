@@ -44,6 +44,34 @@
 }
 ~~~
 
+### 按语种组合生成最终拼接数据
+
+在完成训练集和验证集的原始录音划分后，对训练部分运行。最终 JSONL 包含原始保留行和新拼接行，可以直接交给下一节的 `build_sft.py`。
+
+~~~bash
+cd /data/yb/Code/OmniCommit/Second
+python -m pip install -r SFT-Scripts/requirements.txt
+python Data-Scripts/augment_codeswitch.py \
+  /data/yb/Code/OmniCommit/datasets/timestamped.jsonl \
+  --audio-dir /data/yb/Code/OmniCommit/datasets/aug01/wavs \
+  --output /data/yb/Code/OmniCommit/datasets/aug01/combined.jsonl \
+  --pair-target 10000 --triple-target 3000 --seed 42
+~~~
+
+- 默认覆盖 ja、ru、ko、it、de、fr、pt、es、en、zh。按**整行恰好出现的语种集合**计数，45 个双语组合各至少 10,000 条，120 个三语组合各至少 3,000 条。正反方向共享配额。A→B→A 计为一条双语记录，A→B→C 只计一次三语。统计包含有效原始行，已达标组合保留原有条数。可通过 `--languages zh en it` 缩小补充范围；其他语种现有记录仍可进入最终文件。
+- 普通拼接使用完整的单语源录音（可以包含多个说话人），包含标注前后的真实音频。A、B 完整拼入同一新样本时，最终文件保留拼接行，移除 A、B 的原始行。短插话只取 C 的一个已标注片段时，保留原始 C；新行仍记录 C 所用区间。不同新样本可以复用同一源，同一次运行将整条供体与短插话供体分开。未使用的有效行仍指向原音频。原始 JSONL 和 WAV 均保留在磁盘上。
+- `pair`、`triple` 生成双语和三语，`short-triple` 在两个完整单语录音中间插入第三语种的一小段。`return`、`short-return` 在 A 内部的语义边界插入 B，返回 A 时复用其说话人编号。短插话默认最多 900 ms，可调 `--short-max-ms`。每个组内轮流补可用场景，并优先选择稀缺语序。各源的编号在新录音内重新分配，原始同人跨语种样本可以自然保留。
+- 每个新接缝默认有 50% 概率直接相接，其余插入 80–400 ms 的零采样静音。用 `--no-gap-prob 1` 全部直接连接，用 `--no-gap-prob 0 --gap-ms 100 250` 为每个新接缝插入 100–250 ms。源录音自带的停顿仍保留。时间戳按实际写入的采样帧重新计算。
+- 相对音频路径基于输入文件所在目录，也可指定 `--audio-root`。索引阶段逐行校验标注。生成器读取抽中的源 WAV，写入 16 kHz 单声道的新 WAV，在日志打印的临时补集逐行记录成功结果。合并完成后只保留最终 JSONL。终端报告 `removed_source_rows`、`partial_source_rows_retained`、`final_by_combination` 和 `missing_by_combination`。缺少可用素材时仍写出已构建结果，列出未达标组合及缺额，退出码为 1。
+- 只需要指定数量的新增拼接行时，显式使用 `--count N`；这一模式写补集。已有补集可以用下面命令合并。请用拼接时的原始 JSONL 和相同的 `--audio-root`。旧格式补集按单条拼接记录里同一源音频的实际帧区间核对，无法确认整条用完时保留原行。
+
+~~~bash
+python Data-Scripts/merge_codeswitch.py \
+  /data/yb/Code/OmniCommit/datasets/timestamped.jsonl \
+  /data/yb/Code/OmniCommit/datasets/aug01/supplement.jsonl \
+  --output /data/yb/Code/OmniCommit/datasets/aug01/combined.jsonl
+~~~
+
 ## 2. 按指定步长重铸
 
 在训练服务器上运行。将示例中的 `timestamped.jsonl` 替换成实际的**逐语义段时间戳**文件。
