@@ -11,8 +11,6 @@
 .log-entry summary{cursor:pointer;font-size:13px;line-height:1.6;overflow-wrap:anywhere}.log-entry{margin:0}
 .log-meta{color:#50647e;font-variant-numeric:tabular-nums;margin-right:8px}.log-output{white-space:pre-wrap;color:#193657}
 .log-entry[data-action="DIRECT"] .log-output{color:#175843}.log-entry pre{margin:6px 0;max-height:none}
-.segment .transcript-piece{display:inline;float:none;white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;color:inherit;background:none;border:0;margin:0;padding:0;border-radius:0;text-align:inherit}
-.transcript-piece:enabled:hover,.transcript-piece:focus-visible{text-decoration:underline;text-underline-offset:3px}.segment .transcript-piece:disabled{opacity:1}
 #chunkSettings{display:flex;align-items:center;gap:6px 10px;flex-wrap:wrap;margin:12px 0}#chunkSettings label{margin:0}#chunkMs{width:7em}
 .file-range{display:flex;gap:12px;flex-wrap:wrap;margin:12px 0}.file-range label{margin:0;flex:1 1 9em}.file-range input{display:block;width:100%;margin-top:4px}
 </style></head><body>
@@ -117,7 +115,7 @@ function identifyService(info) {
     (chunkInput.hidden ? chunkPresets : chunkInput).value = String(acceptedChunkMs);
   }
   $('transcriptHelp').textContent = second
-    ? '同一说话人和语种的正文连续显示。点击要修正的文字可以更改该片段的说话人。'
+    ? '每次提交的正文另起一行，多句分行显示。修正说话人会更新该行所属的整个原始片段。'
     : firstTranscriptHelp;
   turnLog.protocol = info.protocol;
   if (!turnLog.current.all.length) turnLog.current.protocol = info.protocol;
@@ -143,50 +141,44 @@ function correctionButton(segment, label) {
   };
   return button;
 }
-function transcriptGroup(segment) {
-  const group = document.createElement('div');
-  group.className = 'segment';
-  group.dataset.speaker = segment.display_speaker;
-  group.dataset.language = segment.language;
-  const heading = document.createElement('strong');
-  heading.textContent = safeName(segment.display_speaker) + ' · ' + segment.language;
-  group.append(heading);
-  return group;
+const sentenceSegmenters = new Map();
+function transcriptLines(segment) {
+  if (turnLog.protocol !== 'second') return [segment.text];
+  const lines = segment.text.split(/\r\n|[\r\n\u2028\u2029]/u).filter(line => line.trim());
+  if (typeof Intl.Segmenter !== 'function') {
+    // Older browsers: split at sentence punctuation, keeping decimal points and word spacing.
+    return lines.flatMap(line => line.match(/.+?(?:[。！？!?؟]+[”’"'」』）)]*\s*|\.+[”’"'」』）)]*(?=\s|$)\s*|$)/gu));
+  }
+  const language = segment.language;
+  if (!sentenceSegmenters.has(language)) {
+    const options = {granularity:'sentence'};
+    try {
+      sentenceSegmenters.set(language, new Intl.Segmenter(language, options));
+    } catch (error) {
+      if (!(error instanceof RangeError)) throw error;
+      sentenceSegmenters.set(language, new Intl.Segmenter(undefined, options));
+    }
+  }
+  const segmenter = sentenceSegmenters.get(language);
+  return lines.flatMap(line => Array.from(segmenter.segment(line), sentence => sentence.segment));
 }
 function appendTranscript(box, segment) {
-  if (turnLog.protocol !== 'second') {
-    const row = transcriptGroup(segment);
-    row.append(correctionButton(segment, '修正说话人'), document.createTextNode(segment.text));
+  for (const text of transcriptLines(segment)) {
+    const row = document.createElement('div');
+    row.className = 'segment';
+    row.dataset.speaker = segment.display_speaker;
+    row.dataset.language = segment.language;
+    row.dataset.segmentId = segment.segment_id;
+    const heading = document.createElement('strong');
+    heading.textContent = safeName(segment.display_speaker) + ' · ' + segment.language;
+    row.append(heading, correctionButton(segment, '修正说话人'), document.createTextNode(text));
     box.append(row);
-    return;
   }
-  let group = box.children[box.children.length - 1];
-  if (!group || group.dataset.speaker !== segment.display_speaker || group.dataset.language !== segment.language) {
-    group = transcriptGroup(segment);
-    box.append(group);
-  }
-  const piece = correctionButton(segment, segment.text);
-  piece.className = 'transcript-piece';
-  piece.dataset.segmentId = segment.segment_id;
-  piece.title = '修正第 ' + segment.segment_id + ' 段的说话人';
-  group.append(piece);
 }
 function transcriptText() {
-  if (turnLog.protocol !== 'second') {
-    return segments.map(s => safeName(s.display_speaker) + ' [' + s.language + '] ' + s.text).join('\n') + '\n';
-  }
-  const pieces = [];
-  let previous;
-  for (const segment of segments) {
-    if (!previous || previous.display_speaker !== segment.display_speaker || previous.language !== segment.language) {
-      if (previous) pieces.push('\n');
-      pieces.push(safeName(segment.display_speaker) + ' [' + segment.language + '] ');
-    }
-    pieces.push(segment.text);
-    previous = segment;
-  }
-  if (pieces.length) pieces.push('\n');
-  return pieces.join('');
+  const lines = segments.flatMap(s => transcriptLines(s).map(text => safeName(s.display_speaker) + ' [' + s.language + '] ' + text));
+  if (!lines.length && turnLog.protocol === 'second') return '';
+  return lines.join('\n') + '\n';
 }
 function renderSpeakers(){const list=$('speakerList');list.replaceChildren();for(const s of speakers){const chip=document.createElement('span');chip.className='speaker';chip.textContent=s.speaker+(s.name?' · '+s.name:'');list.append(chip);}}function render(snapshot){if(snapshot){segments=snapshot.segments||segments;speakers=snapshot.speakers||speakers;aliases=snapshot.aliases||aliases;}const box=$('transcript');box.replaceChildren();for(const s of segments)appendTranscript(box, s);renderSpeakers();}
 function transmit(){if(!socket||socket.readyState!==1||busy)return;if(controlQueue.length){busy=true;socket.send(JSON.stringify({type:'control',...controlQueue.shift()}));return;}if(queue.length){busy=true;socket.send(queue.shift());return;}if(mode==='file'&&!ending){pollFile();return;}if(ending&&!ended){ended=true;busy=true;socket.send(JSON.stringify({type:'end'}));}}

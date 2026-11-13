@@ -171,8 +171,7 @@ assert.match(elements.get('logProgress').textContent,/60\.0 秒（zh · spk1）.
 assert.equal(elements.get('logError').hidden,false);
 assert.match(elements.get('logError').textContent,/61\.0 秒.*Context audio budget exhausted/);
 
-// Second uses the same transport metadata for UI grouping; the visible log and
-// downloaded session must preserve the sparse model text, including its spaces.
+// Logging and downloading a Second session preserves its sparse model text and spaces.
 vm.runInContext(`
   turnLog.start('system');
   log({type:'ready',protocol:'second',chunk_seconds:.7});
@@ -191,31 +190,52 @@ assert.equal(JSON.parse(downloads.at(-1).body.trimEnd().split('\n').at(-1)).text
 vm.runInContext(`
   finished=true; ending=true; busy=false; socket=null;
   speakers=[{speaker:'spk1',name:'甲'},{speaker:'spk2',name:'乙'}];
-  segments=[{segment_id:1,display_speaker:'spk1',language:'en',text:'Yes.'}];
+  segments=[{segment_id:1,display_speaker:'spk1',language:'en',text:'The total is'}];
   render();
 `,context);
 const transcript = elements.get('transcript');
-const firstGroup = transcript.children[0], firstPiece = firstGroup.children[1];
+const firstRow = transcript.children[0];
 vm.runInContext(`
   for (const seg of [
-    {segment_id:2,display_speaker:'spk1',language:'en',text:' I will.'},
-    {segment_id:3,display_speaker:'spk1',language:'zh',text:'可以。'},
-    {segment_id:4,display_speaker:'spk2',language:'zh',text:'好。'}]) {
+    {segment_id:2,display_speaker:'spk1',language:'en',text:' 3.14. Next step?'},
+    {segment_id:3,display_speaker:'spk1',language:'zh',text:'可以。继续吗？'},
+    {segment_id:4,display_speaker:'spk2',language:'zh',text:'上半句\\r\\n下半句'}]) {
     segments.push(seg);
     appendTranscript($('transcript'), seg);
   }
 `,context);
-assert.equal(transcript.children.length,3);
-assert.equal(transcript.children[0],firstGroup);
-assert.equal(firstGroup.children[1],firstPiece);
-assert.equal(firstGroup.children.slice(1).map(e=>e.textContent).join(''),'Yes. I will.');
-assert.equal(firstGroup.children[2].dataset.segmentId,2);
-assert.equal(vm.runInContext('transcriptText()',context),'甲 [en] Yes. I will.\n甲 [zh] 可以。\n乙 [zh] 好。\n');
+const visibleBodies = () => transcript.children.map(row => row.children.at(-1));
+const displayedTxt = () => transcript.children.map(row => {
+  const [speaker, language] = row.children[0].textContent.split(' · ');
+  return speaker + ' [' + language + '] ' + row.children.at(-1);
+}).join('\n') + '\n';
+assert.equal(transcript.children[0],firstRow, 'appending new transcript must retain existing DOM');
+assert.equal(transcript.children.length,7, 'each commit, sentence boundary and hard break starts a row');
+assert.deepEqual(visibleBodies().map(s => s.trim()), [
+  'The total is', '3.14.', 'Next step?', '可以。', '继续吗？', '上半句', '下半句'
+]);
+assert.equal(visibleBodies().slice(1,3).join(''), ' 3.14. Next step?');
+assert.equal(vm.runInContext('transcriptText()',context), displayedTxt());
+vm.runInContext("download=saveLog; $('exportTxt').onclick(); $('exportJson').onclick()", context);
+assert.equal(downloads.at(-2).body, displayedTxt());
+assert.deepEqual(JSON.parse(downloads.at(-1).body).segments.map(s => s.text),
+  ['The total is',' 3.14. Next step?','可以。继续吗？','上半句\r\n下半句']);
 context.prompt=()=> 'spk2';
-firstGroup.children[2].onclick();
+transcript.children[2].children[1].onclick();  // Second sentence within original segment 2.
 assert.equal(vm.runInContext('segments[1].display_speaker',context),'spk2');
+assert.deepEqual(transcript.children.map(row => row.children[0].textContent), [
+  '甲 · en', '乙 · en', '乙 · en', '甲 · zh', '甲 · zh', '乙 · zh', '乙 · zh'
+]);
+assert.equal(vm.runInContext('transcriptText()',context), displayedTxt());
+// Some server clients use older browsers without a built-in sentence segmenter.
+const segmentedBodies = visibleBodies();
+vm.runInContext('const nativeSegmenter=Intl.Segmenter; Intl.Segmenter=undefined; render()', context);
+assert.deepEqual(visibleBodies(), segmentedBodies);
+vm.runInContext('Intl.Segmenter=nativeSegmenter', context);
+// The original protocol keeps one row per segment even if that segment has multiple sentences.
+vm.runInContext("turnLog.protocol='first';render()", context);
 assert.equal(transcript.children.length,4);
-assert.equal(vm.runInContext('transcriptText()',context),'甲 [en] Yes.\n乙 [en]  I will.\n甲 [zh] 可以。\n乙 [zh] 好。\n');
+assert.equal(visibleBodies()[1], ' 3.14. Next step?');
 
 // Start via the actual page handler. Stub only the browser capture/upload
 // devices and transport so lock timing and the real JSON handshake are covered.
@@ -348,7 +368,8 @@ for (const protocol of ['first', 'second']) {
   vm.runInContext('pollFile()',context);
   assert.deepEqual(last(ws), {type:'file_next', release_seconds:58.625});
   await frame(ws, {type:'result',event:'audio',turn:1,action:'WAIT',text:'<|WAIT|>',
-    start_seconds:0,end_seconds:.5,source_start_seconds:58.125,source_end_seconds:58.625});
+    new_segments:[],start_seconds:0,end_seconds:.5,source_start_seconds:58.125,source_end_seconds:58.625});
+  assert.equal(transcript.children.length,0, 'WAIT should be logged without a transcript row');
   assert.match(elements.get('processed').textContent, /已处理：0.5 秒 · 原文件 58.63 秒/);
   assert.match(elements.get('pending').textContent, /0.0 秒/);
   assert.match(vm.runInContext("logHeading(turnLog.current.model[0])",context), /原文件 58.125–58.625 s/);
