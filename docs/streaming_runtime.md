@@ -64,6 +64,21 @@ python tools/compare_stream_traces.py \
 
 每份日志的 `ready.enable_prefix_caching` 记录引擎初始化后的实际设置：HF 为 `null`，vLLM 默认开启。开关只控制跨请求的 KV 前缀复用，三个实验都保留流式会话的历史音频和先前回复。比较脚本逐对报告最早出现差异的轮次、音频区间和原始回复。优先看两份 vLLM 日志；首次分歧之后，先前输出也已不同，后面的差异可能来自各自累积的历史。HF 同时更换了推理后端，适合作为独立参照。
 
+### 单独从德语起点重跑，同原录音逐轮对照
+
+已知德语在原录音的 58.0–96.0 秒时，可直接复用上述三份全程 JSONL。以下命令从它们的 `ready` 记录读取原音视频和模型路径、500 ms 步长、精度、上下文预算和缓存设置。请使用上次的 GPU 和推理环境。旧日志未记录的 HF attention 和 vLLM 张量并行等引擎选项使用诊断脚本的默认值。
+
+```bash
+cd /data/yb/Code/OmniCommit
+CUDA_VISIBLE_DEVICES=0 python3 tools/diagnose_switch_segment.py outputs/ja-de.500ms \
+  --start-seconds 58 --end-seconds 96 --language de \
+  --output-dir outputs/ja-de.58-96.500ms
+```
+
+脚本复用原录音的音频块生成 `clip.wav`，再分别启动 HF、vLLM 开前缀缓存和关前缀缓存三个独立进程。边界须落在原步长的网格上。58–96 秒共有 76 块，片段第 1 块对应原录音第 117 块，首轮结束于 58.5 秒。每路日志即时写入输出目录。若某一路遇到待确认音频超限，另外两路会继续运行。
+
+查看 `comparison.txt`，比较同一后端在全程和仅德语条件下的首次出字、首次显式输出 `<de>` 的时刻及其原文。结束事件单列。首次提交 `<de>` 衡量标签响应时间，正文准确性请结合 `clip.wav` 判断。新会话可以重新编号说话人。
+
 ## 1. 环境与离线真实模型测试
 
 在已用于 FLEX 的推理环境执行；不要用这些命令升级 torch/CUDA。
