@@ -13,13 +13,13 @@ from pathlib import Path
 import numpy as np
 
 from .audio_token_counter import AudioTokenCounter
-from .inference_backend import multimodal_messages, validate_token_manifest
+from .inference_backend import AssistantPrefixDecoder, multimodal_messages, validate_token_manifest
 from .streaming import ContextBudgetError, WAIT
 
 AUDIO_PLACEHOLDER = "<|audio_start|><|audio_pad|><|audio_end|>"
 
 
-class VLLMBackend:
+class VLLMBackend(AssistantPrefixDecoder):
     def __init__(self, model_path, *, max_context_tokens=4096, max_new_tokens=256,
                  tensor_parallel_size=1, gpu_memory_utilization=.85,
                  max_audio_turns=80, max_audio_seconds=5.0,
@@ -89,7 +89,7 @@ class VLLMBackend:
             raise RuntimeError("Audio preprocessor modified non-audio tokens")
         return len(expanded)-len(self.audio_turn)
 
-    def generate(self, messages, audios):
+    def _generate(self, messages, audios, prefix):
         if sum(m["content"].count("<audio>") for m in messages) != len(audios):
             raise ValueError("Audio placeholders and waveform count disagree")
         max_frames = round(self.max_audio_seconds * 16000)
@@ -97,7 +97,7 @@ class VLLMBackend:
             raise ContextBudgetError("Audio count/length exceeds configured vLLM capacity")
         prompt = self.tokenizer.apply_chat_template(multimodal_messages(messages),
                             tokenize=False, add_generation_prompt=True)
-        ids = self._encode(prompt)
+        ids = self._encode(prompt + prefix)
         extra = sum(self.audio_counter.count(a,self._exact_audio_expansion)[0] for a in audios)
         expected = len(ids)+extra
         if expected+self.max_new_tokens>self.max_context_tokens:

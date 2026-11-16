@@ -1,27 +1,51 @@
 """Load a merged Third checkpoint with its training-time tokenizer."""
-from .protocol import EOS, WAIT
+import json
+from pathlib import Path
+
+from .protocol import DIRECT, EOS, WAIT, protocol_for_tokens
 
 
-def _metadata():
+def _metadata(name):
+    if name == "explicit":
+        return {"schema_version": 4, "protocol": {
+            "name": "omnicommit_third_explicit", "wait": WAIT, "direct": DIRECT, "end_of_audio": EOS}}
     return {"schema_version": 3, "protocol": {
         "name": "omnicommit_third", "wait": WAIT, "end_of_audio": EOS}}
 
 
 def read_export_protocol(tokens_file):
-    tokens = tokens_file.read_text(encoding="utf-8-sig").splitlines()
-    if tokens != [WAIT]:
-        raise ValueError("Third tokens.txt must contain exactly <|WAIT|>")
-    return tokens, _metadata()
+    tokens = Path(tokens_file).read_text(encoding="utf-8-sig").splitlines()
+    profile = protocol_for_tokens(tokens)
+    return tokens, _metadata(profile.name)
+
+
+def _manifest_mode(manifest):
+    if isinstance(manifest, dict) and isinstance(manifest.get("tokens"), list):
+        profile = protocol_for_tokens(manifest["tokens"])
+        if all(manifest.get(k) == v for k, v in _metadata(profile.name).items()):
+            return profile.name
+    raise ValueError("Expected a Third export from Third/SFT-Scripts/merge_lora.sh")
+
+
+def detect_model_protocol(model_dir):
+    """Read protocol metadata before allocating GPU memory; the backend verifies token IDs on load."""
+    path = Path(model_dir) / "omnicommit_tokens.json"
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"Cannot read Third export manifest {path}: {exc}") from exc
+    return _manifest_mode(manifest)
 
 
 def validate_manifest(tokenizer, manifest):
     from omnicommit.inference_backend import validate_manifest_token_ids
-    if (not isinstance(manifest, dict) or manifest.get("tokens") != [WAIT]
-            or any(manifest.get(k) != v for k, v in _metadata().items())):
-        raise ValueError("Expected a Third export from Third/SFT-Scripts/merge_lora.sh")
+    _manifest_mode(manifest)
     return validate_manifest_token_ids(tokenizer, manifest)
 
 
 def build_backend(args):
     from omnicommit.stream_cli import build_backend as load_backend
-    return load_backend(args, manifest_validator=validate_manifest)
+    options = {}
+    if getattr(args, "protocol", None) == "explicit" and getattr(args, "enable_recovery", False):
+        options["max_audio_item_seconds"] = args.recovery_window_seconds
+    return load_backend(args, manifest_validator=validate_manifest, **options)

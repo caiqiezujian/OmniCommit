@@ -10,6 +10,7 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 THIRD = REPO / "Third"
 WAIT = "<|WAIT|>"
+DIRECT = "<|DIRECT|>"
 
 
 def run_script(script, *args):
@@ -18,7 +19,8 @@ def run_script(script, *args):
 
 
 @pytest.mark.parametrize("number_format", ["normalized", "verbatim"])
-def test_existing_second_dataset_matches_third_recast(tmp_path, number_format):
+@pytest.mark.parametrize("protocol", ["plain", "explicit"])
+def test_existing_second_dataset_matches_third_recast(tmp_path, number_format, protocol):
     wav = tmp_path / "talk.wav"
     with wave.open(str(wav), "wb") as f:
         f.setparams((1, 2, 16000, 51200, "NONE", ""))
@@ -34,9 +36,10 @@ def test_existing_second_dataset_matches_third_recast(tmp_path, number_format):
     timed = tmp_path / "timed.jsonl"
     timed.write_text(json.dumps(record) + "\n", encoding="utf-8")
     for name in ("Second", "Third"):
+        protocol_args = ["--protocol", "plain"] if name == "Third" and protocol == "plain" else []
         result = run_script(REPO / name / "Data-Scripts" / "build_sft.py", timed,
                             "--chunk-ms", 800, "--output-dir", tmp_path / name,
-                            "--number-format", number_format)
+                            "--number-format", number_format, *protocol_args)
         assert result.returncode == 0, result.stderr
     name = "train.800ms.jsonl"
     sample = (tmp_path / "Second" / name).read_text(encoding="utf-8")
@@ -45,12 +48,21 @@ def test_existing_second_dataset_matches_third_recast(tmp_path, number_format):
     source.write_text("{invalid\n" + sample, encoding="utf-8")
     output = tmp_path / "converted" / name
     convert = THIRD / "Data-Scripts" / "from_second_sft.py"
-    command = run_script(convert, source, "--output", output)
+    protocol_args = ["--protocol", "plain"] if protocol == "plain" else []
+    command = run_script(convert, source, "--output", output, *protocol_args)
     assert command.returncode == 0, command.stderr
     converted = json.loads(output.read_text(encoding="utf-8"))
     assert converted == json.loads((tmp_path / "Third" / name).read_text(encoding="utf-8"))
     replies = [m["content"] for m in converted["messages"] if m["role"] == "assistant"]
-    assert replies == [WAIT, "开始。Let's", " meet", "，好的。\n", WAIT]
-    assert output.with_suffix(".jsonl.tokens.txt").read_text(encoding="utf-8").splitlines() == [WAIT]
+    prefix = DIRECT if protocol == "explicit" else ""
+    inventory = [WAIT, DIRECT] if protocol == "explicit" else [WAIT]
+    assert replies == [WAIT, prefix + "开始。Let's", prefix + " meet", prefix + "，好的。\n", WAIT]
+    assert output.with_suffix(".jsonl.tokens.txt").read_text(encoding="utf-8").splitlines() == inventory
     assert json.loads(output.with_suffix(".jsonl.rejected.jsonl").read_text(encoding="utf-8"))["line"] == 1
     assert run_script(convert, source, "--output", output).returncode != 0
+    if protocol == "explicit":
+        plain = tmp_path / "old-third.jsonl"
+        upgraded = tmp_path / "upgraded.jsonl"
+        assert run_script(convert, source, "--protocol", "plain", "--output", plain).returncode == 0
+        assert run_script(convert, plain, "--output", upgraded).returncode == 0
+        assert upgraded.read_bytes() == output.read_bytes()

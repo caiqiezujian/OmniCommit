@@ -9,11 +9,11 @@ sys.path.insert(0, str(ROOT / "Second"))
 sys.path.insert(0, str(ROOT / "Third"))
 
 from second_asr.dataset import main as build_dataset
-from third_asr import protocol
+from third_asr.protocol import PROTOCOLS, get_protocol
 
 
 def main(argv=None):
-    return build_dataset(argv, protocol=protocol, default_chunk_ms=800)
+    return build_dataset(argv, protocol=get_protocol("explicit"), default_chunk_ms=800, protocol_choices=PROTOCOLS)
 
 
 if __name__ == "__main__":

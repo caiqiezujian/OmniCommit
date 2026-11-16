@@ -344,3 +344,8 @@ class ReplayBackend:
     def generate(self, messages, audios):
         return {"text": next(self.replies) if self.replies is not None else WAIT,
                 "prompt_tokens": None}
+
+    def generate_with_prefix(self, messages, audios, prefix):
+        # Each scripted entry represents one entire backend response, including
+        # the supplied prefix for a successful recovery.
+        return self.generate(messages, audios)

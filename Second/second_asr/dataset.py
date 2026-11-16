@@ -10,7 +10,7 @@ from pathlib import Path
 import soundfile as sf
 
 from . import protocol as second_protocol
-from .protocol import WAIT, sort_tokens
+from .protocol import WAIT
 from .recast import build_sft_row, validate_chunk_ms
 from .source import parse_record
 
@@ -47,7 +47,7 @@ def prepare_record(record, audio_root, steps, number_format, release_on="semanti
     return result, tokens, longest_gap
 
 
-def main(argv=None, *, protocol=second_protocol, default_chunk_ms=500):
+def main(argv=None, *, protocol=second_protocol, default_chunk_ms=500, protocol_choices=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", type=Path, help="Source JSONL with per-unit timestamps in ms")
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -56,7 +56,12 @@ def main(argv=None, *, protocol=second_protocol, default_chunk_ms=500):
     parser.add_argument("--release-on", choices=("semantic-unit", "timed-span"), default="semantic-unit",
                         help="Commit at semantic segment ends or at each validated sub-span end when available")
     parser.add_argument("--number-format", choices=["normalized", "verbatim"], default="normalized")
+    if protocol_choices is not None:
+        parser.add_argument("--protocol", choices=tuple(protocol_choices), default=protocol.name,
+                            help="Training output format (default: %(default)s)")
     args = parser.parse_args(argv)
+    if protocol_choices is not None:
+        protocol = protocol_choices[args.protocol]
     steps = args.chunk_ms
     try:
         for step in steps:
@@ -79,7 +84,7 @@ def main(argv=None, *, protocol=second_protocol, default_chunk_ms=500):
 
     kept = bad = 0
     longest_gap = None
-    inventory = {WAIT}
+    inventory = protocol.training_tokens(())
     counts = {step: {"audio_turns": 0, "wait_audio_turns": 0} for step in steps}
     with args.input.open("rb") as source, ExitStack() as stack:
         writers = {step: stack.enter_context(path.open("xb")) for step, path in paths.items()}
@@ -113,10 +118,12 @@ def main(argv=None, *, protocol=second_protocol, default_chunk_ms=500):
                 print(f"Rows {line_number} | kept {kept} | rejected {bad}", file=sys.stderr, flush=True)
         for path in tokens_files:
             with path.open("x", encoding="utf-8", newline="\n") as handle:
-                handle.write("".join(t + "\n" for t in sort_tokens(inventory)))
+                handle.write("".join(t + "\n" for t in protocol.sort_tokens(inventory)))
         report = {"input": str(args.input.resolve()), "number_format": args.number_format, "release_on": args.release_on,
                   "kept": kept, "rejected": bad, "chunk_ms": steps, "by_chunk_ms": counts,
                   "longest_unannotated_gap": longest_gap}
+        if protocol_choices is not None:
+            report["protocol"] = protocol.name
         with summary.open("x", encoding="utf-8", newline="\n") as handle:
             json.dump(report, handle, ensure_ascii=False, indent=2)
             handle.write("\n")

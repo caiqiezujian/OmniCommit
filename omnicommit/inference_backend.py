@@ -58,7 +58,19 @@ def multimodal_messages(messages):
     return result
 
 
-class HFBackend:
+class AssistantPrefixDecoder:
+    def generate(self, messages, audios):
+        return self._generate(messages, audios, "")
+
+    def generate_with_prefix(self, messages, audios, prefix):
+        """Continue one assistant turn after the trained action token."""
+        if prefix != "<|DIRECT|>" or prefix not in self.allowed_tokens:
+            raise ValueError("Forced decoding requires a trained DIRECT token")
+        result = self._generate(messages, audios, prefix)
+        return {**result, "text": prefix + result["text"]}
+
+
+class HFBackend(AssistantPrefixDecoder):
     def __init__(self, model_path, *, max_context_tokens=4096, max_new_tokens=256,
                  device_map="auto", dtype="auto", attn_implementation="sdpa",
                  manifest_validator=validate_token_manifest):
@@ -95,12 +107,12 @@ class HFBackend:
         if not self.stop_ids:
             raise ValueError("Missing trained chat EOS tokens")
 
-    def generate(self, messages, audios):
+    def _generate(self, messages, audios, prefix):
         if sum(m["content"].count("<audio>") for m in messages) != len(audios):
             raise ValueError("Audio placeholders and waveforms disagree")
         prompt = self.processor.apply_chat_template(multimodal_messages(messages),
                     tokenize=False, add_generation_prompt=True)
-        inputs = self.processor(text=prompt, audio=audios or None, sampling_rate=16000,
+        inputs = self.processor(text=prompt + prefix, audio=audios or None, sampling_rate=16000,
                                 return_tensors="pt", padding=True)
         count = int(inputs["input_ids"].shape[-1])
         if count + self.max_new_tokens > self.max_context_tokens:

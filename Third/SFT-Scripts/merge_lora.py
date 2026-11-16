@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export a Third PEFT checkpoint and verify its trained WAIT row for serving."""
+"""Export a Third PEFT checkpoint and verify each trained action-token row."""
 from pathlib import Path
 import runpy
 import sys

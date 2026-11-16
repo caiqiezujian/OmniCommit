@@ -45,16 +45,17 @@ function showResult(result) {
   events.push(result);
   $("saveLog").disabled = false;
   if (result.action === "DIRECT") {
-    transcript.push(result.text);
+    const text = result.display_text;
+    transcript.push(text);
     const box = $("words");
     const follow = box.scrollHeight - box.scrollTop - box.clientHeight < 32;
-    box.append(document.createTextNode(result.text));
+    box.append(document.createTextNode(text));
     if (follow) box.scrollTop = box.scrollHeight;
     $("saveText").disabled = false;
   }
   const li = document.createElement("li");
   li.textContent = (result.event === "end_of_audio" ? "音频结束" : result.end_seconds.toFixed(2) + " s") +
-    "  " + result.text;
+    "  " + result.text + (result.recovery ? "  [补识别：" + result.recovery.status + "]" : "");
   $("turns").prepend(li);
   if ($("turns").children.length > 60) $("turns").lastElementChild.remove();
   $("heard").textContent = result.end_seconds.toFixed(1) + " s";
@@ -277,7 +278,8 @@ $("start").onclick = async () => {
 fetch("/health").then(r => r.json()).then(info => {
   if (!info.ready || info.protocol !== "third") throw Error("Third 服务尚未就绪");
   health = info;
-  $("health").textContent = "模型在线 · " + info.backend;
+  $("health").textContent = [info.backend, info.action_protocol === "explicit" ? "显式动作" : "纯正文",
+    info.gap_recovery ? "有声等待补识别已开启" : "补识别已关闭"].join(" · ");
   $("step").textContent = Math.round(info.chunk_seconds * 1000) + " ms";
   $("start").disabled = false;
 }).catch(error => { $("health").textContent = error.message; });

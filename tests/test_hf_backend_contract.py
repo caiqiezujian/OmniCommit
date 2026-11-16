@@ -105,6 +105,21 @@ def test_direct_keeps_tags_and_removes_only_chat_eos(backend):
     assert output["text"] == "<|DIRECT|><en><spk1>text"
 
 
+def test_direct_prefill_continues_the_current_assistant_turn(backend):
+    model, state = backend
+    messages = [{"role": "user", "content": "<audio>"}]
+    audio = [np.zeros(8000)]
+    state.generated = [40, 14]
+    assert model.generate_with_prefix(messages, audio, "<|DIRECT|>")["text"] == "<|DIRECT|>text"
+    assert state.processor_kwargs["text"].endswith("<|im_start|>assistant\n<|DIRECT|>")
+    assert len(state.last_messages) == 1
+    assert model.generate(messages, audio)["text"] == "text"
+    assert state.processor_kwargs["text"].endswith("<|im_start|>assistant\n")
+    model.allowed_tokens = {"<|WAIT|>"}
+    with pytest.raises(ValueError, match="trained DIRECT"):
+        model.generate_with_prefix(messages, audio, "<|DIRECT|>")
+
+
 def test_context_counts_expanded_processor_tokens_and_never_truncates(backend):
     model, state = backend
     state.prompt_length = 25

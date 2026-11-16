@@ -28,7 +28,8 @@ def create_app(backend_factory, options, *, max_sessions=1,
                auto_reference_factory=None, session_factory=StreamSession,
                media_cursor_factory=MediaCursor,
                protocol_name="first", chunk_ms_choices=LIVE_CHUNK_MS, gap_service_factory=None,
-               web_directory=None, allowed_controls=None):
+               web_directory=None, allowed_controls=None,
+               protocol_settings=None):
     from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
     from fastapi.responses import FileResponse, JSONResponse
     from fastapi.staticfiles import StaticFiles
@@ -96,7 +97,8 @@ def create_app(backend_factory, options, *, max_sessions=1,
                 "native_prefix_caching": getattr(backend, "enable_prefix_caching", False),
                 "native_mm_processor_cache": getattr(backend, "mm_processor_cache_gb", 0) > 0,
                 "manual_kv_reuse": False, "file_input": bool(shutil.which("ffmpeg")),
-                "automatic_reference": "experimental_qwen" if reference_provider is not None else "disabled"}
+                "automatic_reference": "experimental_qwen" if reference_provider is not None else "disabled",
+                **(protocol_settings or {})}
 
     async def upload_media(request):
         origin = request.headers.get("origin")
@@ -206,7 +208,8 @@ def create_app(backend_factory, options, *, max_sessions=1,
                 "context_policy": session_options.context_policy, "backend": type(backend).__name__,
                 "warning": "Rolling mode is an unverified tail heuristic" if session_options.context_policy == "rolling" else "Verified watermarks required before safe context eviction",
                 "automatic_reference": "experimental_qwen" if reference_provider is not None else "disabled",
-                "auto_reference": "experimental_qwen" if reference_provider is not None else "disabled"})
+                "auto_reference": "experimental_qwen" if reference_provider is not None else "disabled",
+                **(protocol_settings or {})})
             while True:
                 # A user may pause file playback for longer than two minutes.
                 # Live capture keeps an inactivity limit; files wait for an

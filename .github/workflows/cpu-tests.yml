@@ -8,12 +8,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install -r requirements-dev.txt
+      - run: pip install -r requirements-dev.txt -r Third/requirements-web.txt
       - name: OmniCommit tests
         run: python -m pytest -q
       - name: Second streaming ASR tests
         run: python -m pytest -q Second/tests
-      - name: Third plain transcript ASR tests
+      - name: Third streaming ASR protocol and recovery tests
         run: python -m pytest -q Third/tests
       - name: Meeting page and transcript export
         run: node tests/test_web_ui_contract.mjs

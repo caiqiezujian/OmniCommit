@@ -1,6 +1,6 @@
 # Third · 多语种流式原文转录
 
-Third 每轮接收一块新音频。能提交正文时，assistant 直接输出原语言的新增文字；没有新增正文时输出独立的 `<|WAIT|>`。一轮可提交多种语言，相邻轮次可以连续出正文。音频结束后，user 发送 `<end_of_audio>`，assistant 回复 `<|WAIT|>`。训练额外注册一个特殊 token：`<|WAIT|>`。
+Third 每轮接收一块新音频。默认 `explicit` 模式把 assistant 的两种回复训练为 `<|DIRECT|>新增原文` 和独立的 `<|WAIT|>`。同一轮可以提交两种语言的正文，相邻轮次也可以连续提交。语种或说话人变化时仍按文字的时间戳提交。音频结束后 user 发送 `<end_of_audio>`，assistant 回复 `<|WAIT|>`。
 
 从 Third 目录运行以下命令。原始语种、说话人和时间戳继续保存在源数据里，供检查语种切换和漏词时使用。最终训练 JSONL 只含 `audios` 和 `messages`，其中 `audios` 是指向原录音区间的虚拟引用；训练容器须能访问引用中的音频绝对路径。
 
@@ -10,15 +10,16 @@ cd /data/yb/Code/OmniCommit/Third
 
 ## 1. 生成训练数据
 
-**已有 Second 的 800 ms SFT 文件时，优先直接转换。** 这个入口逐条校验并转换 Second 消息，每个音频引用、已有 WAIT 的位置、原语言正文和词间空格都保留。无需原 WAV 在线，也无需再跑 CTC。
+**已有 Second 或旧 Third 纯正文 SFT 时，直接转换现成的训练文件。** 脚本根据每行的 system 指令识别输入协议，按原位置给有正文的轮次加上动作 token。转换保留每个音频引用、原有 WAIT、逐轮正文和接续空格，运行时无需读取原 WAV 或重跑 CTC。
 
 ~~~bash
 python Data-Scripts/from_second_sft.py \
   /data/yb/Code/OmniCommit/datasets/second_run_001/train.800ms.jsonl \
-  --output /data/yb/Code/OmniCommit/datasets/third_run_001/train.800ms.jsonl
+  --protocol explicit \
+  --output /data/yb/Code/OmniCommit/datasets/third_explicit_001/train.800ms.jsonl
 ~~~
 
-输出旁的 `.tokens.txt` 供训练与合并使用，`.rejected.jsonl` 记录被跳过的原始行号和原因。用于 Second/Third 对照时，应确认拒绝行数为零，或在两组都成功的相同行上比较。
+显式模式的 `.tokens.txt` 按 `<|WAIT|>`、`<|DIRECT|>` 的顺序各写一行。若要生成纯正文对照组，对同一个输入指定 `--protocol plain` 和独立的输出路径。两条构建命令都支持该选项。`.rejected.jsonl` 记录转换时跳过的原始行号和原因。
 
 **已有逐段时间戳时，可以从原始标注重铸。** 下面是上面转换命令的另一条入口。示例用独立目录，便于比较。复用 Second 数据准备环境，也可以先安装 `python -m pip install -r ../Second/SFT-Scripts/requirements.txt`。
 
@@ -36,9 +37,9 @@ python Data-Scripts/build_sft.py \
 例如，某个 800 ms 边界前已经说完中文句尾和独立对齐的英文 `Let's`，学生目标可以是：
 
 ~~~text
-用户音频一       我把时间
-用户音频二       发给你了。Let's
-用户音频三        meet tomorrow.
+用户音频一       <|DIRECT|>我把时间
+用户音频二       <|DIRECT|>发给你了。Let's
+用户音频三       <|DIRECT|> meet tomorrow.
 <end_of_audio>   <|WAIT|>
 ~~~
 
@@ -50,7 +51,7 @@ python Data-Scripts/build_sft.py \
 
 ~~~bash
 python SFT-Scripts/check_sft.py \
-  /data/yb/Code/OmniCommit/datasets/third_run_001/train.800ms.jsonl \
+  /data/yb/Code/OmniCommit/datasets/third_explicit_001/train.800ms.jsonl \
   --rows 2 --decode
 ~~~
 
@@ -59,8 +60,8 @@ python SFT-Scripts/check_sft.py \
 ~~~bash
 bash SFT-Scripts/train_sft.sh \
   /data/data_process/lzy/qwen3_omni_mega/train/qwen3_omni_mcore_3.12.1 \
-  /data/yb/Code/OmniCommit/datasets/third_run_001/train.800ms.jsonl \
-  /data/yb/Code/OmniCommit/outputs/third-sft-001 \
+  /data/yb/Code/OmniCommit/datasets/third_explicit_001/train.800ms.jsonl \
+  /data/yb/Code/OmniCommit/outputs/third-explicit-sft-001 \
   --gpu-ids 1,2,3,4 --save_interval 1000
 ~~~
 
@@ -69,8 +70,8 @@ bash SFT-Scripts/train_sft.sh \
 ~~~bash
 bash SFT-Scripts/train_sft_swift4.sh \
   /data/models/qwen3_omni_original_hf \
-  /data/yb/Code/OmniCommit/datasets/third_run_001/train.800ms.jsonl \
-  /data/yb/Code/OmniCommit/outputs/third-swift4-sft-001 \
+  /data/yb/Code/OmniCommit/datasets/third_explicit_001/train.800ms.jsonl \
+  /data/yb/Code/OmniCommit/outputs/third-explicit-swift4-sft-001 \
   --gpu-ids 0,1,2,3,4,5,6,7 --save_steps 1000
 ~~~
 
@@ -78,21 +79,21 @@ bash SFT-Scripts/train_sft_swift4.sh \
 
 ~~~bash
 python SFT-Scripts/audit_encoded_lengths.py \
-  /data/yb/Code/OmniCommit/datasets/third_run_001/train.800ms.jsonl \
+  /data/yb/Code/OmniCommit/datasets/third_explicit_001/train.800ms.jsonl \
   --model /data/models/qwen3_omni_original_hf --rows 2 --max-length 8192 \
-  --report /data/yb/Code/OmniCommit/datasets/third_run_001/encoded-audit.json
+  --report /data/yb/Code/OmniCommit/datasets/third_explicit_001/encoded-audit.json
 ~~~
 
 ## 3. 合并 checkpoint
 
-传入原始 HF 基座、实际含 `adapter_config.json` 和适配器权重的 checkpoint、导出目录，以及该次训练使用的 token 清单。导出器校验 WAIT 的真实 token ID、词嵌入和输出权重，并写入 Third 的协议清单。
+传入原始 HF 基座、实际含 `adapter_config.json` 和适配器权重的 checkpoint、导出目录，以及此次训练的 token 清单。显式模型合并时校验 WAIT 和 DIRECT 的 ID，以及两个 token 在词嵌入和输出层的训练权重，写出 v4 协议清单。旧纯正文模型沿用 v3。要启用强制 DIRECT 解码，需要用显式数据训练并合并的新权重。
 
 ~~~bash
 bash SFT-Scripts/merge_lora.sh \
   /data/models/qwen3_omni_original_hf \
-  /data/yb/Code/OmniCommit/outputs/third-sft-001/checkpoint-1000 \
-  /data/yb/Code/OmniCommit/models/third-merged \
-  --special-tokens /data/yb/Code/OmniCommit/datasets/third_run_001/train.800ms.jsonl.tokens.txt \
+  /data/yb/Code/OmniCommit/outputs/third-explicit-sft-001/checkpoint-1000 \
+  /data/yb/Code/OmniCommit/models/third-explicit-merged \
+  --special-tokens /data/yb/Code/OmniCommit/datasets/third_explicit_001/train.800ms.jsonl.tokens.txt \
   --gpu-ids 0
 ~~~
 
@@ -101,12 +102,20 @@ bash SFT-Scripts/merge_lora.sh \
 在推理环境中使用上一步导出的 HF 模型。默认后端沿用 FLEX 的 vLLM 0.11.1，`--backend hf` 可切换到 Transformers。将整个 OmniCommit 仓库部署到同一台机器，训练、导出和服务都会使用仓库内的共享组件。启动时的 `--chunk-ms` 决定当前服务的步长，按训练数据填写。
 
 ~~~bash
-python -m pip install -r ../requirements-web.txt
+python -m pip install -r requirements-web.txt
 CUDA_VISIBLE_DEVICES=0 bash start_server.sh \
-  /data/yb/Code/OmniCommit/models/third-merged \
+  /data/yb/Code/OmniCommit/models/third-explicit-merged \
   --chunk-ms 800 --port 18891
 ~~~
 
 在浏览器打开 `http://服务器内网IP:18891`。可在服务器执行 `curl http://127.0.0.1:18891/health` 检查 Third 服务的就绪状态。网页支持麦克风、浏览器共享的系统声音和音视频文件。浏览器远程采音通常需要 HTTPS，localhost 可以直接使用。直接提供 HTTPS 时可传 `--ssl-certfile` 和 `--ssl-keyfile`。系统声音取决于浏览器能否共享所选来源的音频轨道。服务器读取音视频文件需要 `ffmpeg`。服务面向内网，无需访问令牌。
 
-页面通过 TXT 导出已提交的全文，通过 JSONL 导出每轮原始回复和推理耗时。日志中 `action` 的值 `DIRECT` 是服务端对“本轮有正文”的标记。模型生成的 `text` 可直接与对应的训练目标比较。长录音采用滚动上下文，已显示的全文供浏览与导出，近期音频和对话供下一轮推理。模型连续对有声输入给出 `WAIT` 并达到待提交音频上限时，服务会报告错误，页面保留已提交的正文。
+服务启动时读取模型清单，`/health` 中的 `action_protocol` 显示 `explicit` 或 `plain`，`gap_recovery` 显示恢复开关。页面和 TXT 导出展示新增正文。JSONL 导出保留逐轮的动作、原始输出和恢复记录。
+
+### 连续有声 WAIT 的恢复
+
+平时由模型选择动作。对显式模型，服务在 CPU 使用 WebRTC VAD 统计尚未提交的轮次中有多少秒人声。默认累计 2.4 秒人声后，服务用同一台 GPU 上的同一个 Omni 单独重听这一段，解码从当前 assistant 的 `<|DIRECT|>` 之后开始。恢复窗口默认最多 6.4 秒，可带最近最多 0.8 秒的跨界音频。三个时长分别用 `--recovery-voiced-seconds`、`--recovery-window-seconds` 和 `--recovery-overlap-seconds` 设置。静音和结束事件均不触发补识别。
+
+一次连续 WAIT 最多触发一次局部解码，直到再次提交正文。恢复成功时，最终提交进入下一轮的对话历史。调试时查看 `primary_text`、`recovery`、`text` 和 `display_text`，分别核对被替换的原始 WAIT、候选及处理结果、最终协议回复和页面正文。空正文、纯标点、已提交内容的重复等不能触发提交。窗口装不下待处理语音时记录 `window_exceeded` 并保留 WAIT。VAD 只提供人声证据，强制前缀本身无法验证新正文的语义正确性。
+
+在同一份显式模型和同一段测试音频上，用默认配置和 `--no-recovery` 分别启动服务，可比较切换后的漏词、重复词和恢复耗时。旧纯正文模型自动走常规解码。对于始终无法提交的有声音频，服务保留待处理数据直至达到上下文上限，然后报告错误。

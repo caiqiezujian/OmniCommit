@@ -4,13 +4,13 @@ OmniCommit 使用 Qwen3-Omni 对多语言、多说话人的增量音频进行原
 
 ## 在 main 选择训练入口
 
-先看训练 JSONL 中**有正文的 assistant 回复**。第一版以 `<|DIRECT|>` 开头，每次提交都带完整语种和说话人标签。第二版直接提交正文，首次转录或归属变化时带标签，同一归属跨轮续写。第三版只提交原语言正文，等待时独立输出 `<|WAIT|>`。各版使用各自数据构建器生成的 token 清单。
+先看训练 JSONL 中**有正文的 assistant 回复**。第一版以 `<|DIRECT|>` 开头，每次提交都带完整语种和说话人标签。第二版首次提交或归属变化时标注语种和说话人。Third 默认输出 `<|DIRECT|>` 加原语言正文，等待时单独输出 `<|WAIT|>`；其 `plain` 对照模式直接输出正文。训练和导出都读取对应数据生成的 token 清单。
 
 | 训练协议 | ms-swift 3.12.1 · MCore 基座 | ms-swift 4.1.3 · 原始 HF 基座 |
 |---|---|---|
 | 第一版 · WAIT / DIRECT | [SFT-Scripts/train_sft.sh](SFT-Scripts/train_sft.sh) | [SFT-Scripts/train_sft_swift4.sh](SFT-Scripts/train_sft_swift4.sh) |
 | 第二版 · WAIT / 正文 | [Second/SFT-Scripts/train_sft.sh](Second/SFT-Scripts/train_sft.sh) | [Second/SFT-Scripts/train_sft_swift4.sh](Second/SFT-Scripts/train_sft_swift4.sh) |
-| 第三版 · WAIT / 纯正文 | [Third/SFT-Scripts/train_sft.sh](Third/SFT-Scripts/train_sft.sh) | [Third/SFT-Scripts/train_sft_swift4.sh](Third/SFT-Scripts/train_sft_swift4.sh) |
+| 第三版 · WAIT / DIRECT + 原文 | [Third/SFT-Scripts/train_sft.sh](Third/SFT-Scripts/train_sft.sh) | [Third/SFT-Scripts/train_sft_swift4.sh](Third/SFT-Scripts/train_sft_swift4.sh) |
 
 各入口都用 Megatron 训练，三个位置参数依次是对应格式的**基座目录、训练 JSONL、输出目录**。3.12.1 默认每 3000 步保存，使用 `--save_interval` 调整。4.1.3 默认每 1000 步保存，使用 `--save_steps` 调整。
 

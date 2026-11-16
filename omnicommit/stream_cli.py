@@ -51,7 +51,7 @@ def runtime_options(args, options_class=StreamOptions):
     return options_class(**{name: getattr(args, name) for name in names})
 
 
-def build_backend(args, *, manifest_validator=None, chunk_seconds_choices=None):
+def build_backend(args, *, manifest_validator=None, chunk_seconds_choices=None, max_audio_item_seconds=0.0):
     if args.backend == "replay":
         replies = json.loads(args.replies.read_text(encoding="utf-8")) if args.replies else None
         if replies is not None and not isinstance(replies, list):
@@ -69,7 +69,7 @@ def build_backend(args, *, manifest_validator=None, chunk_seconds_choices=None):
             max_new_tokens=args.max_new_tokens,tensor_parallel_size=args.tensor_parallel_size,
             gpu_memory_utilization=args.gpu_memory_utilization,
             max_audio_turns=math.ceil(args.max_context_seconds/min(steps))+args.max_speakers+2,
-            max_audio_seconds=max(.5,max(steps),args.max_reference_seconds),
+            max_audio_seconds=max(.5,max(steps),args.max_reference_seconds,max_audio_item_seconds),
             enable_prefix_caching=args.enable_prefix_caching,
             mm_processor_cache_gb=args.mm_processor_cache_gb,image_slots=args.vllm_image_slots,dtype=args.dtype,
             **checks)
