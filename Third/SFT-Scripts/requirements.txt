@@ -1,2 +1,4 @@
-# CPU preparation, virtual audio decoding and audits use the same stack as Second.
--r ../../Second/SFT-Scripts/requirements.txt
+# CPU audio preparation and training-data audits.
+-r ../requirements-data.txt
+numpy>=1.23,<3
+scipy>=1.9,<2

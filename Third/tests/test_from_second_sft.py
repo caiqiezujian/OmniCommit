@@ -1,4 +1,5 @@
 import json
+import shutil
 import subprocess
 import sys
 import wave
@@ -13,8 +14,8 @@ WAIT = "<|WAIT|>"
 DIRECT = "<|DIRECT|>"
 
 
-def run_script(script, *args):
-    return subprocess.run([sys.executable, str(script), *map(str, args)],
+def run_script(script, *args, cwd=None):
+    return subprocess.run([sys.executable, "-I", str(script), *map(str, args)], cwd=cwd,
                           capture_output=True, text=True, encoding="utf-8", errors="replace")
 
 
@@ -47,9 +48,13 @@ def test_existing_second_dataset_matches_third_recast(tmp_path, number_format, p
     source = tmp_path / "existing.jsonl"
     source.write_text("{invalid\n" + sample, encoding="utf-8")
     output = tmp_path / "converted" / name
-    convert = THIRD / "Data-Scripts" / "from_second_sft.py"
+    # Simulate copying just Third to a server. Keep its parent free of any
+    # Second modules and start Python in an unrelated working directory.
+    copied = tmp_path / "deployment" / "Third"
+    shutil.copytree(THIRD, copied, ignore=shutil.ignore_patterns("__pycache__", ".pytest_cache"))
+    convert = copied / "Data-Scripts" / "from_second_sft.py"
     protocol_args = ["--protocol", "plain"] if protocol == "plain" else []
-    command = run_script(convert, source, "--output", output, *protocol_args)
+    command = run_script(convert, source, "--output", output, *protocol_args, cwd=tmp_path)
     assert command.returncode == 0, command.stderr
     converted = json.loads(output.read_text(encoding="utf-8"))
     assert converted == json.loads((tmp_path / "Third" / name).read_text(encoding="utf-8"))
@@ -66,3 +71,26 @@ def test_existing_second_dataset_matches_third_recast(tmp_path, number_format, p
         assert run_script(convert, source, "--protocol", "plain", "--output", plain).returncode == 0
         assert run_script(convert, plain, "--output", upgraded).returncode == 0
         assert upgraded.read_bytes() == output.read_bytes()
+
+    if (number_format, protocol) == ("normalized", "explicit"):
+        broken = []
+        for field, index, key, value in (
+            ("messages", 2, "content", "speech before initial attribution"),
+            ("messages", 3, "role", "assistant"),
+            ("messages", 5, "content", "no audio placeholder"),
+            ("messages", 6, "content", "<en><spk2>redundant header"),
+            ("messages", -1, "content", "<|DIRECT|>text after EOS"),
+        ):
+            row = json.loads(sample)
+            row[field][index][key] = value
+            broken.append(row)
+        overlap = json.loads(sample)
+        overlap["audios"][1] = overlap["audios"][0]
+        broken.append(overlap)
+        invalid_source = tmp_path / "invalid.jsonl"
+        invalid_source.write_text("".join(json.dumps(v) + "\n" for v in broken), encoding="utf8")
+        invalid_output = tmp_path / "invalid-output.jsonl"
+        result = run_script(convert, invalid_source, "--output", invalid_output, cwd=tmp_path)
+        assert result.returncode == 1 and invalid_output.read_bytes() == b""
+        rejected = Path(str(invalid_output) + ".rejected.jsonl")
+        assert [json.loads(line)["line"] for line in rejected.read_text().splitlines()] == list(range(1, len(broken)+1))

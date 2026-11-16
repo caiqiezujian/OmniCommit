@@ -21,16 +21,17 @@ python Data-Scripts/from_second_sft.py \
 
 显式模式的 `.tokens.txt` 按 `<|WAIT|>`、`<|DIRECT|>` 的顺序各写一行。若要生成纯正文对照组，对同一个输入指定 `--protocol plain` 和独立的输出路径。两条构建命令都支持该选项。`.rejected.jsonl` 记录转换时跳过的原始行号和原因。
 
-**已有逐段时间戳时，可以从原始标注重铸。** 下面是上面转换命令的另一条入口。示例用独立目录，便于比较。复用 Second 数据准备环境，也可以先安装 `python -m pip install -r ../Second/SFT-Scripts/requirements.txt`。
+**已有逐段时间戳时，可以从原始标注重铸。** 数据构建可以单独部署完整的 `Third/` 目录，其中 `Data-Scripts/` 放命令入口，`third_asr/` 放时间戳解析、标签重铸和音频引用代码。在服务器的 `Third/` 下运行以下命令即可生成 1 秒训练集。输入中记录的原始音频需要在该服务器可读。
 
 ~~~bash
+python -m pip install -r requirements-data.txt
 python Data-Scripts/build_sft.py \
   /data/yb/Code/OmniCommit/datasets/timestamped.jsonl \
-  --chunk-ms 800 --release-on semantic-unit \
-  --output-dir /data/yb/Code/OmniCommit/datasets/third_recast_001
+  --protocol explicit --chunk-ms 1000 --release-on semantic-unit \
+  --output-dir /data/yb/Code/OmniCommit/datasets/third_recast_1000ms_001
 ~~~
 
-输入每行含一个原始音频路径、带归属的完整 assistant 参考转录、`output.segments[].source_text`，以及逐段对应的 `timestamps[].start_ms/end_ms`。时间相对于该录音起点，单位毫秒。可以直接使用 Second 拼接脚本生成的 `combined.jsonl`。每条有效录音在 `train.800ms.jsonl` 中生成一行。构建摘要在 `summary.json`，无效记录的行号及错误在 `rejected.jsonl`。[Second 输入示例](../Second/README.md#1-准备输入)
+输入每行含一个原始音频路径、带归属的完整 assistant 参考转录、`output.segments[].source_text`，以及逐段对应的 `timestamps[].start_ms/end_ms`。时间相对于该录音起点，单位毫秒。可以直接使用 Second 拼接脚本生成的 `combined.jsonl`。每条有效录音在 `train.1000ms.jsonl` 中生成一行。构建摘要在 `summary.json`，无效记录的行号及错误在 `rejected.jsonl`。[Second 输入示例](../Second/README.md#1-准备输入)
 
 默认等完整语义段到期再提交。若输入确有更细的、覆盖正文的 `timestamps[].spans[]`，可用 `--release-on timed-span` 采用子段终点。只有切换时刻或另存的字符数组时，先将对齐结果整理为这个输入格式。原蒸馏段中的 `action` 不决定新一轮的 WAIT。用 `--chunk-ms 1000` 可生成 1 秒网格。与已有 800 ms Second 模型做对照时，使用相同的源录音、提交粒度及训练配方。
 
@@ -47,7 +48,7 @@ python Data-Scripts/build_sft.py \
 
 ## 2. 检查并训练
 
-下面的训练和导出示例使用第一个入口生成的文件。若用第二个入口，将数据路径换成 `third_recast_001` 中的对应文件。在训练服务器上先检查前两条真实音频，去掉 `--rows 2 --decode` 可进行全量结构预检。
+训练、审计、合并与 Web 服务使用完整仓库。下面的训练和导出示例使用第一个入口生成的文件。若使用上面的 1 秒重铸示例，训练数据路径填 `third_recast_1000ms_001/train.1000ms.jsonl`，合并时使用同文件旁的 `.tokens.txt`，启动服务时传 `--chunk-ms 1000`。在训练服务器上先检查前两条真实音频，去掉 `--rows 2 --decode` 可进行全量结构预检。
 
 ~~~bash
 python SFT-Scripts/check_sft.py \
