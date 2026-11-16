@@ -4,16 +4,19 @@ OmniCommit 使用 Qwen3-Omni 对多语言、多说话人的增量音频进行原
 
 ## 在 main 选择训练入口
 
-先看训练 JSONL 中**有正文的 assistant 回复**。第一版以 `<|DIRECT|>` 开头，每次提交都带完整语种和说话人标签。第二版直接提交正文，首次转录或归属变化时带标签，同一归属跨轮续写。两套协议的 token 清单各自由自己的数据构建器生成。
+先看训练 JSONL 中**有正文的 assistant 回复**。第一版以 `<|DIRECT|>` 开头，每次提交都带完整语种和说话人标签。第二版直接提交正文，首次转录或归属变化时带标签，同一归属跨轮续写。第三版只提交原语言正文，等待时独立输出 `<|WAIT|>`。各版使用各自数据构建器生成的 token 清单。
 
 | 训练协议 | ms-swift 3.12.1 · MCore 基座 | ms-swift 4.1.3 · 原始 HF 基座 |
 |---|---|---|
 | 第一版 · WAIT / DIRECT | [SFT-Scripts/train_sft.sh](SFT-Scripts/train_sft.sh) | [SFT-Scripts/train_sft_swift4.sh](SFT-Scripts/train_sft_swift4.sh) |
 | 第二版 · WAIT / 正文 | [Second/SFT-Scripts/train_sft.sh](Second/SFT-Scripts/train_sft.sh) | [Second/SFT-Scripts/train_sft_swift4.sh](Second/SFT-Scripts/train_sft_swift4.sh) |
+| 第三版 · WAIT / 纯正文 | [Third/SFT-Scripts/train_sft.sh](Third/SFT-Scripts/train_sft.sh) | [Third/SFT-Scripts/train_sft_swift4.sh](Third/SFT-Scripts/train_sft_swift4.sh) |
 
-四个入口都用 Megatron 训练，三个位置参数依次是对应格式的**基座目录、训练 JSONL、输出目录**。每个入口自动调用同目录的 `check_sft.py` 和 `omnicommit_sft_plugin.py`。3.12.1 默认每 3000 步保存，使用 `--save_interval` 调整。4.1.3 默认每 1000 步保存，使用 `--save_steps` 调整。
+各入口都用 Megatron 训练，三个位置参数依次是对应格式的**基座目录、训练 JSONL、输出目录**。3.12.1 默认每 3000 步保存，使用 `--save_interval` 调整。4.1.3 默认每 1000 步保存，使用 `--save_steps` 调整。
 
 第一版使用仓库根目录的 `start_server.sh`。第二版使用 `Second/SFT-Scripts/merge_lora.sh` 导出模型，并用 `Second/start_server.sh` 启动支持跨轮正文续写的会议网页，默认端口 18890。数据与模型路径按服务器实际挂载填写。[第一版训练手册](SFT-Scripts/README.md) · [第二版数据、训练、导出和服务](Second/README.md)
+
+第三版可以直接转换已有的 Second 训练集，也能从逐段时间戳重铸。数据构建和网页默认使用 800 ms 的音频块，网页默认端口为 18891。[Third 数据、训练、导出和 Web 命令](Third/README.md)
 
 ## 第一版的输入与数据构建
 
@@ -43,7 +46,7 @@ audit_sft.py / audit_encoded_lengths.py → train_sft.sh → merge_lora.sh → s
 
 相同归属的重复语义标签不再决定切分；跨界块可提交旧归属的已确认尾部，新归属暂存。对有真实切换的记录，构建器默认采用 `--reference-fallback completed-spans`：某段声音已完整收到、其切换暂存结束后，允许从操作方提供的可信参考补足教师未识别的剩余正文；`off` 保留严格教师核对。同语种后续说话人还会采集局部前缀，避免前面漏词阻塞后文。补足来源及比例单独记录，不修改教师原始输出。
 
-第一版前缀数据的 `--chunk-seconds` 支持 **0.5 / 0.8 / 1.0**，步长由 trace 传到 SFT 重铸。两版网页都可以在每场会议开始前从下拉列表选择音频块时长，也可以直接输入毫秒数，例如 **200**。第一版输出使用 WAIT/DIRECT 和每段完整的语种、说话人标签。数据构建在 R2T2 方法基础上加入了参考监督和切换规则。真实 GPU 推理、声学质量和新模型效果仍需在服务器验收。
+第一版前缀数据的 `--chunk-seconds` 支持 **0.5 / 0.8 / 1.0**，步长由 trace 传到 SFT 重铸。第一版和第二版网页可以在每场会议开始前选择音频块时长，也可以直接输入毫秒数，例如 **200**。第三版在启动服务时用 `--chunk-ms` 设置步长。第一版输出使用 WAIT/DIRECT 和每段完整的语种、说话人标签。数据构建在 R2T2 方法基础上加入了参考监督和切换规则。真实 GPU 推理、声学质量和新模型效果仍需在服务器验收。
 
 以下保留旧版文本标注路线，供已有数据继续使用：
 
@@ -205,4 +208,4 @@ bash start_server.sh /data/yb/Code/OmniCommit/outputs/merged
 - [会议 Web 服务](docs/web_meeting_service_zh.md) 与 [流式状态说明](docs/streaming_runtime.md)：运行和限制。
 - [方法与验证边界](docs/method.md)、[FLEX 对应关系](docs/FLEX_ADAPTATION.md)：研究路线和实现差异。
 
-在数据开发环境中，从仓库根目录执行 `python -m pytest -q` 检查第一版流程，`python -m pytest -q Second/tests` 检查第二版，再用 `node tests/test_web_ui_contract.mjs` 检查网页交互。真实听音质量、GPU 训练和长会议表现需要在部署环境验收。
+在数据开发环境中，从仓库根目录执行 `python -m pytest -q`、`python -m pytest -q Second/tests` 和 `python -m pytest -q Third/tests` 检查各协议，再用 `node tests/test_web_ui_contract.mjs` 检查共用网页交互。真实听音质量、GPU 训练和长会议表现需要在部署环境验收。

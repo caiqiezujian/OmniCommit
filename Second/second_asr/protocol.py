@@ -90,3 +90,11 @@ def sort_tokens(tokens):
         else:
             raise ValueError(f"Unexpected training token {token!r}")
     return [WAIT, *sorted(languages), *sorted(speakers, key=lambda t: (len(t), t))]
+
+
+def training_tokens(units):
+    tokens = {WAIT}
+    for unit in units:
+        for lang, speaker, _ in unit.spans:
+            tokens.update((f"<{lang}>", f"<{speaker}>"))
+    return tokens

@@ -27,7 +27,8 @@ LOG = logging.getLogger("omnicommit.web")
 def create_app(backend_factory, options, *, max_sessions=1,
                auto_reference_factory=None, session_factory=StreamSession,
                media_cursor_factory=MediaCursor,
-               protocol_name="first", chunk_ms_choices=LIVE_CHUNK_MS, gap_service_factory=None):
+               protocol_name="first", chunk_ms_choices=LIVE_CHUNK_MS, gap_service_factory=None,
+               web_directory=None, allowed_controls=None):
     from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
     from fastapi.responses import FileResponse, JSONResponse
     from fastapi.staticfiles import StaticFiles
@@ -78,7 +79,7 @@ def create_app(backend_factory, options, *, max_sessions=1,
 
     app = FastAPI(lifespan=lifespan)
     app.state.media_store = media_store
-    web_directory = Path(__file__).resolve().parent / "web"
+    web_directory = Path(web_directory) if web_directory is not None else Path(__file__).resolve().parent / "web"
     app.mount("/web", StaticFiles(directory=web_directory), name="web")
 
     @app.get("/")
@@ -277,6 +278,8 @@ def create_app(backend_factory, options, *, max_sessions=1,
                     elif event.get("type") == "control":
                         try:
                             op = event.get("op")
+                            if allowed_controls is not None and op not in allowed_controls:
+                                raise ValueError(f"Unsupported control for {protocol_name}: {op}")
                             if op == "correct_segment":
                                 snapshot = ledger.correct_segment(event["segment_id"], event["speaker"])
                                 pending_evidence = None
@@ -392,12 +395,15 @@ def create_app(backend_factory, options, *, max_sessions=1,
     return app
 
 
-def add_web_arguments(parser):
+def add_web_arguments(parser, *, include_references=True):
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=7860)
     parser.add_argument("--max-sessions", type=int, default=1)
     parser.add_argument("--ssl-certfile")
     parser.add_argument("--ssl-keyfile")
+    if not include_references:
+        parser.set_defaults(auto_reference_model=None, auto_reference_python=None)
+        return
     parser.add_argument("--auto-reference-model", type=Path,
                         help="Optional local Qwen3-ForcedAligner; creates unverified experimental references")
     parser.add_argument("--auto-reference-python", type=Path,

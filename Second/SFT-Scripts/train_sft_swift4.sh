@@ -46,11 +46,11 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 # The SWIFT 3.x fallback patches must never be installed in the native 4.x path.
 unset OMNICOMMIT_SFT_ATTENTION_COMPAT OMNICOMMIT_PACKED_NO_FLASH
 
-python3 "$SCRIPT_DIR/check_sft.py" "$DATASET" --rows 2 --tokens-file "$TOKENS_FILE" --framework
+python3 "${OMNICOMMIT_SFT_CHECK:-$SCRIPT_DIR/check_sft.py}" "$DATASET" --rows 2 --tokens-file "$TOKENS_FILE" --framework
 echo "[train] HF model=$HF_MODEL | GPUs=$GPU_LIST | output=$OUTPUT_DIR"
 exec megatron sft \
   --model "$HF_MODEL" --dataset "$DATASET" --output_dir "$OUTPUT_DIR" --add_version false \
-  --external_plugins "$SCRIPT_DIR/omnicommit_sft_plugin.py" --template omnicommit_second_qwen3_omni \
+  --external_plugins "${OMNICOMMIT_SFT_PLUGIN:-$SCRIPT_DIR/omnicommit_sft_plugin.py}" --template "${OMNICOMMIT_SFT_TEMPLATE:-omnicommit_second_qwen3_omni}" \
   --tuner_type lora --lora_rank 8 --lora_alpha 32 --target_modules all-linear \
   --new_special_tokens "$TOKENS_FILE" --modules_to_save word_embeddings output_layer \
   --loss_scale default --freeze_llm false --freeze_vit true --freeze_aligner true \

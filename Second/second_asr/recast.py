@@ -5,7 +5,8 @@ import sys
 from fractions import Fraction
 from pathlib import Path
 
-from .protocol import EOS, WAIT, render_reply, system_prompt
+from . import protocol as second_protocol
+from .protocol import EOS, WAIT
 from .source import Unit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "SFT-Scripts"))
@@ -25,7 +26,7 @@ def _end_frame(end_ms: float, frames: int, rate: int) -> int:
 
 
 def build_sft_row(units: list[Unit], path: Path, frames: int, rate: int,
-                  chunk_ms: int, number_format: str = "normalized") -> dict:
+                  chunk_ms: int, number_format: str = "normalized", *, protocol=second_protocol) -> dict:
     validate_chunk_ms(chunk_ms)
     if not units or frames <= 0 or rate <= 0:
         raise ValueError("A record needs positive-duration audio and aligned text")
@@ -36,7 +37,7 @@ def build_sft_row(units: list[Unit], path: Path, frames: int, rate: int,
         raise ValueError("Unit ends must follow transcript order and fit the audio")
 
     refs = []
-    messages = [{"role": "system", "content": system_prompt(number_format)}]
+    messages = [{"role": "system", "content": protocol.system_prompt(number_format)}]
     cursor, start, turn = 0, 0, 1
     state = None
     while start < frames:
@@ -47,7 +48,7 @@ def build_sft_row(units: list[Unit], path: Path, frames: int, rate: int,
         while cursor < len(units) and ends[cursor] <= end:
             spans.extend(units[cursor].spans)
             cursor += 1
-        reply, state = render_reply(spans, state)
+        reply, state = protocol.render_reply(spans, state)
         span_seconds = (end - start) / rate
         # Tail padding is generated after cropping. It cannot release more text.
         input_seconds = max(span_seconds, 0.5 if end == frames else 0.01)

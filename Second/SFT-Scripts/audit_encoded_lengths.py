@@ -40,22 +40,23 @@ def protocol_ids(tokenizer, tokens):
     return ids
 
 
-def load_template(model_dir, tokens, *, packing):
-    import omnicommit_sft_plugin  # register the same template used by the launcher
+def load_template(model_dir, tokens, *, packing, template_name="omnicommit_second_qwen3_omni",
+                  plugin_name="omnicommit_sft_plugin"):
+    importlib.import_module(plugin_name)
     major = int(importlib.metadata.version("ms-swift").split(".")[0])
     options = dict(max_length=None, truncation_strategy="raise", loss_scale="default")
     if major == 4:
         from swift.model import get_processor
         from swift.template import get_template
         processor = get_processor(str(model_dir), model_type="qwen3_omni_moe", new_special_tokens=tokens)
-        template = get_template(processor, template_type="omnicommit_second_qwen3_omni", **options)
+        template = get_template(processor, template_type=template_name, **options)
     elif major == 3:
         from swift.llm import get_model_tokenizer, get_template
         model, processor = get_model_tokenizer(str(model_dir), model_type="qwen3_omni", load_model=False,
                                                new_special_tokens=tokens)
         if model is not None:
             raise RuntimeError("Processor-only audit unexpectedly loaded a model")
-        template = get_template("omnicommit_second_qwen3_omni", processor, **options)
+        template = get_template(template_name, processor, **options)
     else:
         raise ValueError(f"No supported training template loader for ms-swift major version {major}")
     tokenizer = getattr(processor, "tokenizer", processor)
@@ -72,7 +73,7 @@ def check_encoded_protocol(row, encoded, token_ids):
     protocol = set(token_ids.values())
     actual = [int(value) for value in encoded["labels"] if int(value) in protocol]
     if actual != expected:
-        raise ValueError("Supervised actions/language/speaker tokens differ from the original assistant turns")
+        raise ValueError("Supervised protocol tokens differ from the original assistant turns")
     mask = encoded["feature_attention_mask"]
     if encoded["input_features"].shape[0] != len(row["audios"]) or mask.shape[0] != len(row["audios"]):
         raise ValueError("Encoded audio features/masks do not match the input audio chunk count")
@@ -135,8 +136,10 @@ def check_packed_batch(template, examples, max_length):
             "sequence_boundaries": boundaries, "audio_chunks": cursor}
 
 
-def main(argv=None):
-    from check_sft import read_tokens, validate_row
+def main(argv=None, *, checks=None, template_name="omnicommit_second_qwen3_omni",
+         plugin_name="omnicommit_sft_plugin"):
+    if checks is None:
+        import check_sft as checks
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("dataset", type=Path)
@@ -156,9 +159,10 @@ def main(argv=None):
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     tokens_path = args.tokens_file or Path(str(args.dataset) + ".tokens.txt")
-    inventory = read_tokens(tokens_path)
+    inventory = checks.read_tokens(tokens_path)
     tokens = tokens_path.read_text(encoding="utf-8-sig").splitlines()
-    template, tokenizer, token_ids = load_template(args.model.resolve(strict=True), tokens, packing=args.check_packing)
+    template, tokenizer, token_ids = load_template(args.model.resolve(strict=True), tokens, packing=args.check_packing,
+                                                  template_name=template_name, plugin_name=plugin_name)
     examples = []
     count, valid, maximum, errors = 0, 0, 0, []
     with args.dataset.open(encoding="utf-8-sig") as source:
@@ -168,7 +172,7 @@ def main(argv=None):
             count += 1
             try:
                 row = json.loads(line)
-                validate_row(row, decode=False, token_inventory=inventory)
+                checks.validate_row(row, decode=False, token_inventory=inventory)
                 encoded = template.encode({"messages": deepcopy(row["messages"]), "audios": list(row["audios"])},
                                           return_length=args.check_packing)
                 metrics = audit_encoded(encoded, args.max_length)

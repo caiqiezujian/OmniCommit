@@ -13,7 +13,7 @@ from .runtime_protocol import LIVE_CHUNK_SECONDS
 from .streaming import ReplayBackend, StreamOptions, StreamSession
 
 
-def add_runtime_arguments(parser, *, include_chunk=True):
+def add_runtime_arguments(parser, *, include_chunk=True, include_references=True):
     parser.add_argument("--backend", choices=("hf", "vllm", "replay"), default="hf")
     parser.add_argument("--model", type=Path)
     parser.add_argument("--replies", type=Path, help="Replay only: JSON array of scripted replies; never real ASR")
@@ -24,9 +24,12 @@ def add_runtime_arguments(parser, *, include_chunk=True):
     parser.add_argument("--recent-seconds", type=float, default=12)
     parser.add_argument("--max-context-seconds", type=float, default=30)
     parser.add_argument("--max-pending-seconds", type=float, default=30)
-    parser.add_argument("--max-speakers", type=int, default=16)
-    parser.add_argument("--max-reference-seconds", type=float, default=5)
-    parser.add_argument("--max-total-reference-seconds", type=float, default=30)
+    if include_references:
+        parser.add_argument("--max-speakers", type=int, default=16)
+        parser.add_argument("--max-reference-seconds", type=float, default=5)
+        parser.add_argument("--max-total-reference-seconds", type=float, default=30)
+    else:
+        parser.set_defaults(max_speakers=1, max_reference_seconds=.5, max_total_reference_seconds=.5)
     parser.add_argument("--rolling-tail-seconds", type=float, default=2)
     parser.add_argument("--max-context-tokens", type=int, default=4096)
     parser.add_argument("--max-new-tokens", type=int, default=256)

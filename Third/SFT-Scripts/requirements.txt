@@ -1,0 +1,2 @@
+# CPU preparation, virtual audio decoding and audits use the same stack as Second.
+-r ../../Second/SFT-Scripts/requirements.txt

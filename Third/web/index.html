@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>OmniCommit Third · 实时转录</title>
+  <link rel="stylesheet" href="/web/style.css">
+  <script type="module" src="/web/app.js"></script>
+</head>
+<body>
+  <header><div><strong>OmniCommit</strong><span>Third</span></div><p id="health" role="status">正在连接模型…</p></header>
+  <main>
+    <aside>
+      <h1>流式转录</h1>
+      <fieldset id="settings">
+        <legend>音频来源</legend>
+        <label><input type="radio" name="source" value="microphone" checked> 麦克风</label>
+        <label><input type="radio" name="source" value="system"> 电脑声音</label>
+        <label><input type="radio" name="source" value="file"> 音视频文件</label>
+        <p class="hint" id="captureHelp">浏览器采音需要 HTTPS 或 localhost。</p>
+        <div id="fileOptions" hidden>
+          <input id="file" type="file" accept="audio/*,video/*" aria-label="音视频文件">
+          <label><input id="playback" type="checkbox" checked> 跟随播放器进度</label>
+          <p class="hint">取消勾选即可连续逐块识别整个文件。</p>
+        </div>
+      </fieldset>
+      <video id="player" controls playsinline hidden></video>
+      <div class="buttons"><button id="start" disabled>开始转录</button><button id="stop" disabled>结束</button></div>
+      <p id="status" role="status">等待开始</p>
+      <dl><div><dt>音频步长</dt><dd id="step">—</dd></div><div><dt>已处理音频</dt><dd id="heard">0.0 s</dd></div>
+      <div><dt>本地积压</dt><dd id="queued">0.0 s</dd></div><div><dt>最近推理</dt><dd id="latency">—</dd></div></dl>
+    </aside>
+    <section>
+      <div class="title"><h2>转录正文</h2><button id="saveText" disabled>导出 TXT</button></div>
+      <article id="words" aria-label="已提交的转录正文" aria-live="polite"></article>
+      <details><summary>逐轮记录</summary>
+        <div class="title"><p class="hint">显示最近 60 轮</p><button id="saveLog" disabled>导出完整 JSONL</button></div>
+        <ol id="turns" reversed></ol>
+      </details>
+    </section>
+  </main>
+</body>
+</html>

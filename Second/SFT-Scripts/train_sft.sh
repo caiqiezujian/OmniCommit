@@ -89,15 +89,15 @@ elif [[ "$ATTENTION_MODE" == "--packed-no-flash" || "$ATTENTION_MODE" == "--comp
   fi
 fi
 
-python3 "$SCRIPT_DIR/check_sft.py" "$DATASET_PATH" --rows 2 --tokens-file "$TOKENS_PATH" --framework
+python3 "${OMNICOMMIT_SFT_CHECK:-$SCRIPT_DIR/check_sft.py}" "$DATASET_PATH" --rows 2 --tokens-file "$TOKENS_PATH" --framework
 echo "[train] MCore model=$MODEL_PATH | GPUs=$GPU_LIST | output=$OUTPUT_PATH"
 OMNICOMMIT_PACKED_NO_FLASH="$PACKED_NO_FLASH" python3 -m torch.distributed.run \
   --nproc_per_node "$GPU_COUNT" --nnodes 1 --master_port "${MASTER_PORT:-29571}" \
   --module swift.cli._megatron.sft \
   --load "$MODEL_PATH" \
   --dataset "$DATASET_PATH" \
-  --external_plugins "$SCRIPT_DIR/omnicommit_sft_plugin.py" \
-  --template omnicommit_second_qwen3_omni \
+  --external_plugins "${OMNICOMMIT_SFT_PLUGIN:-$SCRIPT_DIR/omnicommit_sft_plugin.py}" \
+  --template "${OMNICOMMIT_SFT_TEMPLATE:-omnicommit_second_qwen3_omni}" \
   --train_type lora \
   --lora_rank 8 --lora_alpha 32 \
   --target_modules all-linear \
