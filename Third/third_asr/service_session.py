@@ -14,7 +14,7 @@ from .recovery import VoicedWaitRecovery
 @dataclass
 class ThirdStreamOptions(StreamOptions):
     chunk_seconds: float = .8
-    context_policy: str = "rolling"
+    context_policy: str = "window"
     number_format: str = "normalized"
     protocol: str = "plain"
     enable_recovery: bool = True

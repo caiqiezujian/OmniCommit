@@ -66,3 +66,56 @@ def test_websocket_silence_then_voiced_wait_recovery():
             ws.send_json({"type": "end"})
             final = ws.receive_json()
             assert final["text"] == WAIT and final["display_text"] == "" and "recovery" not in final
+
+
+def test_vllm_reserves_slots_for_page_choices(monkeypatch):
+    main = runpy.run_path(str(THIRD / "tools/serve_web.py"))["main"]
+    monkeypatch.setitem(main.__globals__, "detect_model_protocol", lambda model: "plain")
+    monkeypatch.setattr("third_asr.runtime.vllm_backend.VLLMBackend", lambda model, **kw: kw)
+    calls = []
+    def serve(parser, args, backend_factory, options, app_factory):
+        calls.append((options.window_seconds, options.discard_seconds, args.max_window_seconds,
+                      backend_factory()["max_audio_turns"]))
+    monkeypatch.setitem(main.__globals__, "serve_web", serve)
+    main(["--model", "checkpoint"])
+    main(["--model", "checkpoint", "--window-seconds", "75", "--discard-seconds", "45",
+          "--max-window-seconds", "150", "--chunk-ms", "1000"])
+    assert calls == [(60, 50, 120, 150), (75, 45, 150, 150)]
+    with pytest.raises(SystemExit):
+        main(["--model", "checkpoint", "--max-window-seconds", "20"])
+
+
+def test_sessions_negotiate_independent_windows_and_apply_them_during_wait():
+    from fastapi.testclient import TestClient
+    app = create_app(ReplayBackend, ThirdStreamOptions(chunk_seconds=1), max_sessions=2)
+    with TestClient(app) as client, client.websocket_connect("/stream") as mic, client.websocket_connect("/stream") as system:
+        defaults = client.get("/health")
+        assert defaults.headers["cache-control"] == "no-store"
+        assert (defaults.json()["window_seconds"], defaults.json()["discard_seconds"]) == (60, 50)
+        for ws, kind, window, discard in ((mic, "microphone", 3, 2), (system, "system", 2, 1)):
+            ws.send_json(dict(type="start", sample_rate=16000, source_kind=kind,
+                              window_seconds=window, discard_seconds=discard))
+            ready = ws.receive_json()
+            assert (ready["window_seconds"], ready["discard_seconds"]) == (window, discard)
+        for starts in [(0, 0), (0, 0), (0, 1), (2, 2)]:
+            for ws, start in zip((mic, system), starts):
+                ws.send_bytes(bytes(32000))
+                row = ws.receive_json()
+                assert row["window_start_seconds"] == start and row["action"] == "WAIT"
+        system.send_json({"type": "end", "window_seconds": 3})
+        assert system.receive_json()["type"] == "error"
+        mic.send_json({"type": "end"})
+        assert mic.receive_json()["event"] == "end_of_audio"
+
+
+@pytest.mark.parametrize("window,discard", [(0, 1), (2, 3), (False, 1), (3, "1"), (20, 10), (.2, .1)])
+def test_reject_invalid_or_over_capacity_window_before_decoding(window, discard):
+    from fastapi.testclient import TestClient
+    backend = ReplayBackend([])
+    backend.max_audio_turns = 4
+    opts = ThirdStreamOptions(chunk_seconds=1, window_seconds=4, discard_seconds=3)
+    with TestClient(create_app(lambda: backend, opts)) as client, client.websocket_connect("/stream") as ws:
+        assert client.get("/health").json()["max_window_seconds"] == 4
+        ws.send_json(dict(type="start", sample_rate=16000, window_seconds=window, discard_seconds=discard))
+        error = ws.receive_json()
+        assert error["type"] == "error" and error["heard_seconds"] == 0

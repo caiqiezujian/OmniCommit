@@ -100,8 +100,30 @@ def test_file_upload_playback_gate_and_stop_at_zero():
                     assert ws.receive_json()["text"] == WAIT
 
 
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="requires FFmpeg")
+def test_file_range_uses_negotiated_window_relative_to_range_start():
+    wav = BytesIO()
+    with wave.open(wav, "wb") as audio:
+        audio.setparams((1, 2, 16000, 0, "NONE", ""))
+        audio.writeframes(bytes(10 * 16000 * 2))
+    from fastapi.testclient import TestClient
+    with TestClient(create_app(ReplayBackend, ThirdStreamOptions(chunk_seconds=1))) as client:
+        upload = client.post("/api/media", content=wav.getvalue()).json()
+        with client.websocket_connect("/stream") as ws:
+            ws.send_json(dict(type="start", sample_rate=16000, source_kind="file", media_id=upload["media_id"],
+                              file_start_seconds=4, file_end_seconds=9, window_seconds=3, discard_seconds=2))
+            ready = ws.receive_json()
+            assert (ready["file_start_seconds"], ready["window_seconds"], ready["discard_seconds"]) == (4, 3, 2)
+            for turn, head in enumerate([0, 0, 0, 2, 2], 1):
+                ws.send_json(dict(type="file_next", release_seconds=4 + turn))
+                row = ws.receive_json()
+                assert (row["window_start_seconds"], row["end_seconds"], row["source_end_seconds"]) == (head, turn, 4 + turn)
+            ws.send_json({"type": "end"})
+            assert ws.receive_json()["window_start_seconds"] == 2
+
+
 def test_silence_compaction_and_voiced_pending_guard():
-    opts = ThirdStreamOptions(recent_seconds=.8, max_context_seconds=2.4, max_pending_seconds=2.4)
+    opts = ThirdStreamOptions(context_policy="rolling", recent_seconds=.8, max_context_seconds=2.4, max_pending_seconds=2.4)
     session = ThirdStreamSession(ReplayBackend(), opts)
     for _ in range(2250):  # 30 minutes of digital silence
         event = session.step(np.zeros(12800, dtype=np.float32))

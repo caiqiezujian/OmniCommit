@@ -4,7 +4,9 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from dataclasses import replace
 import json
+import math
 from pathlib import Path
 import shutil
 import time
@@ -16,7 +18,8 @@ from .runtime.media import MediaCursor, MediaStore
 from .service_session import ThirdStreamSession
 
 
-def create_app(backend_factory, options, *, max_sessions=1, auto_reference_factory=None):
+def create_app(backend_factory, options, *, max_sessions=1, auto_reference_factory=None,
+               max_window_seconds=None):
     if auto_reference_factory is not None:
         raise ValueError("Third transcribes plain text; speaker references are unsupported")
     from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
@@ -24,6 +27,9 @@ def create_app(backend_factory, options, *, max_sessions=1, auto_reference_facto
     from fastapi.staticfiles import StaticFiles
     if max_sessions < 1:
         raise ValueError("max_sessions must be positive")
+    if max_window_seconds is not None and (not math.isfinite(max_window_seconds)
+            or max_window_seconds < options.window_seconds):
+        raise ValueError("max_window_seconds must cover the default window")
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="omnicommit-model")
     active = set()
     backend = None
@@ -32,6 +38,17 @@ def create_app(backend_factory, options, *, max_sessions=1, auto_reference_facto
                          "gap_asr": "omni" if recovery else "disabled",
                          "recovery_voiced_seconds": options.recovery_voiced_seconds}
     media_store = MediaStore(max_slots=max(2, max_sessions * 2))
+
+    def window_settings(selected):
+        if selected.context_policy != "window":
+            return {}
+        limit = max_window_seconds
+        slots = getattr(backend, "max_audio_turns", None)
+        if slots is not None:
+            capacity = slots * selected.chunk_seconds
+            limit = capacity if limit is None else min(capacity, limit)
+        return {"window_seconds": selected.window_seconds, "discard_seconds": selected.discard_seconds,
+                "max_window_seconds": limit}
 
     @asynccontextmanager
     async def lifespan(app):
@@ -65,7 +82,7 @@ def create_app(backend_factory, options, *, max_sessions=1, auto_reference_facto
 
     @app.get("/health")
     async def health():
-        return {"ready": backend is not None, "protocol": "third", "active_sessions": len(active),
+        return JSONResponse({"ready": backend is not None, "protocol": "third", "active_sessions": len(active),
                 "max_sessions": max_sessions, "chunk_seconds": options.chunk_seconds,
                 "context_policy": options.context_policy,
                 "backend": type(backend).__name__ if backend else None,
@@ -73,7 +90,7 @@ def create_app(backend_factory, options, *, max_sessions=1, auto_reference_facto
                 "native_mm_processor_cache": getattr(backend, "mm_processor_cache_gb", 0) > 0,
                 "manual_kv_reuse": False, "file_input": bool(shutil.which("ffmpeg")),
                 "automatic_reference": "disabled",
-                **protocol_settings}
+                **window_settings(options), **protocol_settings}, headers={"Cache-Control": "no-store"})
 
     async def upload_media(request):
         origin = request.headers.get("origin")
@@ -136,12 +153,21 @@ def create_app(backend_factory, options, *, max_sessions=1, auto_reference_facto
                 raise ValueError("A file range requires an uploaded file session")
             if "chunk_ms" in init:
                 raise ValueError("This service uses a fixed chunk length")
+            window_keys = ("window_seconds", "discard_seconds")
+            overrides = {key: init[key] for key in window_keys if key in init}
+            if overrides and options.context_policy != "window":
+                raise ValueError("Window settings require the window context policy")
+            selected = replace(options, **overrides) if overrides else options
+            settings = window_settings(selected)
+            limit = settings.get("max_window_seconds")
+            if limit is not None and selected.window_seconds > limit + 1e-8:
+                raise ValueError(f"本服务支持的最大窗口为 {limit:g} 秒。")
             if source_kind == "file":
                 upload = media_store.claim(init.get("media_id"))
                 cursor = MediaCursor(upload, start_seconds=init.get("file_start_seconds", 0),
                                      end_seconds=init.get("file_end_seconds"))
                 source_heard = cursor.start_seconds
-            session = ThirdStreamSession(backend, options)
+            session = ThirdStreamSession(backend, selected)
             active.add(session)
             admitted = True
             await websocket.send_json({"type": "ready", "protocol": "third",
@@ -149,10 +175,12 @@ def create_app(backend_factory, options, *, max_sessions=1, auto_reference_facto
                 **({"file_start_seconds": cursor.start_seconds, "file_end_seconds": cursor.end_seconds}
                    if cursor is not None else {}),
                 "context_policy": options.context_policy, "backend": type(backend).__name__,
-                "warning": "Rolling mode is an unverified tail heuristic" if options.context_policy == "rolling" else "Verified watermarks required before safe context eviction",
+                "warning": {"window": "窗口将超长时按整轮丢弃旧音频；连续 WAIT 也使用相同规则。",
+                            "rolling": "Rolling mode is an unverified tail heuristic",
+                            "verified": "Verified watermarks required before safe context eviction"}[options.context_policy],
                 "automatic_reference": "disabled",
                 "auto_reference": "disabled",
-                **protocol_settings})
+                **settings, **protocol_settings})
             while True:
                 # A user may pause file playback for longer than two minutes.
                 # Live capture keeps an inactivity limit; files wait for an
@@ -175,6 +203,8 @@ def create_app(backend_factory, options, *, max_sessions=1, auto_reference_facto
                     event = json.loads(packet.get("text", ""))
                     if "chunk_ms" in event:
                         raise ValueError("chunk_ms can only be selected when starting a session")
+                    if any(key in event for key in window_keys):
+                        raise ValueError("窗口长度和丢弃长度只能在开始转录时设置。")
                     if any(key in event for key in range_keys):
                         raise ValueError("The file range can only be selected when starting a session")
                     if event.get("type") == "end":
@@ -205,7 +235,7 @@ def create_app(backend_factory, options, *, max_sessions=1, auto_reference_facto
                     elif event.get("type") == "control":
                         try:
                             op = event.get("op")
-                            if op != "commit":
+                            if op != "commit" or options.context_policy == "window":
                                 raise ValueError(f"Unsupported control for third: {op}")
                             session.verify_commit(event["through_seconds"], verified=event.get("verified", False))
                             snapshot = {"segments": [], "speakers": [], "aliases": {}, "reference_evidence": {}}

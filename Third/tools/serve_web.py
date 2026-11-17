@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Start the Third streaming ASR Web service."""
 import argparse
+from functools import partial
+import math
 from pathlib import Path
 import sys
 
@@ -18,6 +20,10 @@ def main(argv=None):
     add_runtime_arguments(parser)
     add_web_arguments(parser)
     parser.add_argument("--chunk-ms", type=int, default=800, help="Audio step used during SFT")
+    parser.add_argument("--window-seconds", type=float, help="Default live audio window, including the new chunk (60 s)")
+    parser.add_argument("--discard-seconds", type=float, help="Oldest live audio to discard on overflow (50 s)")
+    parser.add_argument("--max-window-seconds", type=float,
+                        help="Largest selectable window; vLLM reserves audio slots for at least 120 s by default")
     parser.add_argument("--protocol", choices=["auto", "explicit", "plain"], default="auto",
                         help="Auto-detect the trained action format from the merged checkpoint")
     parser.add_argument("--recovery", dest="enable_recovery", action=argparse.BooleanOptionalAction,
@@ -25,12 +31,25 @@ def main(argv=None):
     parser.add_argument("--recovery-voiced-seconds", type=float, default=2.4)
     parser.add_argument("--recovery-overlap-seconds", type=float, default=.8)
     parser.add_argument("--recovery-window-seconds", type=float, default=6.4)
-    parser.set_defaults(backend="vllm", port=18891, context_policy="rolling", number_format="normalized")
+    parser.set_defaults(backend="vllm", port=18891, number_format="normalized")
     args = parser.parse_args(argv)
     args.chunk_seconds = args.chunk_ms / 1000
     if args.model is None and args.backend != "replay":
         parser.error("--model is required for HF and vLLM inference")
     try:
+        if args.context_policy != "window" and any(value is not None for value in
+                (args.window_seconds, args.discard_seconds, args.max_window_seconds)):
+            parser.error("Window settings require --context-policy window")
+        if args.window_seconds is None:
+            args.window_seconds = ThirdStreamOptions.window_seconds
+        if args.discard_seconds is None:
+            args.discard_seconds = ThirdStreamOptions.discard_seconds
+        if args.context_policy == "window":
+            if args.max_window_seconds is None and args.backend == "vllm":
+                args.max_window_seconds = max(120.0, args.window_seconds)
+            if args.max_window_seconds is not None and (not math.isfinite(args.max_window_seconds)
+                    or args.max_window_seconds < args.window_seconds):
+                parser.error("--max-window-seconds must be finite and at least --window-seconds")
         if args.backend != "replay":
             trained = detect_model_protocol(args.model)
             if args.protocol not in ("auto", trained):
@@ -45,7 +64,8 @@ def main(argv=None):
             check_recovery_dependencies()
     except (OSError, ValueError, ImportError, RuntimeError) as exc:
         parser.error(str(exc))
-    serve_web(parser, args, lambda: build_backend(args), options, create_app)
+    serve_web(parser, args, lambda: build_backend(args), options,
+              partial(create_app, max_window_seconds=args.max_window_seconds))
 
 
 if __name__ == "__main__":

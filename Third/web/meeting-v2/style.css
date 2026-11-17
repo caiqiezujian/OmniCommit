@@ -31,6 +31,9 @@ button.primary, .tabs input:checked + span { background: #2458ae; border-color: 
 button:disabled, .tabs input:disabled + span { opacity: .45; cursor: not-allowed; }
 input, select { font: inherit; border: 1px solid #d4ddea; border-radius: 7px; padding: 8px; max-width: 100%; }
 label { display: block; margin: 12px 0; }
+.window-settings { display: flex; flex-wrap: wrap; gap: 8px 16px; margin: 12px 0; }
+.window-settings label { margin: 0; }
+.window-settings input { display: block; width: 8em; margin-top: 4px; }
 .tabs label { position: relative; margin: 0; }
 .tabs input { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip-path: inset(50%); }
 .tabs input:focus-visible + span, button:focus-visible { outline: 2px solid #2458ae; outline-offset: 2px; }

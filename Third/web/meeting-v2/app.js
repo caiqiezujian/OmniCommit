@@ -37,42 +37,36 @@ function download(name, type, value) {
   a.click();
   setTimeout(() => URL.revokeObjectURL(url), 3000);
 }
-$("saveText").onclick = () => download("third.txt", "text/plain;charset=utf-8", transcript.join(""));
+$("saveText").onclick = () => download("third.txt", "text/plain;charset=utf-8", transcript.join("\n"));
 $("saveLog").onclick = () => download("third.jsonl", "application/x-ndjson", turnLog.current.model.map(e => JSON.stringify(e) + "\n").join(""));
-
-const sentences = typeof Intl.Segmenter === "function"
-  ? new Intl.Segmenter(undefined, {granularity: "sentence"}) : null;
-
-function appendTranscript(box, text) {
-  // A chunk can finish the sentence displayed by the preceding DIRECT.
-  const last = box.lastElementChild;
-  const tail = (last?.textContent ?? "") + text;
-  const parts = sentences ? Array.from(sentences.segment(tail), s => s.segment)
-    : tail.match(/[^\r\n]+(?:\r\n?|\n)?|\r\n?|\n/gu) ?? [];
-  const rows = parts.map(part => {
-    const row = document.createElement("div");
-    row.className = "segment";
-    row.textContent = part;
-    return row;
-  });
-  if (last) last.replaceWith(...rows);
-  else box.append(...rows);
-}
 
 function showResult(result) {
   if (result.type !== "result") return;
   $("saveLog").disabled = false;
   if (result.action === "DIRECT") {
     const text = result.display_text;
-    transcript.push(text);
     const box = $("words");
     const follow = box.scrollHeight - box.scrollTop - box.clientHeight < 32;
-    appendTranscript(box, text);
+    const row = document.createElement("div");
+    row.className = "segment";
+    row.textContent = text;
+    box.append(row);
+    transcript.push(text);
     if (follow) box.scrollTop = box.scrollHeight;
     $("saveText").disabled = false;
   }
   $("heard").textContent = result.end_seconds.toFixed(1) + " s";
   $("latency").textContent = result.generation_seconds.toFixed(2) + " s";
+  if (Number.isFinite(result.window_start_seconds)) {
+    const seconds = n => Number(n.toFixed(3));
+    let metric = "模型窗口：" + seconds(result.window_start_seconds) + "–" + seconds(result.end_seconds) + " 秒";
+    if (result.discarded_seconds > 0) metric += " · 本轮丢弃 " + seconds(result.discarded_seconds) + " 秒";
+    if (Number.isInteger(result.num_cached_tokens) && result.num_cached_tokens >= 0) {
+      metric += " · KV 命中 " + result.num_cached_tokens + " tokens";
+    }
+    $("windowStatus").textContent = metric;
+    $("windowStatus").hidden = false;
+  }
 }
 
 class Channel {
@@ -249,6 +243,27 @@ player.addEventListener("error", () => {
 
 $("start").onclick = async () => {
   if (!health || running) return;
+  let windowOptions = {};
+  if (health.context_policy === "window") {
+    const windowSeconds = $("windowSeconds").valueAsNumber;
+    const discardSeconds = $("discardSeconds").valueAsNumber;
+    if (!Number.isFinite(windowSeconds) || windowSeconds < health.chunk_seconds) {
+      status("窗口至少需要容纳一个音频块。", true);
+      $("windowSeconds").focus();
+      return;
+    }
+    if (Number.isFinite(health.max_window_seconds) && windowSeconds > health.max_window_seconds) {
+      status("本服务的窗口上限是 " + health.max_window_seconds + " 秒。", true);
+      $("windowSeconds").focus();
+      return;
+    }
+    if (!Number.isFinite(discardSeconds) || discardSeconds <= 0 || discardSeconds > windowSeconds) {
+      status("每次丢弃长度须大于零，且不能超过窗口长度。", true);
+      $("discardSeconds").focus();
+      return;
+    }
+    windowOptions = {window_seconds: windowSeconds, discard_seconds: discardSeconds};
+  }
   const state = running = {kind: selected(), queue: new CaptureQueue(), fileHeard: 0, stopping: false};
   $("start").disabled = $("settings").disabled = true;
   try {
@@ -272,11 +287,17 @@ $("start").onclick = async () => {
     });
     await channel.open;
     const ready = await channel.request({
-      type: "start", sample_rate: 16000, source_kind: state.kind, media_id: upload?.media_id
+      type: "start", sample_rate: 16000, source_kind: state.kind, media_id: upload?.media_id,
+      ...windowOptions
     });
-    if (ready.protocol !== "third") throw Error("服务未加载 Third 协议");
+    if (ready.type !== "ready" || ready.protocol !== "third") throw Error("服务未加载 Third 协议");
+    if (health.context_policy === "window" && (ready.window_seconds !== windowOptions.window_seconds
+        || ready.discard_seconds !== windowOptions.discard_seconds)) {
+      throw Error("服务端未确认所选窗口，请核对 Third 服务版本并重新开始。");
+    }
     transcript = [];
     $("words").replaceChildren();
+    $("windowStatus").hidden = true;
     $("heard").textContent = $("queued").textContent = "0.0 s";
     $("saveLog").disabled = $("saveText").disabled = true;
     status("正在转录");
@@ -296,11 +317,30 @@ $("start").onclick = async () => {
   }
 };
 
-fetch("/health").then(r => r.json()).then(info => {
+fetch("/health", {cache: "no-store"}).then(r => r.json()).then(info => {
   if (!info.ready || info.protocol !== "third") throw Error("Third 服务尚未就绪");
+  if (!$("windowSettings")) {
+    // Older HTML may still load this script through its unversioned URL.
+    if (location.search === "?ui=window1") throw Error("服务仍返回旧版页面，请确认 Third 已更新并刷新。");
+    location.replace("/?ui=window1");
+    return;
+  }
+  const hasWindow = info.context_policy === "window";
+  if (hasWindow && (!Number.isFinite(info.window_seconds) || !Number.isFinite(info.discard_seconds))) {
+    throw Error("服务端未返回窗口设置，请核对 Third 服务版本。");
+  }
+  $("windowSettings").hidden = !hasWindow;
+  if (hasWindow) {
+    $("windowSeconds").value = String(info.window_seconds);
+    $("windowSeconds").min = String(info.chunk_seconds);
+    if (Number.isFinite(info.max_window_seconds)) $("windowSeconds").max = String(info.max_window_seconds);
+    $("discardSeconds").value = String(info.discard_seconds);
+    $("windowSeconds").disabled = $("discardSeconds").disabled = false;
+  }
   health = info;
   $("health").textContent = [info.backend, info.action_protocol === "explicit" ? "显式动作" : "纯正文",
-    info.gap_recovery ? "有声等待补识别已开启" : "补识别已关闭"].join(" · ");
+    info.gap_recovery ? "有声等待补识别已开启" : "补识别已关闭",
+    ...(hasWindow ? [] : ["当前策略 " + (info.context_policy || "未知") + "，此会话不支持自选窗口"])].join(" · ");
   $("step").textContent = Math.round(info.chunk_seconds * 1000) + " ms";
   $("start").disabled = false;
 }).catch(error => { $("health").textContent = error.message; });

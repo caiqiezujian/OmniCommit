@@ -101,6 +101,7 @@ class VoicedWaitRecovery:
         self.first_voice = None
         self.voiced_samples = 0
         self.attempted = False
+        self.window_voice = []
 
     def observe(self, session, result):
         turn = session.history[-1]
@@ -118,16 +119,38 @@ class VoicedWaitRecovery:
         if result["action"] == "DIRECT":
             self.reset()
             return
+        window_start = result.get("window_start_seconds")
+        if result.get("discarded_seconds", 0) and self.window_voice and not self.attempted:
+            # VAD counts belong to the audio that supplied them. Keep the
+            # evidence in the overlap without evaluating the same frames twice.
+            kept = []
+            for end, onset, samples in self.window_voice:
+                if end > window_start:
+                    samples -= max(0, round((window_start - onset) * SAMPLE_RATE))
+                    if samples > 0:
+                        kept.append((end, max(onset, window_start), samples))
+            self.window_voice = kept
+            self.first_voice = kept[0][1] if kept else None
+            self.voiced_samples = sum(item[2] for item in kept)
         if not count or self.attempted:
             return
+        onset = max(turn.start + first / SAMPLE_RATE, 0.)
+        if window_start is not None:
+            # A 10 ms VAD frame can span two chunks; ignore any samples
+            # preceding this window's left edge, even on the first kept turn.
+            count -= max(0, round((window_start - onset) * SAMPLE_RATE))
+            if count <= 0:
+                return
+            onset = max(onset, window_start)
+            self.window_voice.append((turn.end, onset, count))
         if self.first_voice is None:
-            self.first_voice = max(turn.start + first / SAMPLE_RATE, 0.)
+            self.first_voice = onset
         self.voiced_samples += count
         if self.voiced_samples < round(self.options.recovery_voiced_seconds * SAMPLE_RATE):
             return
         self.attempted = True
         start = max(self.first_voice - self.options.recovery_overlap_seconds,
-                    session.verified_commit_seconds, 0.)
+                    session.verified_commit_seconds, window_start or 0.)
         stats = result["recovery"] = {"start_seconds": start, "end_seconds": turn.end,
                                      "voiced_seconds": self.voiced_samples / SAMPLE_RATE}
         if turn.end - start > self.options.recovery_window_seconds + 1e-8:

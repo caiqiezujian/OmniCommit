@@ -14,7 +14,7 @@ def add_runtime_arguments(parser):
     parser.add_argument("--model", type=Path)
     parser.add_argument("--replies", type=Path, help="Replay only: JSON array of scripted replies; never real ASR")
     parser.add_argument("--number-format", choices=("verbatim", "normalized"), default="verbatim")
-    parser.add_argument("--context-policy", choices=("verified", "rolling"), default="verified")
+    parser.add_argument("--context-policy", choices=("window", "verified", "rolling"), default="window")
     parser.add_argument("--recent-seconds", type=float, default=12)
     parser.add_argument("--max-context-seconds", type=float, default=30)
     parser.add_argument("--max-pending-seconds", type=float, default=30)
@@ -51,10 +51,16 @@ def build_backend(args, *, manifest_validator=None, max_audio_item_seconds=0.0):
     checks = {} if manifest_validator is None else {"manifest_validator": manifest_validator}
     if args.backend == "vllm":
         from .vllm_backend import VLLMBackend
+        if args.context_policy == "window":
+            # The engine fixes the number of audio slots at startup. Reserve room
+            # for comparing longer windows in the UI without reloading weights.
+            max_audio_turns = math.ceil(args.max_window_seconds / args.chunk_seconds)
+        else:
+            max_audio_turns = math.ceil(args.max_context_seconds / args.chunk_seconds) + args.max_speakers + 2
         return VLLMBackend(
             args.model, max_context_tokens=args.max_context_tokens, max_new_tokens=args.max_new_tokens,
             tensor_parallel_size=args.tensor_parallel_size, gpu_memory_utilization=args.gpu_memory_utilization,
-            max_audio_turns=math.ceil(args.max_context_seconds / args.chunk_seconds) + args.max_speakers + 2,
+            max_audio_turns=max_audio_turns,
             max_audio_seconds=max(.5, args.chunk_seconds, args.max_reference_seconds, max_audio_item_seconds),
             enable_prefix_caching=args.enable_prefix_caching, mm_processor_cache_gb=args.mm_processor_cache_gb,
             image_slots=args.vllm_image_slots, dtype=args.dtype, **checks,

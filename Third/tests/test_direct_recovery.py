@@ -86,7 +86,7 @@ def test_rejection_keeps_primary_and_does_not_retry_per_chunk(candidate, status)
 def test_background_pause_compacts_and_short_voice_is_not_lost():
     count = 65
     session, backend = make_session([WAIT] * (count + 3), [DIRECT + "Bonjour."],
-                                    recovery_voiced_seconds=1.2, max_pending_seconds=3.2,
+                                    context_policy="rolling", recovery_voiced_seconds=1.2, max_pending_seconds=3.2,
                                     recent_seconds=1.6, max_context_seconds=3.2)
     for _ in range(count):
         result = session.step(block(.0002))
@@ -114,7 +114,7 @@ def test_overlong_window_preserves_pending_without_tail_only_decode():
 def test_consecutive_successes_keep_new_interval_but_allow_long_rolling_sessions():
     count = 60
     session, _ = make_session([WAIT] * count, [DIRECT + " "+str(i) for i in range(count)],
-                              recovery_voiced_seconds=.8, recent_seconds=1.6,
+                              context_policy="rolling", recovery_voiced_seconds=.8, recent_seconds=1.6,
                               max_context_seconds=4.8, max_pending_seconds=4.8)
     for _ in range(count):
         result = session.step(block(.1))
@@ -128,6 +128,21 @@ def test_no_recovery_when_disabled():
     for _ in range(6):
         assert "recovery" not in session.step(block(.1))
     assert not backend.calls
+
+
+def test_recovery_after_slice_uses_only_retained_voiced_evidence():
+    session, backend = make_session([WAIT] * 5 + [WAIT], [DIRECT + "Hallo"],
+                                    chunk_seconds=1., window_seconds=3., discard_seconds=2.,
+                                    recovery_voiced_seconds=2., recovery_overlap_seconds=1.)
+    for v in (.2, 0., 0.):
+        assert session.step(block(v, 1.))["text"] == WAIT
+    # Voice from the discarded first second must not trigger recovery here.
+    row = session.step(block(.3, 1.))
+    assert row["window_start_seconds"] == 2 and "recovery" not in row
+    row = session.step(block(.4, 1.))
+    assert row["primary_text"] == WAIT and row["text"] == DIRECT + "Hallo"
+    assert (row["recovery"]["start_seconds"], row["recovery"]["end_seconds"]) == (2, 5)
+    np.testing.assert_array_equal(backend.calls[0], np.concatenate([block(v, 1.) for v in (0, .3, .4)]))
 
 
 def test_carry_vad_frames_across_odd_chunk_and_exclude_literal_silence():

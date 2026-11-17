@@ -5,10 +5,10 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="omnicommit-ui" content="third-meeting-v2">
   <title>OmniCommit Third · 实时会议转录</title>
-  <link rel="stylesheet" href="/web/meeting-v2/style.css">
+  <link rel="stylesheet" href="/web/meeting-v2/style.css?v=window1">
   <script defer src="/web/meeting-v2/log-archive.js"></script>
   <script defer src="/web/meeting-v2/turn-log.js"></script>
-  <script type="module" src="/web/meeting-v2/app.js"></script>
+  <script type="module" src="/web/meeting-v2/app.js?v=window1"></script>
 </head>
 <body>
   <header><strong>OmniCommit Third</strong><span>多语种流式转录</span></header>
@@ -23,6 +23,10 @@
             <label><input type="radio" name="source" value="file"><span>音视频文件</span></label>
           </div>
           <p class="hint">音频块时长：<span id="step">—</span></p>
+          <div class="window-settings" id="windowSettings">
+            <label>窗口长度（秒）<input id="windowSeconds" type="number" min="0" step="any" value="60" disabled></label>
+            <label>每次丢弃长度（秒）<input id="discardSeconds" type="number" min="0" step="any" value="50" disabled></label>
+          </div>
           <div id="fileOptions" hidden>
             <label>选择本地文件 <input id="file" type="file" accept="audio/*,video/*"></label>
             <video id="player" controls playsinline hidden></video>
@@ -41,6 +45,7 @@
           <div class="metric">已处理：<span id="heard">0.0 s</span></div>
           <div class="metric">本地积压：<span id="queued">0.0 s</span></div>
           <div class="metric">最近推理：<span id="latency">—</span></div>
+          <div class="metric" id="windowStatus" hidden></div>
         </div>
       </section>
       <section class="card" aria-labelledby="transcriptTitle">
@@ -49,7 +54,7 @@
           <button id="saveText" disabled>导出 TXT</button>
           <button id="saveLog" disabled>导出 JSONL</button>
         </div>
-        <p class="hint">正文只显示已提交的原文。等待和补识别记录可在逐轮日志里查看。</p>
+        <p class="hint">每轮提交的正文另起一行。等待和补识别记录可在逐轮日志里查看。</p>
         <div id="words" class="transcript" aria-label="已提交的转录正文" aria-live="polite"></div>
         <details id="logPanel" open>
           <summary id="logTitle">逐轮日志 · WAIT / DIRECT</summary>

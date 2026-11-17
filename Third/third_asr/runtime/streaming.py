@@ -1,12 +1,9 @@
-"""Bounded, causal streaming state. No acoustic identity is guessed in Python.
-
-DIRECT is a text commitment, not a trustworthy consumed-audio timestamp. Only
-verified commit watermarks authorize eviction; an exhausted budget is explicit.
-"""
+"""Bounded, causal streaming state for the Third web service."""
 from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import sys
 import time
 
 import numpy as np
@@ -42,6 +39,8 @@ class StreamOptions:
     number_format: str = "verbatim"
     context_policy: str = "verified"
     rolling_tail_seconds: float = 2.0
+    window_seconds: float = 60.0
+    discard_seconds: float = 50.0
 
     def __post_init__(self):
         chunk_milliseconds(self.chunk_seconds)
@@ -56,8 +55,17 @@ class StreamOptions:
             raise ValueError("max_speakers must be a positive integer")
         if self.number_format not in ("normalized", "verbatim"):
             raise ValueError("number_format must be normalized or verbatim")
-        if self.context_policy not in ("verified", "rolling"):
-            raise ValueError("context_policy must be verified or rolling")
+        if self.context_policy not in ("verified", "rolling", "window"):
+            raise ValueError("context_policy must be verified, rolling or window")
+        if self.context_policy == "window":
+            for key in ("window_seconds", "discard_seconds"):
+                value = getattr(self, key)
+                if type(value) not in (float, int) or not 0 < value <= sys.float_info.max:
+                    raise ValueError(key + " must be positive and finite")
+            if self.chunk_seconds > self.window_seconds:
+                raise ValueError("window_seconds must be at least chunk_seconds")
+            if self.discard_seconds > self.window_seconds:
+                raise ValueError("discard_seconds must not exceed window_seconds")
 
 
 @dataclass
@@ -109,10 +117,10 @@ class StreamSession:
     def _model_reply(self, reply, end_of_audio):
         raise NotImplementedError
 
-    def _context(self, current_audio=None, end_of_audio=False):
+    def _context(self, history, current_audio=None, end_of_audio=False):
         messages = [{"role": "system", "content": self._context_system_prompt()}]
         audios = []
-        for turn in self.history:
+        for turn in history:
             messages.extend([{"role": "user", "content": "<audio>"},
                              {"role": "assistant", "content": turn.reply}])
             audios.append(turn.audio)
@@ -127,9 +135,40 @@ class StreamSession:
     def _pending_seconds(self, commit):
         return self.heard_seconds - commit
 
+    def _history_for_audio(self, duration):
+        if self.options.context_policy == "window":
+            end = self.heard_seconds + duration
+            if self.history and end - self.history[0].start > self.options.window_seconds + 1e-8:
+                # Both targets round up to a whole audio/assistant pair. An
+                # unusually small discard must still leave room for this chunk.
+                cutoff = max(self.history[0].start + self.options.discard_seconds,
+                             end - self.options.window_seconds)
+                for index, turn in enumerate(self.history, 1):
+                    if turn.end + 1e-8 >= cutoff:
+                        return self.history[index:]
+                return []
+            return self.history
+        self._trim()
+        commit = self.verified_commit_seconds
+        if self.options.context_policy == "rolling":
+            commit = max(commit, self.inferred_commit_seconds)
+        pending = self._pending_seconds(commit) + duration
+        retained = duration + sum(t.end - t.start for t in self.history)
+        if pending > self.options.max_pending_seconds + 1e-8:
+            raise ContextBudgetError(
+                f"Unverified pending audio exceeded budget ({pending:.2f}s > "
+                f"{self.options.max_pending_seconds:g}s; {self.options.context_policy} policy, "
+                f"commit watermark {commit:.2f}s, attempted audio end {self.heard_seconds + duration:.2f}s)"
+            )
+        if retained > self.options.max_context_seconds + 1e-8:
+            raise ContextBudgetError("Context audio budget exhausted; cannot safely evict uncommitted speech")
+        return self.history
+
     def step(self, audio=None, *, end_of_audio=False, final_chunk=False):
         self._check_open()
         self.evicted_this_turn = False
+        history = self.history
+        previous_start = history[0].start if history else self.heard_seconds
         if end_of_audio:
             if audio is not None or not self.history:
                 raise ValueError("EOS is text-only and requires preceding audio")
@@ -145,26 +184,13 @@ class StreamSession:
             if np.max(np.abs(pcm)) > 1.001:
                 raise ValueError("Audio samples must be in [-1,1]")
             duration = len(pcm) / SAMPLE_RATE
-            self._trim()
-            commit = self.verified_commit_seconds
-            if self.options.context_policy == "rolling":
-                commit = max(commit, self.inferred_commit_seconds)
-            pending = self._pending_seconds(commit) + duration
-            retained = duration + sum(t.end - t.start for t in self.history)
-            if pending > self.options.max_pending_seconds + 1e-8:
-                raise ContextBudgetError(
-                    f"Unverified pending audio exceeded budget ({pending:.2f}s > "
-                    f"{self.options.max_pending_seconds:g}s; {self.options.context_policy} policy, "
-                    f"commit watermark {commit:.2f}s, attempted audio end {self.heard_seconds + duration:.2f}s)"
-                )
-            if retained > self.options.max_context_seconds + 1e-8:
-                raise ContextBudgetError("Context audio budget exhausted; cannot safely evict uncommitted speech")
+            history = self._history_for_audio(duration)
             # Match SFT's last short-tail padding without inventing source time.
             short_chunk = len(pcm) < round(self.options.chunk_seconds * SAMPLE_RATE)
             minimum = self._minimum_input_samples(final_chunk or short_chunk)
             if len(pcm) < minimum:
                 pcm = np.pad(pcm, (0, minimum - len(pcm)))
-        messages, audios = self._context(pcm, end_of_audio)
+        messages, audios = self._context(history, pcm, end_of_audio)
         started = time.perf_counter()
         try:
             generated = self.backend.generate(messages, audios)
@@ -176,6 +202,10 @@ class StreamSession:
             raise
         elapsed = time.perf_counter() - started
         start = self.heard_seconds
+        if history is not self.history:
+            # Only commit a proposed window rotation once the reply is valid.
+            self.history = history
+            self.evicted_this_turn = True
         self.turn_count += 1
         self.heard_seconds += duration
         if parsed["action"] == "DIRECT" and self.options.context_policy == "rolling":
@@ -188,16 +218,20 @@ class StreamSession:
             self._short_tail = short_chunk or final_chunk
         else:
             self.closed = True
+        if self.options.context_policy == "window":
+            head = self.history[0].start
+            policy_stats = dict(window_start_seconds=head, discarded_seconds=head - previous_start)
+        else:
+            policy_stats = dict(unverified_audio_seconds=self.heard_seconds - self.verified_commit_seconds,
+                                heuristic_eviction=self.heuristic_eviction, inferred_commit_seconds=self.inferred_commit_seconds)
         return dict(parsed, turn=self.turn_count, event="end_of_audio" if end_of_audio else "audio",
                     start_seconds=start, end_seconds=self.heard_seconds,
                     generation_seconds=elapsed, realtime_factor=elapsed / duration if duration else None,
                     retained_audio_seconds=sum(t.end - t.start for t in self.history),
-                    unverified_audio_seconds=self.heard_seconds - self.verified_commit_seconds,
                     reference_speakers=[],
                     context_policy=self.options.context_policy,
-                    heuristic_eviction=self.heuristic_eviction,
                     evicted_this_turn=self.evicted_this_turn,
-                    inferred_commit_seconds=self.inferred_commit_seconds,
+                    **policy_stats,
                     prompt_tokens=generated.get("prompt_tokens") if isinstance(generated, dict) else None,
                     num_cached_tokens=generated.get("num_cached_tokens") if isinstance(generated, dict) else None)
 
