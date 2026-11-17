@@ -135,7 +135,7 @@ CUDA_VISIBLE_DEVICES=0 bash start_server.sh \
 
 ### 长音频中单轮输出截断
 
-vLLM 的 `finish_reason="length"` 表示这轮解码碰到了 token 长度上限。Third 默认给每轮预留 256 个新 token。正常的 60 秒音频窗口裁剪另行记录在 `discarded_seconds`。诊断该问题时，在网页导出的 JSONL 中查找 `truncation`，其中 `primary.generated_tokens`、`primary.prompt_tokens` 和两个配置上限对应实际失败的请求。
+vLLM 的 `finish_reason="length"` 表示这轮解码碰到了 token 长度上限。Third 默认给每轮预留 512 个新 token，总上下文默认 4352 个 token，输入仍可使用 3840 个 token。网页和 HTTP 的启动命令均接受 `--max-new-tokens` 和 `--max-context-tokens`。正常的 60 秒音频窗口裁剪另行记录在 `discarded_seconds`。诊断该问题时，在网页导出的 JSONL 中查找 `truncation`，其中 `primary.generated_tokens`、`primary.prompt_tokens` 和两个配置上限对应实际失败的请求。
 
 主解码截断后，若能缩短历史并保留末尾所有 WAIT 轮，服务会对同一块音频最多重试一次。成功时展示完整回复，记录 `status="recovered"`；默认窗口策略从这次成功的上下文继续。没有合适的重试历史或重试再次截断时，页面标出一个待复核区间，记录 `status="gap"`，下一块从空历史继续。区间覆盖最近一次出字后的待处理音频以及出错块，可能包括静音，并非逐字对齐的漏词范围。截断片段不会进入正文。对于上传文件，可以按标出的原文件起止时间单独回听或重新转录。
 

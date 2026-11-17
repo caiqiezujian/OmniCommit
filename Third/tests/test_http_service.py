@@ -1,7 +1,9 @@
 """Exercise meeting admission, timeouts and incremental audio over the real ASGI routes."""
 import asyncio
+import base64
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
+import json
 from pathlib import Path
 import sys
 import threading
@@ -40,6 +42,71 @@ def wav(data, rate=16000):
         out.setparams((1, 2, rate, 0, "NONE", ""))
         out.writeframes(data)
     return f.getvalue()
+
+
+def test_json_float32_is_lossless_across_json_wav_and_pcm_packets():
+    class Capture(ReplayBackend):
+        def __init__(self):
+            super().__init__(["first", " second", WAIT])
+            self.blocks = []
+
+        def generate(self, messages, audios):
+            if messages[-1]["content"] == "<audio>":
+                self.blocks.append(audios[-1].copy())
+            return super().generate(messages, audios)
+
+    def encoded(samples):
+        return {"data": base64.b64encode(samples.tobytes()).decode("ascii")}
+
+    model = Capture()
+    # Include floats that would change or disappear if converted through int16.
+    start = np.resize(np.array([-.12345679, 1e-9, -1., 1.], dtype="<f4"), STEP - 2)
+    middle = np.array([32767], dtype="<i2")
+    last = np.array([-32768], dtype="<i2")
+    tail = np.array([-.9876543, 1e-9], dtype="<f4")
+    path = BASE + "mixed"
+    with TestClient(app(model, max_packet_seconds=.5)) as client:
+        first = client.post(path + "/chunks", json=encoded(start))
+        assert first.status_code == 200 and first.json()["buffered_seconds"] == len(start) / 16000
+        buffered = client.post(path + "/chunks", content=wav(middle.tobytes()),
+                               headers={"Content-Type": "audio/wav"})
+        assert buffered.json()["status"] == "buffered"
+        direct = client.post(path + "/chunks", headers=RAW, content=last.tobytes()).json()
+        assert (direct["action"], direct["text"], direct["heard_seconds"]) == ("DIRECT", "first", .5)
+        assert client.post(path + "/chunks", json=encoded(tail)).json()["status"] == "buffered"
+        ended = client.post(path + "/end").json()
+    assert ended["text"] == " second" and ended["heard_seconds"] == pytest.approx(.5 + 2 / 16000)
+    full, padded = model.blocks
+    expected = np.concatenate([start, middle.astype("f4") / 32768, last.astype("f4") / 32768])
+    np.testing.assert_array_equal(full, expected)
+    np.testing.assert_array_equal(padded[:len(tail)], tail)
+    assert full.dtype == padded.dtype == np.float32 and not np.any(padded[len(tail):])
+
+
+def test_invalid_float32_requests_leave_buffer_and_capacity_intact():
+    headers = {"Content-Type": "application/json; charset=utf-8"}
+    path = BASE + "malformed"
+    def payload(raw):
+        return json.dumps({"data": base64.b64encode(raw).decode("ascii")}).encode("utf-8")
+
+    bad_bodies = [
+        b"{", b"[]", b"{}", b'{"data":null}', b'{"data":[]}', b'{"data":""}',
+        b'{"data":"AAAAAA==!"}', payload(bytes(5)),
+        *(payload(np.array([value], dtype="<f4").tobytes()) for value in [np.nan, np.inf, -np.inf, -4.]),
+    ]
+    with TestClient(app(ReplayBackend(), max_packet_seconds=.5, max_meetings=1)) as client:
+        assert client.post(path + "/chunks", content=bad_bodies[0], headers=headers).status_code == 400
+        assert client.get("/health").json()["active_meetings"] == 0
+        initial = client.post(path + "/chunks", content=payload(bytes(4)), headers=headers)
+        assert initial.json()["buffered_seconds"] == 1 / 16000
+        for body in bad_bodies:
+            assert client.post(path + "/chunks", content=body, headers=headers).status_code == 400
+        oversized = payload(bytes(4 * (STEP + 1)))
+        assert client.post(path + "/chunks", content=oversized, headers=headers).status_code == 413
+        # The preceding bad packets neither advanced the meeting nor destroyed its previous tail.
+        assert client.get(path + "/result").json() == initial.json()
+        limit = client.post(path + "/chunks", content=payload(bytes(4 * STEP)), headers=headers).json()
+        assert limit["buffered_seconds"] == 1 / 16000 and limit["heard_seconds"] == .5
 
 
 def test_reblocking_buffered_partial_and_wav_tail_with_eos():

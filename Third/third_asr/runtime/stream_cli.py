@@ -6,6 +6,7 @@ import json
 import math
 from pathlib import Path
 
+from . import DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_NEW_TOKENS
 from .streaming import ReplayBackend, StreamOptions
 
 
@@ -23,8 +24,10 @@ def add_runtime_arguments(parser, *, include_legacy_policies=True):
     else:
         parser.set_defaults(context_policy="window")
     parser.set_defaults(max_speakers=1, max_reference_seconds=.5, max_total_reference_seconds=.5)
-    parser.add_argument("--max-context-tokens", type=int, default=4096)
-    parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument("--max-context-tokens", type=int, default=DEFAULT_MAX_CONTEXT_TOKENS,
+                        help="Total prompt and output tokens per request (default: %(default)s)")
+    parser.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS,
+                        help="Reserved generation tokens per turn (default: %(default)s)")
     parser.add_argument("--device-map", default="auto")
     parser.add_argument("--dtype", choices=("auto", "bfloat16", "float16", "float32"), default="auto")
     parser.add_argument("--attention", choices=("sdpa", "flash_attention_2", "eager"), default="sdpa")

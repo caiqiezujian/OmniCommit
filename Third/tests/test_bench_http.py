@@ -1,5 +1,6 @@
 """The load client counts transport acknowledgements separately from model results."""
 from collections import defaultdict
+import base64
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
@@ -14,8 +15,10 @@ import pytest
 bench = runpy.run_path(str(Path(__file__).resolve().parents[1] / "tools" / "bench_http.py"))
 
 
-@pytest.mark.parametrize("failure", ["", "first_429", "first_502", "later_429", "gap"])
-def test_real_http_meetings_and_slo_counts(tmp_path, capsys, failure):
+@pytest.mark.parametrize(("failure", "wire_format"), [
+    ("", "pcm16"), ("", "json-f32"), ("first_429", "pcm16"), ("first_502", "pcm16"),
+    ("later_429", "pcm16"), ("gap", "pcm16")])
+def test_real_http_meetings_and_slo_counts(tmp_path, capsys, failure, wire_format):
     blocks = defaultdict(list)
     ended = []
     polls = []
@@ -49,7 +52,14 @@ def test_real_http_meetings_and_slo_counts(tmp_path, capsys, failure):
                 else:
                     self.send_json(200, dict(status="ended"))
                 return
-            assert op == "chunks" and self.headers.get("Content-Type") == "application/octet-stream"
+            assert op == "chunks"
+            if wire_format == "json-f32":
+                assert self.headers["Content-Type"] == "application/json"
+                body = base64.b64decode(json.loads(body)["data"], validate=True)
+                samples = struct.unpack("<160f", body)
+                assert all(s == samples[0] for s in samples) and samples[0] * 32768 in range(9)
+            else:
+                assert self.headers["Content-Type"] == "application/octet-stream"
             blocks[meeting].append(body)
             n = len(blocks[meeting])
             if failure == "first_429" or (failure == "later_429" and n == 2):
@@ -75,13 +85,14 @@ def test_real_http_meetings_and_slo_counts(tmp_path, capsys, failure):
     thread.start()
     try:
         code = bench["main"]([str(wav), "--url", f"http://127.0.0.1:{server.server_port}",
-                              "--concurrency", "1", "2", "--seconds", ".03"])
+                              "--concurrency", "1", "2", "--seconds", ".03", "--wire-format", wire_format])
     finally:
         server.shutdown()
         server.server_close()
         thread.join(2)
     header, *tiers = [json.loads(s) for s in capsys.readouterr().out.splitlines()]
     assert header["chunk_ms"] == 10
+    assert header["wire_format"] == wire_format
     assert len(ended) == len(set(ended)) == (0 if failure == "first_429" else 3)
     assert len({data[0] for data in blocks.values()}) == 3
     for n, summary in enumerate(tiers, 1):

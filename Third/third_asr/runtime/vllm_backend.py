@@ -12,6 +12,7 @@ from pathlib import Path
 
 import numpy as np
 
+from . import DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_NEW_TOKENS
 from .audio_token_counter import AudioTokenCounter
 from .inference_backend import AssistantPrefixDecoder, multimodal_messages
 from ..service_backend import validate_manifest
@@ -21,7 +22,8 @@ AUDIO_PLACEHOLDER = "<|audio_start|><|audio_pad|><|audio_end|>"
 
 
 class VLLMBackend(AssistantPrefixDecoder):
-    def __init__(self, model_path, *, max_context_tokens=4096, max_new_tokens=256,
+    def __init__(self, model_path, *, max_context_tokens=DEFAULT_MAX_CONTEXT_TOKENS,
+                 max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
                  tensor_parallel_size=1, gpu_memory_utilization=.85,
                  max_audio_turns=80, max_audio_seconds=5.0,
                  enable_prefix_caching=True, mm_processor_cache_gb=1.0, image_slots=1, dtype="auto",

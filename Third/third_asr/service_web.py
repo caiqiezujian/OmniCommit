@@ -107,6 +107,8 @@ def create_app(backend_factory, options, *, max_sessions=1, auto_reference_facto
                 "max_sessions": max_sessions, "chunk_seconds": options.chunk_seconds,
                 "context_policy": options.context_policy,
                 "backend": type(backend).__name__ if backend else None,
+                "max_new_tokens": getattr(backend, "max_new_tokens", None),
+                "max_context_tokens": getattr(backend, "max_context_tokens", None),
                 "native_prefix_caching": getattr(backend, "enable_prefix_caching", False),
                 "native_mm_processor_cache": getattr(backend, "mm_processor_cache_gb", 0) > 0,
                 "manual_kv_reuse": False, "file_input": bool(shutil.which("ffmpeg")),

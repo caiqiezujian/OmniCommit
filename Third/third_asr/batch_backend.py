@@ -64,6 +64,8 @@ class BatchBackend:
         try:
             backend = factory()
             self.backend_name = type(backend).__name__
+            self.max_new_tokens = getattr(backend, "max_new_tokens", None)
+            self.max_context_tokens = getattr(backend, "max_context_tokens", None)
             self.max_audio_turns = getattr(backend, "max_audio_turns", None)
             self.allowed_tokens = getattr(backend, "allowed_tokens", None)
             self.enable_prefix_caching = getattr(backend, "enable_prefix_caching", False)

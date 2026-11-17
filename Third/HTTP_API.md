@@ -1,6 +1,6 @@
 # Third 会议转录 HTTP API
 
-每个会议使用独立的 `meeting_id`。调用方按录音顺序上传短音频，同一会议等上一包返回最终结果再发下一包。不同会议可以同时发送。会议 ID 放在 URL 中，请求体直接放音频字节。接口面向内网，无需令牌或客户端序号。
+每个会议使用独立的 `meeting_id`。调用方按录音顺序上传短音频，同一会议等上一包返回最终结果再发下一包。不同会议可以同时发送。会议 ID 放在 URL 中，音频可以通过 JSON 的 `data` 字段发送 Base64 编码的 float32 波形，也可以在请求体中直接发送 PCM16 或 WAV。接口面向内网，无需令牌或客户端序号。
 
 ## 1. 启动
 
@@ -13,6 +13,7 @@ CUDA_VISIBLE_DEVICES=0 bash start_http.sh \
   /data/yb/Code/OmniCommit/models/third-explicit-merged \
   --port 18892 --chunk-ms 1000 \
   --window-seconds 60 --discard-seconds 50 \
+  --max-new-tokens 512 --max-context-tokens 4352 \
   --max-meetings 16 --max-in-flight 8 --batch-size 4 \
   --response-timeout-ms 900
 ~~~
@@ -29,12 +30,54 @@ curl -fsS http://127.0.0.1:18892/health
 | `--max-in-flight 8` | 同时接受最多 8 个上传或处理中的会议操作，容量满时返回 429。 |
 | `--batch-size 4`、`--batch-wait-ms 2` | vLLM 一次最多为 4 个独立请求生成，每批从首个请求排队开始，最多等 2 毫秒凑批。只有一路时也可立即或在等待期结束后处理。 |
 | `--chunk-ms` | 默认 800。服务会跨请求累积不足一轮的音频，再按这个长度送模型。 |
+| `--max-new-tokens 512`、`--max-context-tokens 4352` | 每轮最多生成 512 个新 token。总预算也提高了 256，以保留原有 3840 个输入 token 的空间。启动时显式填写的值优先。 |
 | `--max-packet-seconds 8` | 单个上传包的最长音频。要逐包获取一轮模型结果，建议每包恰好发送一个模型步长。 |
 | `--upload-timeout-seconds 10` | 接收单包请求体的时限。超时释放该会议的上传名额，返回 408，可以重新发该包。 |
 | `--response-timeout-ms 900` | 从服务端收到完整请求体开始计算的同步等待预算。超过预算就返回 202，GPU 继续完成该包。 |
 | `--idle-timeout-seconds 600` | 没有在处理的会议连续闲置达到该时长后释放。会议状态存在内存，重启进程会清空。 |
 
 ## 2. 传一包、取结果、结束
+
+### JSON + Base64 float32
+
+`POST /v1/meetings/{meeting_id}/chunks` 使用 `Content-Type: application/json`，请求体为 `{"data":"<Base64 字符串>"}`。`data` 编码的是 **16 kHz、单声道、小端 float32 的原始采样字节**。幅值按音频惯例归一化到 `[-1, 1]`，1 秒有 16000 个样本，编码前为 64000 字节。请直接传裸样本，WAV 头、MP3 文件、PCM16 字节均有各自的格式。已拿到符合此约定的 Base64 字符串时可原样放入 `data`。
+
+下面的客户端示例从真实音频读取 float32 波形。它按服务的模型步长发送，处理 `202`，并在文件末尾取回尾音结果。运行示例需要 `requests` 和 `soundfile`。
+
+~~~python
+import base64
+import time
+
+import requests
+import soundfile as sf
+
+base = "http://127.0.0.1:18892"
+meeting = base + "/v1/meetings/demo-001"
+
+with requests.Session() as client:
+    def collect(response):
+        while response.status_code == 202:
+            time.sleep(0.05)
+            response = client.get(base + response.json()["result_url"], timeout=5)
+        response.raise_for_status()
+        return response.json()
+
+    health = client.get(base + "/health", timeout=5)
+    health.raise_for_status()
+    frames = round(16000 * health.json()["chunk_seconds"])
+    with sf.SoundFile("meeting.16k.wav") as recording:
+        if (recording.samplerate, recording.channels) != (16000, 1):
+            raise ValueError("需要 16 kHz 单声道音频")
+        for wave_data in recording.blocks(blocksize=frames, dtype="float32"):
+            raw = wave_data.astype("<f4", copy=False).tobytes()
+            data = base64.b64encode(raw).decode("ascii")
+            result = collect(client.post(meeting + "/chunks", json={"data": data}, timeout=5))
+            print(result["status"], result["action"], result["text"], result["gaps"])
+    result = collect(client.post(meeting + "/end", timeout=5))
+    print(result["status"], result["action"], result["text"], result["gaps"])
+~~~
+
+### 二进制 PCM16 和 WAV
 
 假设 `chunk.wav` 包含会议最初的 1 秒，格式为单声道、16 kHz、PCM16 无压缩 WAV。在服务器上可以直接测试：
 
@@ -82,10 +125,12 @@ curl -i -X POST http://127.0.0.1:18892/v1/meetings/demo-001/end
 ~~~bash
 cd /data/yb/Code/OmniCommit/Third
 python tools/bench_http.py /data/test/meeting.16k.wav \
-  --url http://127.0.0.1:18892 --concurrency 1 2 4 8 \
+  --url http://127.0.0.1:18892 --wire-format json-f32 --concurrency 1 2 4 8 \
   --seconds 16 --slo-ms 1000 > a800-concurrency.jsonl
 cat a800-concurrency.jsonl
 ~~~
+
+`--wire-format json-f32` 将 WAV 里每一包 PCM16 转成归一化 float32，再通过 Base64 JSON 上传。压测输出中的 `wire_format` 标明该轮的传输格式。省略此参数时沿用裸 PCM16 上传。
 
 - `timely_percent_of_planned` 是全部计划发送的包里，首次 POST 就在预算内拿到真实 `DIRECT` 或 `WAIT` 的比例。要每包 1 秒内拿到推理判断，应检查该比例是否达到 100%，并核对 `first_post_202`、`unsent`、`errors` 及 `cleanup_errors`。模型是否确实出字还可分别看 `direct`、`wait`。
 - `final_model_result_ms.p95/p99` 从客户端将请求体写入套接字计到读完整个模型结果，包含 202 后的查询时间。`audio_ready_to_model_result_ms.p99` 还包含上一个请求过慢导致的积压。`model_results_late_from_audio_ready` 直接统计这类端到端超时。建议在实际调用方机器上测，也让网络路径与生产一致。

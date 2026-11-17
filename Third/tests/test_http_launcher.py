@@ -8,7 +8,11 @@ from unittest.mock import Mock
 import pytest
 
 
-def test_http_launcher_uses_trained_protocol_and_sizes_model_for_batching(tmp_path, monkeypatch):
+@pytest.mark.parametrize("extra, expected_budgets", [
+    ([], (512, 4352)),
+    (["--max-new-tokens", "768", "--max-context-tokens", "4608"], (768, 4608)),
+])
+def test_http_launcher_uses_trained_protocol_and_sizes_model_for_batching(tmp_path, monkeypatch, extra, expected_budgets):
     uvicorn = pytest.importorskip("uvicorn")
     pytest.importorskip("fastapi")
     path = Path(__file__).resolve().parents[1] / "tools" / "serve_http.py"
@@ -41,7 +45,8 @@ def test_http_launcher_uses_trained_protocol_and_sizes_model_for_batching(tmp_pa
         return "app"
 
     monkeypatch.setattr(http_service, "create_app", inspect)
-    launcher.main(["--model", str(tmp_path), "--chunk-ms", "1000", "--batch-size", "6", "--recovery"])
+    launcher.main(["--model", str(tmp_path), "--chunk-ms", "1000", "--batch-size", "6", "--recovery", *extra])
+    assert (engine.call_args.kwargs["max_new_tokens"], engine.call_args.kwargs["max_context_tokens"]) == expected_budgets
     assert engine.call_args.kwargs["max_audio_turns"] == 60
     assert engine.call_args.kwargs["max_audio_seconds"] == launcher.ThirdStreamOptions.recovery_window_seconds
     assert engine.call_args.kwargs["max_batch_size"] == 6

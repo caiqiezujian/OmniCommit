@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 
 from ..service_backend import validate_manifest
+from . import DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_NEW_TOKENS
 from .streaming import ContextBudgetError, GenerationTruncated, WAIT
 
 
@@ -63,7 +64,8 @@ class AssistantPrefixDecoder:
 
 
 class HFBackend(AssistantPrefixDecoder):
-    def __init__(self, model_path, *, max_context_tokens=4096, max_new_tokens=256,
+    def __init__(self, model_path, *, max_context_tokens=DEFAULT_MAX_CONTEXT_TOKENS,
+                 max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
                  device_map="auto", dtype="auto", attn_implementation="sdpa",
                  manifest_validator=validate_manifest):
         import torch

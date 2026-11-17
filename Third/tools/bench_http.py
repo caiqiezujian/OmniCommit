@@ -5,6 +5,7 @@ PCM16 WAV, including across concurrency tiers. A meeting keeps absolute packet
 ready times even if its previous response is late.
 """
 import argparse
+import base64
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -38,8 +39,8 @@ class Client:
         self.prefix = address.path.rstrip("/")
         self.timeout = timeout
 
-    def request(self, method, path, body=None):
-        headers = {"Content-Type": "application/octet-stream"} if body is not None else {}
+    def request(self, method, path, body=None, *, content_type="application/octet-stream"):
+        headers = {"Content-Type": content_type} if body is not None else {}
         self.connection.request(method, self.prefix + path, body, headers=headers)
         sent = time.perf_counter()  # Body written to the local socket.
         response = self.connection.getresponse()
@@ -80,12 +81,14 @@ class MeetingStats:
     cleanup_error: str = ""
 
 
-def stream_meeting(url, audio, first, frames, step, meeting, gate, slo_ms, timeout):
+def stream_meeting(url, audio, first, frames, step, meeting, gate, slo_ms, timeout, wire_format):
     stats = MeetingStats()
     client = Client(url, timeout)
     path = "/v1/meetings/" + meeting
     admitted = possibly_admitted = False
     try:
+        if wire_format == "json-f32":
+            import numpy as np
         with wave.open(str(audio), "rb") as source:
             source.setpos(first)
             gate.wait(timeout=timeout)
@@ -97,10 +100,17 @@ def stream_meeting(url, audio, first, frames, step, meeting, gate, slo_ms, timeo
                     raise ValueError("WAV contains fewer samples than its header declares")
                 ready = start + (offset + count) / RATE
                 time.sleep(max(0., ready - time.perf_counter()))
+                content_type = "application/octet-stream"
+                if wire_format == "json-f32":
+                    waveform = np.frombuffer(body, dtype="<i2").astype(np.float32) / 32768.0
+                    data = base64.b64encode(waveform.astype("<f4", copy=False).tobytes()).decode("ascii")
+                    body = json.dumps({"data": data}).encode("utf-8")
+                    content_type = "application/json"
                 stats.sent += 1
                 possibly_admitted = True
                 try:
-                    status, result, sent, arrived = client.request("POST", path + "/chunks", body)
+                    status, result, sent, arrived = client.request("POST", path + "/chunks", body,
+                                                                   content_type=content_type)
                 except HTTPStatusError as exc:
                     if 400 <= exc.status < 500:
                         possibly_admitted = admitted
@@ -121,7 +131,7 @@ def stream_meeting(url, audio, first, frames, step, meeting, gate, slo_ms, timeo
                 stats.result_ms.append(elapsed)
                 stats.from_ready_ms.append((arrived - ready) * 1000)
                 stats.timely += int(not delayed and elapsed <= slo_ms)
-    except (ValueError, HTTPException, OSError, threading.BrokenBarrierError, wave.Error) as exc:
+    except (ValueError, HTTPException, OSError, ImportError, threading.BrokenBarrierError, wave.Error) as exc:
         stats.error = str(exc) or type(exc).__name__
         # Each meeting sends in order. Ambiguous failures must not replay audio.
         if not stats.sent:
@@ -179,6 +189,8 @@ def main(argv=None):
     parser.add_argument("--url", default="http://127.0.0.1:18892")
     parser.add_argument("--concurrency", nargs="+", type=int, default=[1, 2, 4])
     parser.add_argument("--chunk-ms", type=int, help="Defaults to the model step reported by /health")
+    parser.add_argument("--wire-format", choices=("pcm16", "json-f32"), default="pcm16",
+                        help="Send raw PCM16 or a JSON object with base64 float32 samples (requires NumPy)")
     parser.add_argument("--seconds", type=float, help="Audio seconds per meeting; default up to 30 s")
     parser.add_argument("--slo-ms", type=float, default=1000)
     parser.add_argument("--timeout", type=float, default=15., help="Socket and delayed-result polling timeout in seconds")
@@ -213,7 +225,8 @@ def main(argv=None):
         parser.error(str(exc))
 
     print(json.dumps(dict(url=args.url, wav=str(args.audio), meeting_seconds=frames / RATE, chunk_ms=chunk_ms,
-                          model_chunk_ms=model_chunk_ms, slo_ms=args.slo_ms, warmup="none")), flush=True)
+                          model_chunk_ms=model_chunk_ms, wire_format=args.wire_format,
+                          slo_ms=args.slo_ms, warmup="none")), flush=True)
     step = RATE * chunk_ms // 1000
     run = uuid4().hex
     failed = False
@@ -222,7 +235,7 @@ def main(argv=None):
         gate = threading.Barrier(size)
         with ThreadPoolExecutor(max_workers=size) as pool:
             futures = [pool.submit(stream_meeting, args.url, args.audio, (first_meeting + n) * frames, frames, step,
-                                   f"bench-{run}-{tier}-{n}", gate, args.slo_ms, args.timeout)
+                                   f"bench-{run}-{tier}-{n}", gate, args.slo_ms, args.timeout, args.wire_format)
                        for n in range(size)]
             row = report([f.result() for f in futures], math.ceil(frames / step), args.slo_ms)
         print(json.dumps(row, ensure_ascii=False), flush=True)

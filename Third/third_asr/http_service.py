@@ -1,10 +1,12 @@
 """HTTP transport for Third's streaming protocol. One meeting owns one acoustic history."""
 import asyncio
+import base64
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import io
+import json
 import math
 import time
 from urllib.parse import quote
@@ -22,11 +24,39 @@ PCM_TYPES = {"audio/pcm", "application/octet-stream"}
 WAV_TYPES = {"audio/wav", "audio/wave", "audio/x-wav"}
 
 
+def decode_json_audio(body, sample_limit):
+    try:
+        packet = json.loads(body)
+    except (ValueError, RecursionError) as exc:
+        raise HTTPException(400, "Invalid JSON audio packet") from exc
+    encoded = packet.get("data") if isinstance(packet, dict) else None
+    if not isinstance(encoded, str) or not encoded:
+        raise HTTPException(400, "Send a JSON object with a nonempty base64 string in data")
+    if len(encoded) > 4 * ((sample_limit * 4 + 2) // 3):
+        raise HTTPException(413, "Float32 audio packet exceeds configured duration")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except ValueError as exc:
+        raise HTTPException(400, "data must contain standard base64") from exc
+    if len(raw) > sample_limit * 4:
+        raise HTTPException(413, "Float32 audio packet exceeds configured duration")
+    if not raw or len(raw) % 4:
+        raise HTTPException(400, "Decoded data must contain whole float32 samples")
+    samples = np.frombuffer(raw, dtype="<f4")
+    if not np.isfinite(samples).all() or np.max(np.abs(samples)) > 1.001:
+        raise HTTPException(400, "Decoded float32 samples must be finite and normalized to [-1, 1]")
+    return samples
+
+
 async def read_packet(request, sample_limit):
     media = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-    if media not in PCM_TYPES | WAV_TYPES:
-        raise HTTPException(415, "Send audio/pcm (signed PCM16 LE, mono, 16000 Hz) or audio/wav")
-    limit = sample_limit * 2 + (65536 if media in WAV_TYPES else 0)
+    if media == "application/json":
+        # Base64 expands each three bytes to four characters. Allow a small JSON envelope.
+        limit = 4 * ((sample_limit * 4 + 2) // 3) + 4096
+    elif media in PCM_TYPES | WAV_TYPES:
+        limit = sample_limit * 2 + (65536 if media in WAV_TYPES else 0)
+    else:
+        raise HTTPException(415, "Send JSON base64 float32 LE, raw PCM16 LE, or PCM16 WAV (mono, 16000 Hz)")
     declared = request.headers.get("content-length")
     if declared is not None:
         if not declared.isdecimal():
@@ -39,6 +69,8 @@ async def read_packet(request, sample_limit):
             raise HTTPException(413, "Audio packet exceeds configured size limit")
         body.extend(piece)
     received_at = time.monotonic()
+    if media == "application/json":
+        return decode_json_audio(body, sample_limit), received_at
     if media in WAV_TYPES:
         if len(body) < 12 or int.from_bytes(body[4:8], "little") + 8 > len(body):
             raise HTTPException(400, "Incomplete WAV container")
@@ -57,7 +89,9 @@ async def read_packet(request, sample_limit):
             raise HTTPException(400, "Invalid PCM16 WAV container") from exc
     if not body or len(body) % 2:
         raise HTTPException(400, "Send at least one whole PCM16 sample")
-    return bytes(body), received_at
+    samples = np.frombuffer(body, dtype="<i2").astype(np.float32)
+    samples /= 32768.0
+    return samples, received_at
 
 
 @dataclass
@@ -65,26 +99,26 @@ class Meeting:
     meeting_id: str
     session: ThirdStreamSession
     touched: float
-    tail: bytes = b""
+    tail: np.ndarray = None
     last: object = None
     job: object = None
     needs_collection: bool = False
 
-    def process(self, pcm, ending):
+    def process(self, audio, ending):
         """Worker thread only. Never submit short intermediate packets as final model turns."""
-        audio = self.tail + pcm
-        self.tail = b""
-        step_bytes = round(self.session.options.chunk_seconds * SAMPLE_RATE) * 2
+        if self.tail is not None:
+            audio = np.concatenate((self.tail, audio))
+            self.tail = None
+        step_samples = round(self.session.options.chunk_seconds * SAMPLE_RATE)
         offset = 0
         turns = []
         try:
-            while len(audio) - offset >= step_bytes or (ending and offset < len(audio)):
-                stop = min(len(audio), offset + step_bytes)
-                block = np.frombuffer(audio, dtype="<i2", count=(stop - offset) // 2,
-                                      offset=offset).astype(np.float32) / 32768.
-                turns.append(self.session.step(block, final_chunk=ending and stop == len(audio)))
+            while len(audio) - offset >= step_samples or (ending and offset < len(audio)):
+                stop = min(len(audio), offset + step_samples)
+                turns.append(self.session.step(audio[offset:stop], final_chunk=ending and stop == len(audio)))
                 offset = stop
-            self.tail = audio[offset:]
+            if offset < len(audio):
+                self.tail = audio[offset:].copy()
             if ending:
                 turns.append(self.session.step(end_of_audio=True))
             status = "ended" if ending else ("ok" if turns else "buffered")
@@ -106,10 +140,10 @@ class Meeting:
                 action = "WAIT"
         payload = dict(meeting_id=self.meeting_id, status=status, action=action, text=text, turns=turns, gaps=gaps,
                        heard_seconds=self.session.heard_seconds,
-                       buffered_seconds=len(self.tail) / (SAMPLE_RATE * 2))
+                       buffered_seconds=self.tail.size / SAMPLE_RATE if self.tail is not None else 0.0)
         if error is not None:
             payload["error"] = error
-            payload["unprocessed_seconds"] = (len(audio) - offset) / (SAMPLE_RATE * 2)
+            payload["unprocessed_seconds"] = (len(audio) - offset) / SAMPLE_RATE
         return code, payload
 
 
@@ -184,6 +218,8 @@ def create_app(backend_factory, options, *, max_meetings=16, max_in_flight=8,
     async def health():
         return {"ready": backend is not None, "service": "third_http",
                 "backend": getattr(backend, "backend_name", type(backend).__name__),
+                "max_new_tokens": getattr(backend, "max_new_tokens", None),
+                "max_context_tokens": getattr(backend, "max_context_tokens", None),
                 "action_protocol": options.protocol, "context_policy": options.context_policy,
                 "chunk_seconds": options.chunk_seconds, "window_seconds": options.window_seconds,
                 "discard_seconds": options.discard_seconds,
@@ -241,7 +277,7 @@ def create_app(backend_factory, options, *, max_meetings=16, max_in_flight=8,
         reserve(key, ending)
         try:
             if ending:
-                pcm, received_at = b"", time.monotonic()
+                pcm, received_at = np.empty(0, dtype=np.float32), time.monotonic()
             else:
                 try:
                     pcm, received_at = await asyncio.wait_for(read_packet(request, sample_limit), upload_timeout_seconds)
@@ -267,9 +303,13 @@ def create_app(backend_factory, options, *, max_meetings=16, max_in_flight=8,
 
     @app.post("/v1/meetings/{meeting_id}/chunks", summary="Append one audio packet to a meeting",
               openapi_extra={"requestBody": {"required": True,
-                  "description": "16 kHz, mono, signed PCM16 little-endian, raw or in a WAV container",
-                  "content": {media: {"schema": {"type": "string", "format": "binary"}}
-                              for media in ("audio/pcm", "audio/wav", "application/octet-stream")}}},
+                  "description": "16 kHz mono audio. JSON uses base64 raw little-endian float32. Binary uses PCM16.",
+                  "content": {
+                      "application/json": {"schema": {"type": "object", "required": ["data"], "properties": {
+                          "data": {"type": "string", "format": "byte",
+                                   "description": "Standard base64 of normalized mono float32 LE samples"}}}},
+                      **{media: {"schema": {"type": "string", "format": "binary"}}
+                         for media in ("audio/pcm", "audio/wav", "application/octet-stream")}}}},
               responses={200: {"description": "Model result, partial result with explicit gaps, or buffered audio"},
                          202: {"description": "Accepted and still processing; poll the Location URL"},
                          409: {"description": "Outstanding operation or closed meeting"},
