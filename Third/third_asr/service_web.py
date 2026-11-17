@@ -60,7 +60,8 @@ def create_app(backend_factory, options, *, max_sessions=1, auto_reference_facto
 
     @app.get("/")
     async def index():
-        return FileResponse(web_directory / "index.html")
+        return FileResponse(web_directory / "meeting-v2" / "index.html",
+                            headers={"Cache-Control": "no-store"})
 
     @app.get("/health")
     async def health():

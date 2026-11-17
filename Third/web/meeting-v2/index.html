@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="omnicommit-ui" content="third-meeting-v2">
+  <title>OmniCommit Third · 实时会议转录</title>
+  <link rel="stylesheet" href="/web/meeting-v2/style.css">
+  <script defer src="/web/meeting-v2/log-archive.js"></script>
+  <script defer src="/web/meeting-v2/turn-log.js"></script>
+  <script type="module" src="/web/meeting-v2/app.js"></script>
+</head>
+<body>
+  <header><strong>OmniCommit Third</strong><span>多语种流式转录</span></header>
+  <main>
+    <div class="grid">
+      <section class="card" aria-labelledby="sourceTitle">
+        <h2 id="sourceTitle">音频来源</h2>
+        <fieldset id="settings" aria-labelledby="sourceTitle">
+          <div class="tabs">
+            <label><input type="radio" name="source" value="microphone" checked><span>麦克风</span></label>
+            <label><input type="radio" name="source" value="system"><span>电脑声音</span></label>
+            <label><input type="radio" name="source" value="file"><span>音视频文件</span></label>
+          </div>
+          <p class="hint">音频块时长：<span id="step">—</span></p>
+          <div id="fileOptions" hidden>
+            <label>选择本地文件 <input id="file" type="file" accept="audio/*,video/*"></label>
+            <video id="player" controls playsinline hidden></video>
+            <label><input id="playback" type="checkbox" checked> 跟随播放器进度</label>
+            <p class="hint">取消勾选即可连续逐块识别整个文件。</p>
+          </div>
+        </fieldset>
+        <div class="buttons">
+          <button id="start" class="primary" disabled>开始转录</button>
+          <button id="stop" disabled>结束并处理尾部</button>
+        </div>
+        <p id="status" class="status" role="status">等待开始</p>
+        <p id="health" class="hint" role="status">正在连接模型…</p>
+        <p id="captureHelp" class="hint">麦克风与电脑声音需要 HTTPS 或 localhost；电脑声音需在共享窗口中勾选共享音频。</p>
+        <div class="controls">
+          <div class="metric">已处理：<span id="heard">0.0 s</span></div>
+          <div class="metric">本地积压：<span id="queued">0.0 s</span></div>
+          <div class="metric">最近推理：<span id="latency">—</span></div>
+        </div>
+      </section>
+      <section class="card" aria-labelledby="transcriptTitle">
+        <h2 id="transcriptTitle">实时转录</h2>
+        <div class="buttons">
+          <button id="saveText" disabled>导出 TXT</button>
+          <button id="saveLog" disabled>导出 JSONL</button>
+        </div>
+        <p class="hint">正文只显示已提交的原文。等待和补识别记录可在逐轮日志里查看。</p>
+        <div id="words" class="transcript" aria-label="已提交的转录正文" aria-live="polite"></div>
+        <details id="logPanel" open>
+          <summary id="logTitle">逐轮日志 · WAIT / DIRECT</summary>
+          <div class="log-toolbar">
+            <label>会议 <select id="logSession" aria-label="日志会议"></select></label>
+            <label>显示
+              <select id="logFilter">
+                <option value="model">模型全部轮次</option>
+                <option value="WAIT">仅 WAIT</option>
+                <option id="committedFilter" value="DIRECT">仅 DIRECT</option>
+                <option value="all">全部事件（含文件轮询）</option>
+              </select>
+            </label>
+            <button id="logTxt">下载逐轮 TXT</button>
+            <button id="logJsonl">下载完整日志 JSONL</button>
+          </div>
+          <div class="log-nav">
+            <button id="logFirst">最早</button>
+            <button id="logPrev">上一页</button>
+            <button id="logNext">下一页</button>
+            <button id="logLatest">看最新</button>
+            <label><input type="checkbox" id="logFollow"> 跟随最新</label>
+            <span id="logRange"></span>
+            <span id="logCounts" class="hint"></span>
+          </div>
+          <p id="logProgress" class="hint"></p>
+          <p id="logError" class="error" hidden></p>
+          <div id="events" tabindex="0" aria-label="逐轮日志内容"></div>
+          <p class="hint">日志保存在当前浏览器。点开一条记录可查看完整字段。</p>
+          <p class="error" id="logWarning" role="status" hidden></p>
+        </details>
+      </section>
+    </div>
+  </main>
+</body>
+</html>

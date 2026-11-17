@@ -117,6 +117,8 @@ CUDA_VISIBLE_DEVICES=0 bash start_server.sh \
 
 服务启动时读取模型清单，`/health` 中的 `action_protocol` 显示 `explicit` 或 `plain`，`gap_recovery` 显示恢复开关。页面和 TXT 导出展示新增正文。JSONL 导出保留逐轮的动作、原始输出和恢复记录。
 
+网页单独更新时，将整个 `web/` 解压到正在提供服务的 `Third/web/`，再打开同一服务的 `/web/meeting-v2/index.html`。这是深蓝色会议页的版本化地址，HTML、样式、脚本和采音模块都由该版本目录提供。原来的首页地址也可以继续使用。
+
 ### 连续有声 WAIT 的恢复
 
 平时由模型选择动作。对显式模型，服务在 CPU 使用 WebRTC VAD 统计尚未提交的轮次中有多少秒人声。默认累计 2.4 秒人声后，服务用同一台 GPU 上的同一个 Omni 单独重听这一段，解码从当前 assistant 的 `<|DIRECT|>` 之后开始。恢复窗口默认最多 6.4 秒，可带最近最多 0.8 秒的跨界音频。三个时长分别用 `--recovery-voiced-seconds`、`--recovery-window-seconds` 和 `--recovery-overlap-seconds` 设置。静音和结束事件均不触发补识别。

@@ -102,9 +102,26 @@ def test_web_from_standalone_cli(deployed, tmp_path):
                 assert client.get("/health").json()["action_protocol"] == "explicit"
                 page = client.get("/")
                 assert page.status_code == 200
+                assert "no-store" in page.headers["cache-control"]
+                bundle = "/web/meeting-v2/"
+                canonical = bundle + "index.html"
+                current = client.get(canonical)
+                assert current.status_code == 200 and current.content == page.content
                 for asset in ("style.css", "app.js", "log-archive.js", "turn-log.js"):
-                    url = "/web/" + asset
+                    url = bundle + asset
                     assert url in page.text and client.get(url).status_code == 200
+                capture = bundle + "capture.js"
+                assert capture in client.get(bundle + "app.js").text
+                assert client.get(capture).status_code == 200
+
+                # An already running static server still serves web/index.html;
+                # a cached old HTML document still asks for /web/app.js.
+                landing = client.get("/web/index.html")
+                assert landing.status_code == 200 and 'http-equiv="refresh"' in landing.text
+                assert canonical in landing.text
+                legacy_app = client.get("/web/app.js")
+                assert legacy_app.status_code == 200
+                assert f'location.replace("{canonical}")' in legacy_app.text
                 with client.websocket_connect("/stream") as ws:
                     ws.send_json({"type": "start", "sample_rate": 16000, "source_kind": "microphone"})
                     assert ws.receive_json()["protocol"] == "third"
