@@ -29,11 +29,11 @@ def test_vllm_direct_prefix_counts_against_context_and_preserves_continuation():
     )
     backend.audio_counter = SimpleNamespace(count=lambda *args: (7, False))
     requests = []
+    completion = SimpleNamespace(token_ids=[20, 99], finish_reason="stop")
 
     def run(batch, sampling, **kwargs):
         request, = batch
         requests.append(request)
-        completion = SimpleNamespace(token_ids=[20, 99], finish_reason="stop")
         return [SimpleNamespace(prompt_token_ids=[0] * 9, outputs=[completion])]
 
     backend.llm = SimpleNamespace(generate=run)
@@ -47,3 +47,7 @@ def test_vllm_direct_prefix_counts_against_context_and_preserves_continuation():
     with pytest.raises(ContextBudgetError):
         backend.generate_with_prefix(messages, [audio], direct)
     assert len(requests) == 1
+    backend.max_context_tokens = 32
+    completion.finish_reason = "abort"
+    with pytest.raises(RuntimeError, match="abort"):
+        backend.generate_with_prefix(messages, [audio], direct)
