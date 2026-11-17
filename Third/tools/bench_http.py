@@ -110,8 +110,8 @@ def stream_meeting(url, audio, first, frames, step, meeting, gate, slo_ms, timeo
                 delayed = status == 202
                 stats.delayed += int(delayed)
                 result, arrived = client.collect(path, status, result, arrived)
-                if result.get("status") == "buffered":
-                    stats.actions["buffered"] += 1
+                if result.get("status") in ("buffered", "partial"):
+                    stats.actions[result["status"]] += 1
                     continue
                 action = result.get("action")
                 if action not in ("DIRECT", "WAIT"):
@@ -132,7 +132,9 @@ def stream_meeting(url, audio, first, frames, step, meeting, gate, slo_ms, timeo
                 if stats.error:
                     client.close()  # A failed or timed-out read can leave an unusable socket.
                 status, result, _, arrived = client.request("POST", path + "/end")
-                client.collect(path, status, result, arrived)
+                result, _ = client.collect(path, status, result, arrived)
+                if result.get("gaps"):
+                    stats.actions["end_with_gap"] += 1
             except HTTPStatusError as exc:
                 if admitted or exc.status != 404:
                     stats.cleanup_error = str(exc)
@@ -158,6 +160,7 @@ def report(meetings, chunks, slo_ms):
     return dict(concurrency=len(meetings), planned_chunks=planned, sent=sent, unsent=planned - sent,
                 first_post_202=sum(m.delayed for m in meetings),
                 direct=actions["DIRECT"], wait=actions["WAIT"], buffered=actions["buffered"],
+                partial_packets=actions["partial"], end_with_gap=actions["end_with_gap"],
                 first_post_with_model_result_within_slo=timely,
                 planned_without_timely_model_result=planned - timely,
                 timely_percent_of_planned=round(100 * timely / planned, 2),
@@ -223,7 +226,7 @@ def main(argv=None):
                        for n in range(size)]
             row = report([f.result() for f in futures], math.ceil(frames / step), args.slo_ms)
         print(json.dumps(row, ensure_ascii=False), flush=True)
-        failed |= bool(row["errors"] or row["cleanup_errors"])
+        failed |= bool(row["errors"] or row["cleanup_errors"] or row["partial_packets"] or row["end_with_gap"])
         first_meeting += size
     return int(failed)
 

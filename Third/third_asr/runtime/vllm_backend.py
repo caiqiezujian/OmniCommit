@@ -15,7 +15,7 @@ import numpy as np
 from .audio_token_counter import AudioTokenCounter
 from .inference_backend import AssistantPrefixDecoder, multimodal_messages
 from ..service_backend import validate_manifest
-from .streaming import ContextBudgetError, WAIT
+from .streaming import ContextBudgetError, GenerationTruncated, WAIT
 
 AUDIO_PLACEHOLDER = "<|audio_start|><|audio_pad|><|audio_end|>"
 
@@ -124,14 +124,15 @@ class VLLMBackend(AssistantPrefixDecoder):
         if len(output.outputs) != 1:
             raise RuntimeError("Unexpected vLLM completion count")
         completion = output.outputs[0]
-        if completion.finish_reason == "length":
-            raise RuntimeError("vLLM generation truncated; no partial output committed")
-        if completion.finish_reason != "stop":
+        if completion.finish_reason not in ("stop", "length"):
             raise RuntimeError(f"Unexpected vLLM finish reason {completion.finish_reason!r}; no partial output committed")
-        actual_ids=getattr(output,"prompt_token_ids",None)
+        actual_ids = getattr(output, "prompt_token_ids", None)
         if actual_ids is None or len(actual_ids)!=expected:
             self.audio_counter.disable("actual expansion mismatch")
             raise RuntimeError("Actual multimodal prompt expansion differs from audited counter")
+        if completion.finish_reason == "length":
+            raise GenerationTruncated("vLLM", len(completion.token_ids), len(actual_ids), self.max_new_tokens,
+                                      self.max_context_tokens)
         tokens=list(completion.token_ids)
         while tokens and tokens[-1] in self.stop_ids:
             tokens.pop()

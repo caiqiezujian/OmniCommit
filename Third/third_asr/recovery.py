@@ -4,7 +4,7 @@ import unicodedata
 
 import numpy as np
 
-from .runtime.streaming import SAMPLE_RATE
+from .runtime.streaming import GenerationTruncated, SAMPLE_RATE
 from .protocol import DIRECT
 
 
@@ -22,6 +22,9 @@ class SpeechActivity:
     frame_samples = SAMPLE_RATE // 100
 
     def __init__(self):
+        self.reset()
+
+    def reset(self):
         self.vad = check_recovery_dependencies().Vad(2)
         self.tail = np.array([], dtype=np.int16)
 
@@ -102,6 +105,11 @@ class VoicedWaitRecovery:
         self.voiced_samples = 0
         self.attempted = False
         self.window_voice = []
+
+    def on_gap(self):
+        self.reset()
+        if hasattr(self.activity, "reset"):
+            self.activity.reset()
 
     def observe(self, session, result):
         turn = session.history[-1]
@@ -207,6 +215,8 @@ class VoicedWaitRecovery:
                 session.inferred_commit_seconds = max(session.inferred_commit_seconds, cutoff)
                 result["inferred_commit_seconds"] = session.inferred_commit_seconds
             self.reset()
+        except GenerationTruncated as exc:
+            stats.update(status="truncated", reason=str(exc), **exc.as_dict())
         except Exception as exc:
             # Failure of an optional shadow decode preserves the primary WAIT.
             stats.update(status="error", reason=str(exc))

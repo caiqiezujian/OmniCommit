@@ -94,8 +94,17 @@ class Meeting:
             # Preserve them for the caller, then retire this meeting.
             code, status, error = 500, "error", str(exc)
         text = "".join(turn["display_text"] for turn in turns)
-        action = ("DIRECT" if text else "WAIT") if turns and error is None else None
-        payload = dict(meeting_id=self.meeting_id, status=status, action=action, text=text, turns=turns,
+        gaps = [dict(turn["truncation"], turn=turn["turn"], event=turn["event"]) for turn in turns
+                if turn.get("truncation", {}).get("status") == "gap"]
+        if gaps and status == "ok":
+            status = "partial"
+        action = None
+        if error is None:
+            if text:
+                action = "DIRECT"
+            elif turns and not gaps and all(turn["action"] == "WAIT" for turn in turns):
+                action = "WAIT"
+        payload = dict(meeting_id=self.meeting_id, status=status, action=action, text=text, turns=turns, gaps=gaps,
                        heard_seconds=self.session.heard_seconds,
                        buffered_seconds=len(self.tail) / (SAMPLE_RATE * 2))
         if error is not None:
@@ -261,7 +270,7 @@ def create_app(backend_factory, options, *, max_meetings=16, max_in_flight=8,
                   "description": "16 kHz, mono, signed PCM16 little-endian, raw or in a WAV container",
                   "content": {media: {"schema": {"type": "string", "format": "binary"}}
                               for media in ("audio/pcm", "audio/wav", "application/octet-stream")}}},
-              responses={200: {"description": "Model result or audio buffered until the next model step"},
+              responses={200: {"description": "Model result, partial result with explicit gaps, or buffered audio"},
                          202: {"description": "Accepted and still processing; poll the Location URL"},
                          409: {"description": "Outstanding operation or closed meeting"},
                          429: {"description": "Capacity reached; packet was not accepted"}})

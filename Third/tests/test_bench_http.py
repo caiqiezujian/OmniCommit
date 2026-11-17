@@ -14,7 +14,7 @@ import pytest
 bench = runpy.run_path(str(Path(__file__).resolve().parents[1] / "tools" / "bench_http.py"))
 
 
-@pytest.mark.parametrize("failure", ["", "first_429", "first_502", "later_429"])
+@pytest.mark.parametrize("failure", ["", "first_429", "first_502", "later_429", "gap"])
 def test_real_http_meetings_and_slo_counts(tmp_path, capsys, failure):
     blocks = defaultdict(list)
     ended = []
@@ -59,7 +59,10 @@ def test_real_http_meetings_and_slo_counts(tmp_path, capsys, failure):
             elif n == 1:
                 self.send_json(202, dict(status="processing"))
             elif n == 2:
-                self.send_json(200, dict(status="ok", action="DIRECT", text="Hi."))
+                if failure == "gap":
+                    self.send_json(200, dict(status="partial", action=None, text="", gaps=[{}]))
+                else:
+                    self.send_json(200, dict(status="ok", action="DIRECT", text="Hi."))
             else:
                 self.send_json(200, dict(status="buffered"))
 
@@ -83,7 +86,11 @@ def test_real_http_meetings_and_slo_counts(tmp_path, capsys, failure):
     assert len({data[0] for data in blocks.values()}) == 3
     for n, summary in enumerate(tiers, 1):
         assert summary["planned_chunks"] == n * 3
-        if failure:
+        if failure == "gap":
+            assert code == 1 and summary["partial_packets"] == n and not summary["errors"]
+            assert summary["unsent"] == 0 and summary["buffered"] == n
+            assert summary["first_post_with_model_result_within_slo"] == 0
+        elif failure:
             assert code == 1
             assert summary["http_4xx" if failure.endswith("429") else "http_5xx"] == n
             assert bool(summary["cleanup_errors"]) == (failure == "later_429")

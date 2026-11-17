@@ -18,6 +18,27 @@ from .runtime.media import MediaCursor, MediaStore
 from .service_session import ThirdStreamSession
 
 
+def annotate_file_result(row, cursor, source_start, source_end):
+    row["source_start_seconds"] = source_start
+    row["source_end_seconds"] = source_end
+    gap = row.get("truncation", {})
+    if gap.get("status") != "gap":
+        return
+    for key in ("start_seconds", "end_seconds"):
+        value = gap[key]
+        if value == row["end_seconds"]:
+            absolute = source_end
+        elif value == row["start_seconds"]:
+            absolute = source_start
+        else:
+            # Earlier completed turns lie on the chunk grid. MediaCursor rounds
+            # each nominal millisecond boundary up to a whole source frame.
+            rate = cursor.upload.sample_rate
+            frame_offset = (round(value * 1000) * rate + 999) // 1000
+            absolute = (cursor.start_frame + frame_offset) / rate
+        gap["source_" + key] = absolute
+
+
 def create_app(backend_factory, options, *, max_sessions=1, auto_reference_factory=None,
                max_window_seconds=None):
     if auto_reference_factory is not None:
@@ -259,8 +280,7 @@ def create_app(backend_factory, options, *, max_sessions=1, auto_reference_facto
                 if cursor is not None:
                     # Track the decoded source frames separately. The model sees
                     # session-relative 16 kHz packets; a short tail may round differently.
-                    result["source_start_seconds"] = source_heard
-                    result["source_end_seconds"] = attempted_source_end
+                    annotate_file_result(result, cursor, source_heard, attempted_source_end)
                     source_heard = attempted_source_end
                     attempted_source_end = None
                 result["new_segments"] = []

@@ -13,7 +13,7 @@ THIRD = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(THIRD))
 
 from third_asr.runtime.media import MediaCursor
-from third_asr.runtime.streaming import ContextBudgetError, ReplayBackend
+from third_asr.runtime.streaming import ContextBudgetError, GenerationTruncated, ReplayBackend
 from third_asr.protocol import EOS, WAIT, system_prompt
 from third_asr.service_backend import read_export_protocol, validate_manifest
 from third_asr.service_session import ThirdStreamOptions, ThirdStreamSession
@@ -120,6 +120,38 @@ def test_file_range_uses_negotiated_window_relative_to_range_start():
                 assert (row["window_start_seconds"], row["end_seconds"], row["source_end_seconds"]) == (head, turn, 4 + turn)
             ws.send_json({"type": "end"})
             assert ws.receive_json()["window_start_seconds"] == 2
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="requires FFmpeg")
+def test_file_gap_keeps_websocket_open_and_reports_whole_source_interval():
+    class Capped:
+        replies = iter(["Before", WAIT, None, None, " after.", WAIT])
+        def generate(self, messages, audios):
+            text = next(self.replies)
+            if text is None:
+                raise GenerationTruncated("vLLM", 8, 50, 8, 4096)
+            return text
+
+    wav = BytesIO()
+    with wave.open(wav, "wb") as audio:
+        audio.setparams((1, 2, 16000, 0, "NONE", ""))
+        audio.writeframes(bytes(8 * 16000 * 2))
+    from fastapi.testclient import TestClient
+    with TestClient(create_app(Capped, ThirdStreamOptions(chunk_seconds=1))) as client:
+        upload = client.post("/api/media", content=wav.getvalue()).json()
+        with client.websocket_connect("/stream") as ws:
+            start(ws, "file", media_id=upload["media_id"], file_start_seconds=4, file_end_seconds=8)
+            rows = []
+            for release in (5, 6, 7, 8):
+                ws.send_json(dict(type="file_next", release_seconds=release))
+                rows.append(ws.receive_json())
+            assert [r["action"] for r in rows] == ["DIRECT", "WAIT", None, "DIRECT"]
+            gap = rows[2]["truncation"]
+            assert (gap["start_seconds"], gap["end_seconds"]) == (1, 3)
+            assert (gap["source_start_seconds"], gap["source_end_seconds"]) == (5, 7)
+            assert rows[2]["source_start_seconds"] == 6 and rows[3]["source_end_seconds"] == 8
+            ws.send_json({"type": "end"})
+            assert ws.receive_json()["text"] == WAIT
 
 
 def test_silence_compaction_and_voiced_pending_guard():

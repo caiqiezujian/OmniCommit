@@ -7,7 +7,7 @@ import pytest
 
 THIRD = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(THIRD))
-from third_asr.runtime.streaming import SAMPLE_RATE
+from third_asr.runtime.streaming import GenerationTruncated, SAMPLE_RATE
 from third_asr.protocol import DIRECT, WAIT
 from third_asr.recovery import SpeechActivity, novel_continuation
 from third_asr.service_session import ThirdStreamOptions, ThirdStreamSession
@@ -70,13 +70,16 @@ def test_crossing_recovery_updates_model_history_and_never_duplicates_prefix():
 
 @pytest.mark.parametrize("candidate,status", [
     (DIRECT, "rejected"), (WAIT, "rejected"), (DIRECT + "!", "rejected"),
-    (DIRECT + "Thank you!", "rejected"), (RuntimeError("retry failed"), "error")])
+    (DIRECT + "Thank you!", "rejected"), (RuntimeError("retry failed"), "error"),
+    (GenerationTruncated("vLLM", 256, 400, 256, 4096), "truncated")])
 def test_rejection_keeps_primary_and_does_not_retry_per_chunk(candidate, status):
     session, backend = make_session([DIRECT + "Thank you.", WAIT, WAIT, WAIT, WAIT],
                                     [candidate], recovery_voiced_seconds=.8)
     session.step(block(.1))
     result = session.step(block(.5))
     assert result["recovery"]["status"] == status and result["text"] == WAIT
+    if status == "truncated":
+        assert result["recovery"]["generated_tokens"] == 256 and "truncation" not in result
     assert session.history[-1].reply == WAIT and session.inferred_commit_seconds == 0
     assert "recovery" not in session.step(block(.5))
     assert "recovery" not in session.step(end_of_audio=True)

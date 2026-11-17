@@ -4,15 +4,20 @@
 const LOG_PAGE_SIZE = 50;
 
 function logHistory(protocol = 'third') {
-  return {protocol, all: [], model: [], WAIT: [], DIRECT: [], waitRun: 0, waitSeconds: 0, lastDirect: null, error: null};
+  return {protocol, all: [], model: [], WAIT: [], DIRECT: [], gaps: [], waitRun: 0, waitSeconds: 0, lastDirect: null, error: null};
 }
 
 function indexLogRow(history, row) {
   history.all.push(row);
   if (row.type === 'ready' && row.protocol) history.protocol = row.protocol;
   if (row.type === 'error') history.error = row;
-  if (row.type === 'result' && (row.action === 'WAIT' || row.action === 'DIRECT')) {
-    history.model.push(row);
+  if (row.type !== 'result') return;
+  history.model.push(row);
+  if (row.truncation?.status === 'gap') {
+    history.gaps.push(row);
+    history.waitRun = 0;
+    history.waitSeconds = 0;
+  } else if (row.action === 'WAIT' || row.action === 'DIRECT') {
     history[row.action].push(row);
     if (row.action === 'DIRECT') {
       history.lastDirect = row;
@@ -25,6 +30,16 @@ function indexLogRow(history, row) {
   }
 }
 
+function gapMessage(row) {
+  const gap = row.truncation;
+  const file = Number.isFinite(gap.source_start_seconds) && Number.isFinite(gap.source_end_seconds);
+  const start = file ? gap.source_start_seconds : gap.start_seconds;
+  const end = file ? gap.source_end_seconds : gap.end_seconds;
+  const where = file ? '原文件 ' : '';
+  if (row.event === 'end_of_audio' && start === end) return where + end.toFixed(3) + ' 秒，结束轮解码未完成';
+  return where + start.toFixed(3) + '–' + end.toFixed(3) + ' 秒，转录待核对';
+}
+
 function logHeading(row) {
   if (row.type !== 'result') return row.type;
   const fields = ['第 ' + row.turn + ' 轮'];
@@ -34,6 +49,9 @@ function logHeading(row) {
     fields.push(row.start_seconds.toFixed(2) + '–' + row.end_seconds.toFixed(2) + ' s');
   }
   if (row.event === 'end_of_audio') fields.push('音频结束');
+  if (row.truncation?.status === 'gap') fields.push(gapMessage(row));
+  if (row.truncation?.status === 'recovered') fields.push('生成达到长度上限，重试已完成');
+  if (row.end_reason === 'gap_already_reported') fields.push('已关闭，缺口见上一条记录');
   if (row.evicted_this_turn) fields.push('本轮裁剪');
   if (Number.isFinite(row.generation_seconds)) fields.push('模型 ' + row.generation_seconds.toFixed(2) + ' s');
   return fields.join(' · ');
@@ -223,7 +241,8 @@ class MeetingTurnLog {
     const commit = this.view.protocol === 'second' ? '正文' : 'DIRECT';
     g('logTitle').textContent = '逐轮日志 · WAIT / ' + commit;
     g('committedFilter').textContent = '仅' + (commit === 'DIRECT' ? ' DIRECT' : '正文');
-    g('logCounts').textContent = 'WAIT ' + this.view.WAIT.length + ' · ' + commit + ' ' + this.view.DIRECT.length;
+    g('logCounts').textContent = 'WAIT ' + this.view.WAIT.length + ' · ' + commit + ' ' + this.view.DIRECT.length
+      + (this.view.gaps.length ? ' · 缺口 ' + this.view.gaps.length : '');
     const {lastDirect, waitRun, waitSeconds, error} = this.view;
     const details = [];
     if (lastDirect) {

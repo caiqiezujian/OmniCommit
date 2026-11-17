@@ -41,7 +41,6 @@ class ThirdStreamSession(StreamSession):
         self.protocol = get_protocol(self.options.protocol)
         self.recovery = None
         self.committed_tail = ""
-        self.last_text_end = 0.
         self.quiet_waits = set()
         self.quiet_evicted_seconds = 0.
         if self.options.protocol == "explicit" and self.options.enable_recovery:
@@ -60,7 +59,12 @@ class ThirdStreamSession(StreamSession):
     def step(self, audio=None, *, end_of_audio=False, final_chunk=False):
         self.quiet_evicted_seconds = 0.
         result = super().step(audio, end_of_audio=end_of_audio, final_chunk=final_chunk)
-        if self.recovery is not None and not end_of_audio:
+        if result.get("truncation", {}).get("status") == "gap":
+            self.quiet_waits.clear()
+            self.committed_tail = ""
+            if self.recovery is not None:
+                self.recovery.on_gap()
+        elif self.recovery is not None and not end_of_audio:
             self.recovery.observe(self, result)
             seconds = result.get("recovery", {}).get("seconds", 0.)
             if seconds:

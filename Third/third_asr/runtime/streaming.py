@@ -27,6 +27,27 @@ class ContextBudgetError(RuntimeError):
     """No safe eviction remains. Do not drop pending speech and continue."""
 
 
+class GenerationTruncated(RuntimeError):
+    """A single decode exhausted its length budget before the reply completed."""
+
+    def __init__(self, backend, generated_tokens, prompt_tokens, max_new_tokens, max_context_tokens):
+        self.backend = backend
+        self.generated_tokens = generated_tokens
+        self.prompt_tokens = prompt_tokens
+        self.max_new_tokens = max_new_tokens
+        self.max_context_tokens = max_context_tokens
+        super().__init__(
+            f"{backend} generation truncated (generated_tokens={generated_tokens}, "
+            f"max_new_tokens={max_new_tokens}, prompt_tokens={prompt_tokens}, "
+            f"max_context_tokens={max_context_tokens}). Partial output discarded."
+        )
+
+    def as_dict(self):
+        return {"backend": self.backend, "generated_tokens": self.generated_tokens,
+                "prompt_tokens": self.prompt_tokens, "max_new_tokens": self.max_new_tokens,
+                "max_context_tokens": self.max_context_tokens}
+
+
 @dataclass
 class StreamOptions:
     chunk_seconds: float = .5
@@ -92,6 +113,8 @@ class StreamSession:
         self.failed = False
         self.turn_count = 0
         self._short_tail = False
+        self._last_gap_end = 0.0
+        self.last_text_end = 0.0
 
     def _check_open(self):
         if self.closed or self.failed:
@@ -133,7 +156,45 @@ class StreamSession:
         return SAMPLE_RATE // 2 if final_chunk else SAMPLE_RATE // 100
 
     def _pending_seconds(self, commit):
-        return self.heard_seconds - commit
+        return self.heard_seconds - max(commit, self._last_gap_end)
+
+    def _generate_turn(self, history, pcm, end_of_audio):
+        messages, audios = self._context(history, pcm, end_of_audio)
+        generated = self.backend.generate(messages, audios)
+        reply = generated["text"] if isinstance(generated, dict) else generated
+        return generated, self._model_reply(reply, end_of_audio)
+
+    def _decode_turn(self, history, pcm, end_of_audio):
+        try:
+            generated, parsed = self._generate_turn(history, pcm, end_of_audio)
+            return generated, parsed, history
+        except GenerationTruncated as first:
+            diagnostic = {"status": "gap", "primary": first.as_dict()}
+
+        # Change the greedy prompt for at most one retry; retain trailing WAIT
+        # audio. A DIRECT is a conversational anchor, not a verified watermark.
+        for index in range(len(history) - 1, -1, -1):
+            if history[index].reply == WAIT:
+                continue
+            # When the anchor is already first, drop just the anchor so the
+            # request differs from the one that just exhausted its budget.
+            suffix = history[max(1, index):]
+            if end_of_audio and not suffix:
+                break
+            diagnostic["retry_history_turns"] = len(suffix)
+            try:
+                generated, parsed = self._generate_turn(suffix, pcm, end_of_audio)
+            except GenerationTruncated as second:
+                diagnostic["retry"] = second.as_dict()
+                break
+            diagnostic["status"] = "recovered"
+            parsed["truncation"] = diagnostic
+            # Extend the successful prompt on the next windowed decode. Other
+            # policies retain their established watermark-based eviction rules.
+            return generated, parsed, suffix if self.options.context_policy == "window" else history
+
+        diagnostic["start_seconds"] = max(self.last_text_end, self._last_gap_end, self.verified_commit_seconds)
+        return None, {"action": None, "text": "", "display_text": "", "segments": [], "truncation": diagnostic}, history
 
     def _history_for_audio(self, duration):
         if self.options.context_policy == "window":
@@ -170,7 +231,7 @@ class StreamSession:
         history = self.history
         previous_start = history[0].start if history else self.heard_seconds
         if end_of_audio:
-            if audio is not None or not self.history:
+            if audio is not None or (not self.history and not self._last_gap_end):
                 raise ValueError("EOS is text-only and requires preceding audio")
             duration, pcm = 0.0, None
         else:
@@ -190,12 +251,16 @@ class StreamSession:
             minimum = self._minimum_input_samples(final_chunk or short_chunk)
             if len(pcm) < minimum:
                 pcm = np.pad(pcm, (0, minimum - len(pcm)))
-        messages, audios = self._context(history, pcm, end_of_audio)
         started = time.perf_counter()
         try:
-            generated = self.backend.generate(messages, audios)
-            reply = generated["text"] if isinstance(generated, dict) else generated
-            parsed = self._model_reply(reply, end_of_audio)
+            if end_of_audio and not history:
+                # The final audio already has a reported gap; there is no audio
+                # prompt left to send. Finish without fabricating an EOS reply.
+                generated = None
+                parsed = {"action": None, "text": "", "display_text": "", "segments": [],
+                          "end_reason": "gap_already_reported"}
+            else:
+                generated, parsed, history = self._decode_turn(history, pcm, end_of_audio)
         except Exception as exc:
             # State remains uncommitted. No fabricated WAIT hides model errors.
             self.failed = not isinstance(exc, self.retryable_errors)
@@ -213,13 +278,19 @@ class StreamSession:
             # speech was emitted. A long-held entity can exceed this guard.
             self.inferred_commit_seconds = max(self.inferred_commit_seconds,
                 self.heard_seconds - self.options.rolling_tail_seconds)
-        if not end_of_audio:
+        if parsed.get("truncation", {}).get("status") == "gap":
+            parsed["truncation"]["end_seconds"] = self.heard_seconds
+            self._last_gap_end = self.heard_seconds
+            self.history.clear()
+            self.evicted_this_turn = True
+        elif not end_of_audio:
             self.history.append(AudioTurn(start, self.heard_seconds, pcm, parsed["text"]))
+        if not end_of_audio:
             self._short_tail = short_chunk or final_chunk
         else:
             self.closed = True
         if self.options.context_policy == "window":
-            head = self.history[0].start
+            head = self.history[0].start if self.history else self.heard_seconds
             policy_stats = dict(window_start_seconds=head, discarded_seconds=head - previous_start)
         else:
             policy_stats = dict(unverified_audio_seconds=self.heard_seconds - self.verified_commit_seconds,

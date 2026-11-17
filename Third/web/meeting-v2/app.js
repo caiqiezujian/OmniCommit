@@ -4,6 +4,7 @@ const selected = () => document.querySelector("input[name=source]:checked").valu
 const player = $("player");
 let health, running, mediaURL;
 let transcript = [];
+let gapCount = 0;
 const turnLog = new MeetingTurnLog($, download);
 
 function status(message, error = false) {
@@ -43,6 +44,14 @@ $("saveLog").onclick = () => download("third.jsonl", "application/x-ndjson", tur
 function showResult(result) {
   if (result.type !== "result") return;
   $("saveLog").disabled = false;
+  if (result.truncation?.status === "gap") {
+    const message = gapMessage(result);
+    gapCount++;
+    $("gapNotice").textContent = "本场有 " + gapCount + " 条转录缺口记录。最近一次：" + message + "。";
+    $("gapNotice").hidden = false;
+    transcript.push("[" + message + "]");
+    $("saveText").disabled = false;
+  }
   if (result.action === "DIRECT") {
     const text = result.display_text;
     const box = $("words");
@@ -296,6 +305,8 @@ $("start").onclick = async () => {
       throw Error("服务端未确认所选窗口，请核对 Third 服务版本并重新开始。");
     }
     transcript = [];
+    gapCount = 0;
+    $("gapNotice").hidden = true;
     $("words").replaceChildren();
     $("windowStatus").hidden = true;
     $("heard").textContent = $("queued").textContent = "0.0 s";
@@ -319,10 +330,10 @@ $("start").onclick = async () => {
 
 fetch("/health", {cache: "no-store"}).then(r => r.json()).then(info => {
   if (!info.ready || info.protocol !== "third") throw Error("Third 服务尚未就绪");
-  if (!$("windowSettings")) {
+  if (!$("windowSettings") || !$("gapNotice")) {
     // Older HTML may still load this script through its unversioned URL.
-    if (location.search === "?ui=window1") throw Error("服务仍返回旧版页面，请确认 Third 已更新并刷新。");
-    location.replace("/?ui=window1");
+    if (location.search === "?ui=gaps1") throw Error("服务仍返回旧版页面，请确认 Third 已更新并刷新。");
+    location.replace("/?ui=gaps1");
     return;
   }
   const hasWindow = info.context_policy === "window";

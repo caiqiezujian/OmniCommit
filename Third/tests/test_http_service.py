@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from third_asr.http_service import create_app
-from third_asr.runtime.streaming import ReplayBackend
+from third_asr.runtime.streaming import GenerationTruncated, ReplayBackend
 from third_asr.service_session import ThirdStreamOptions
 
 
@@ -133,6 +133,42 @@ def test_inference_error_preserves_partial_commits_and_capacity():
         assert client.get(BASE+"failed/result").json() == failed.json()
         assert client.get("/health").json()["active_meetings"] == 0
         assert audio(client, "new", 2).status_code == 200
+
+
+def test_length_gap_in_a_multi_turn_packet_preserves_commits_and_continues():
+    class Capped:
+        replies = iter(["before", WAIT, None, None, " after", None, None])
+        def generate(self, messages, audios):
+            text = next(self.replies)
+            if text is None:
+                raise GenerationTruncated("vLLM", 8, 60, 8, 4096)
+            return text
+
+    with TestClient(app(Capped())) as client:
+        row = audio(client, "long", count=4 * STEP).json()
+        assert row["status"] == "partial" and row["action"] == "DIRECT" and row["text"] == "before after"
+        assert [t["action"] for t in row["turns"]] == ["DIRECT", "WAIT", None, "DIRECT"]
+        gap, = row["gaps"]
+        assert (gap["turn"], gap["event"], gap["start_seconds"], gap["end_seconds"]) == (3, "audio", .5, 1.5)
+        assert audio(client, "long", count=100).json()["status"] == "buffered"
+        end = client.post(BASE+"long/end").json()
+        assert end["status"] == "ended" and end["action"] is None and len(end["gaps"]) == 1
+        assert end["gaps"][0]["start_seconds"] == 2
+        assert end["gaps"][0]["end_seconds"] == pytest.approx(2 + 100/16000)
+        assert end["turns"][-1]["end_reason"] == "gap_already_reported"
+        assert client.get(BASE+"long/result").json() == end
+
+
+def test_gap_only_response_and_following_end_do_not_claim_model_wait():
+    class Capped:
+        def generate(self, messages, audios):
+            raise GenerationTruncated("vLLM", 8, 60, 8, 4096)
+    with TestClient(app(Capped())) as client:
+        row = audio(client, "only-gap").json()
+        assert (row["status"], row["action"], row["text"]) == ("partial", None, "")
+        assert len(row["gaps"]) == 1
+        end = client.post(BASE+"only-gap/end").json()
+        assert end["status"] == "ended" and end["action"] is None and end["gaps"] == []
 
 
 def test_invalid_audio_does_not_allocate_or_modify_a_meeting():

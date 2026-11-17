@@ -10,7 +10,7 @@ from pathlib import Path
 import re
 
 from ..service_backend import validate_manifest
-from .streaming import ContextBudgetError, WAIT
+from .streaming import ContextBudgetError, GenerationTruncated, WAIT
 
 
 def validate_manifest_token_ids(tokenizer, manifest):
@@ -124,7 +124,7 @@ class HFBackend(AssistantPrefixDecoder):
         generated = ids[0, count:].tolist()
         # A max-length partial transcript must not be committed as complete.
         if len(generated) >= self.max_new_tokens and generated[-1] not in self.stop_ids + [self.wait_id]:
-            raise RuntimeError("Generation hit max_new_tokens before completing a reply")
+            raise GenerationTruncated("HF", len(generated), count, self.max_new_tokens, self.max_context_tokens)
         while generated and generated[-1] in self.stop_ids:
             generated.pop()
         text = self.tokenizer.decode(generated, skip_special_tokens=False,

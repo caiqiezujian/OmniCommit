@@ -7,8 +7,8 @@
   <title>OmniCommit Third · 实时会议转录</title>
   <link rel="stylesheet" href="/web/meeting-v2/style.css?v=window1">
   <script defer src="/web/meeting-v2/log-archive.js"></script>
-  <script defer src="/web/meeting-v2/turn-log.js"></script>
-  <script type="module" src="/web/meeting-v2/app.js?v=window1"></script>
+  <script defer src="/web/meeting-v2/turn-log.js?v=gaps1"></script>
+  <script type="module" src="/web/meeting-v2/app.js?v=gaps1"></script>
 </head>
 <body>
   <header><strong>OmniCommit Third</strong><span>多语种流式转录</span></header>
@@ -55,6 +55,7 @@
           <button id="saveLog" disabled>导出 JSONL</button>
         </div>
         <p class="hint">每轮提交的正文另起一行。等待和补识别记录可在逐轮日志里查看。</p>
+        <p id="gapNotice" class="error" role="status" hidden></p>
         <div id="words" class="transcript" aria-label="已提交的转录正文" aria-live="polite"></div>
         <details id="logPanel" open>
           <summary id="logTitle">逐轮日志 · WAIT / DIRECT</summary>
@@ -65,6 +66,7 @@
                 <option value="model">模型全部轮次</option>
                 <option value="WAIT">仅 WAIT</option>
                 <option id="committedFilter" value="DIRECT">仅 DIRECT</option>
+                <option value="gaps">仅转录缺口</option>
                 <option value="all">全部事件（含文件轮询）</option>
               </select>
             </label>

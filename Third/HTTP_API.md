@@ -50,6 +50,7 @@ curl -i -X POST http://127.0.0.1:18892/v1/meetings/demo-001/chunks \
 | `200`，`status="ok"`，`action="DIRECT"` | 将 `text` 追加到该会议的转录中。只包含本包新提交的正文，保留原始空格。 |
 | `200`，`status="ok"`，`action="WAIT"` | 本次模型确实返回了 WAIT，正文为空。可以发送下一包。 |
 | `200`，`status="buffered"` | 已收音频尚不足一次模型步长，`action=null`。继续发下一包，剩余秒数见 `buffered_seconds`。 |
+| `200`，`status="partial"` | 包内有模型输出截断且未恢复的轮次。取走其他成功轮次的 `text`，保存 `gaps` 中的会议秒数区间供复核，继续发送下一包。没有成功正文时 `action=null`。 |
 | `202`，`status="processing"` | 已接受这包，模型结果尚未就绪。用 GET 查询同一响应中的 `result_url`，拿到最终结果后再发下一包。 |
 | `409` | 检查同一会议是否已有未取回的操作，或 ID 已结束。用 GET 读取其状态。 |
 | `429` | 这次上传未被接收，调用方可稍后重新发送该包。 |
@@ -68,7 +69,7 @@ curl -i http://127.0.0.1:18892/v1/meetings/demo-001/result
 
 GET 在处理期间返回 202。完成后可读到最近一个操作的最终结果。一个请求覆盖多个模型步长时，`turns` 保留每轮的 `action`、`display_text` 及音频时间，顶层 `text` 按顺序拼接新增正文，`heard_seconds` 是会议已经过模型处理的累计秒数。一次 POST 响应在网络中丢失时，先查结果；本协议按顺序发送，没有逐包重发去重能力。
 
-最后一包发送并取回后结束会议，服务处理不足一步的尾音，再执行模型的结束轮。此接口同样可能返回 202。终态为 `status="ended"`，需要取走其中新增的 `text`。结束或失败的最近结果在内存中短暂保留，建议每场新会议使用新的 ID。
+最后一包发送并取回后结束会议，服务处理不足一步的尾音，再执行模型的结束轮。此接口同样可能返回 202。终态为 `status="ended"`，需要取走其中新增的 `text`，并检查 `gaps` 中的待复核区间。若最后一包已报告缺口且没有新音频，结束事件只关闭会议。结束或失败的最近结果在内存中短暂保留，建议每场新会议使用新的 ID。
 
 ~~~bash
 curl -i -X POST http://127.0.0.1:18892/v1/meetings/demo-001/end
@@ -89,5 +90,6 @@ cat a800-concurrency.jsonl
 - `timely_percent_of_planned` 是全部计划发送的包里，首次 POST 就在预算内拿到真实 `DIRECT` 或 `WAIT` 的比例。要每包 1 秒内拿到推理判断，应检查该比例是否达到 100%，并核对 `first_post_202`、`unsent`、`errors` 及 `cleanup_errors`。模型是否确实出字还可分别看 `direct`、`wait`。
 - `final_model_result_ms.p95/p99` 从客户端将请求体写入套接字计到读完整个模型结果，包含 202 后的查询时间。`audio_ready_to_model_result_ms.p99` 还包含上一个请求过慢导致的积压。`model_results_late_from_audio_ready` 直接统计这类端到端超时。建议在实际调用方机器上测，也让网络路径与生产一致。
 - `/health` 中的 `batch_stats.largest_batch` 是启动以来一次提交给模型的最大请求数，可检查服务是否真正合批。稳定档位还应跨窗口验证，例如 4 路、每路 120 秒需要至少 480 秒音频，使用 `--concurrency 4 --seconds 120` 复测。
+- `partial_packets` 和 `end_with_gap` 分别统计含未恢复截断的音频包和结束操作。压测继续发送后续音频，有缺口的包不会被计为达标；存在缺口时工具最终返回非零状态。
 
 上述 16 场常驻、8 个在途、4 个合批都是可调整的配置。A800 能满足一秒目标的并发数取决于权重、上下文长度、输出文本长度、预热及负载，需要读取实际压测结果。

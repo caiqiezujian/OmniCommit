@@ -10,7 +10,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from third_asr.batch_backend import BatchBackend
-from third_asr.runtime.streaming import ContextBudgetError
+from third_asr.runtime.streaming import ContextBudgetError, GenerationTruncated
 from third_asr.runtime.vllm_backend import VLLMBackend
 
 
@@ -40,7 +40,8 @@ def engine_fixture():
         outputs = []
         for req in requests:
             token = int(req["multi_modal_data"]["audio"][0][0])
-            completion = SimpleNamespace(token_ids=[token, 99], finish_reason="length" if token == 4 else "stop")
+            completion = (SimpleNamespace(token_ids=[token] * backend.max_new_tokens, finish_reason="length")
+                          if token == 4 else SimpleNamespace(token_ids=[token, 99], finish_reason="stop"))
             outputs.append(SimpleNamespace(prompt_token_ids=req["prompt_token_ids"]+[2],
                                            outputs=[completion], num_cached_tokens=token))
         return outputs
@@ -65,7 +66,9 @@ def test_vllm_validates_each_prompt_and_maps_plain_and_prefill_results_in_order(
     assert isinstance(replies[1], ValueError)
     assert replies[2] == {"text": DIRECT + "2", "prompt_tokens": 3, "num_cached_tokens": 2}
     assert isinstance(replies[3], ContextBudgetError)
-    assert isinstance(replies[4], RuntimeError) and "truncated" in str(replies[4])
+    assert isinstance(replies[4], GenerationTruncated) and "truncated" in str(replies[4])
+    assert replies[4].as_dict() == {"backend": "vLLM", "generated_tokens": 3, "prompt_tokens": 2,
+                                    "max_new_tokens": 3, "max_context_tokens": 16}
     assert isinstance(replies[5], ValueError)
 
 
