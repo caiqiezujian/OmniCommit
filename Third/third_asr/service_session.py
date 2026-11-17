@@ -6,7 +6,7 @@ import math
 
 import numpy as np
 
-from omnicommit.streaming import StreamOptions, StreamSession
+from .runtime.streaming import StreamOptions, StreamSession
 from .protocol import WAIT, get_protocol
 from .recovery import VoicedWaitRecovery
 

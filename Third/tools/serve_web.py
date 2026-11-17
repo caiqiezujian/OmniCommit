@@ -5,19 +5,18 @@ from pathlib import Path
 import sys
 
 THIRD = Path(__file__).resolve().parents[1]
-sys.path[:0] = [str(THIRD), str(THIRD.parent)]
+sys.path.insert(0, str(THIRD))
 
-from omnicommit.stream_cli import add_runtime_arguments, runtime_options
-from omnicommit.web_service import add_web_arguments, serve_web
+from third_asr.runtime.stream_cli import add_runtime_arguments, runtime_options
 from third_asr.service_backend import build_backend, detect_model_protocol
 from third_asr.service_session import ThirdStreamOptions
-from third_asr.service_web import create_app
+from third_asr.service_web import add_web_arguments, create_app, serve_web
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    add_runtime_arguments(parser, include_chunk=False, include_references=False)
-    add_web_arguments(parser, include_references=False)
+    add_runtime_arguments(parser)
+    add_web_arguments(parser)
     parser.add_argument("--chunk-ms", type=int, default=800, help="Audio step used during SFT")
     parser.add_argument("--protocol", choices=["auto", "explicit", "plain"], default="auto",
                         help="Auto-detect the trained action format from the merged checkpoint")

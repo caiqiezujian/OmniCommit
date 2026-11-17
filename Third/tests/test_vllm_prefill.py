@@ -1,11 +1,14 @@
 """Exercise forced decoding on one concatenated acoustic window, without a GPU."""
+from pathlib import Path
 from types import SimpleNamespace
+import sys
 
 import numpy as np
 import pytest
 
-from omnicommit.streaming import ContextBudgetError
-from omnicommit.vllm_backend import VLLMBackend
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from third_asr.runtime.streaming import ContextBudgetError
+from third_asr.runtime.vllm_backend import VLLMBackend
 
 
 def test_vllm_direct_prefix_counts_against_context_and_preserves_continuation():

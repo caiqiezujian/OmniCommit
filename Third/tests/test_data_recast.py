@@ -1,4 +1,4 @@
-"""Compare real Second and Third build commands on the same chunk grid."""
+"""Check the Third build command against expected audio intervals and transcript turns."""
 import json
 from pathlib import Path
 import shutil
@@ -8,8 +8,9 @@ import wave
 
 import pytest
 
-ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "Third"))
+THIRD = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(THIRD))
+from third_asr.chunk_refs import decode_chunk_ref
 from third_asr.protocol import DIRECT, EOS, WAIT, get_protocol, parse_reply
 
 
@@ -17,7 +18,8 @@ from third_asr.protocol import DIRECT, EOS, WAIT, get_protocol, parse_reply
 def test_standalone_third_build_on_one_second_grid(tmp_path, mode):
     # Deploy only Third, allowing both its location and its folder name to change.
     deployment = tmp_path / "standalone-asr"
-    shutil.copytree(ROOT / "Third", deployment, ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copytree(THIRD / "Data-Scripts", deployment / "Data-Scripts")
+    shutil.copytree(THIRD / "third_asr", deployment / "third_asr", ignore=shutil.ignore_patterns("__pycache__"))
     work = tmp_path / "input"
     work.mkdir()
     with wave.open(str(work / "talk.wav"), "wb") as wav:
@@ -51,7 +53,7 @@ def test_standalone_third_build_on_one_second_grid(tmp_path, mode):
 
 @pytest.mark.parametrize("mode", ["semantic-unit", "timed-span"])
 @pytest.mark.parametrize("protocol_name", ["plain", "explicit"])
-def test_third_preserves_second_turns_and_text(tmp_path, mode, protocol_name):
+def test_third_preserves_intervals_and_text(tmp_path, mode, protocol_name):
     path = tmp_path / "switch.wav"
     with wave.open(str(path), "wb") as wav:
         wav.setparams((1, 2, 16000, 0, "NONE", ""))
@@ -70,21 +72,18 @@ def test_third_preserves_second_turns_and_text(tmp_path, mode, protocol_name):
     }
     source = tmp_path / "data.jsonl"
     source.write_text("invalid\n" + json.dumps(record) + "\n", encoding="utf-8")
-    outputs = {}
-    for family in ("Second", "Third"):
-        out = tmp_path / family
-        cmd = [sys.executable, str(ROOT / family / "Data-Scripts" / "build_sft.py"), str(source),
-               "--output-dir", str(out), "--release-on", mode]
-        if family == "Second":
-            cmd.extend(["--chunk-ms", "800"])
-        elif protocol_name == "plain":
-            cmd.extend(["--protocol", "plain"])
-        subprocess.run(cmd, check=True, capture_output=True)
-        summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
-        assert (summary["kept"], summary["rejected"], summary["chunk_ms"]) == (1, 1, [800])
-        outputs[family] = json.loads((out / "train.800ms.jsonl").read_text(encoding="utf-8"))
-    assert outputs["Second"]["audios"] == outputs["Third"]["audios"]
-    prompts = outputs["Third"]["messages"]
+    out = tmp_path / "training"
+    cmd = [sys.executable, str(THIRD / "Data-Scripts" / "build_sft.py"), str(source),
+           "--output-dir", str(out), "--release-on", mode, "--protocol", protocol_name]
+    subprocess.run(cmd, check=True, capture_output=True)
+    summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    assert (summary["kept"], summary["rejected"], summary["chunk_ms"]) == (1, 1, [800])
+    row = json.loads((out / "train.800ms.jsonl").read_text(encoding="utf-8"))
+    refs = [decode_chunk_ref(ref) for ref in row["audios"]]
+    assert [(ref["start"], ref["end"]) for ref in refs] == [(0, 0.8), (0.8, 1.6), (1.6, 2.36)]
+    assert all(Path(ref["path"]) == path for ref in refs)
+    assert [ref["input_seconds"] for ref in refs] == pytest.approx([.8, .8, .76])
+    prompts = row["messages"]
     protocol = get_protocol(protocol_name)
     assert prompts[0]["content"] == protocol.system_prompt("normalized")
     assert summary["protocol"] == protocol_name
@@ -93,9 +92,7 @@ def test_third_preserves_second_turns_and_text(tmp_path, mode, protocol_name):
     expected = ([WAIT, "发给你了。Let's"] if mode == "semantic-unit" else ["发给你了。", "Let's"])
     assert replies == [text if text == WAIT or protocol_name == "plain" else DIRECT + text
                        for text in [*expected, " meet tomorrow.", WAIT]]
-    second = [m["content"] for m in outputs["Second"]["messages"] if m["role"] == "assistant"]
-    assert [text == WAIT for text in second] == [text == WAIT for text in replies]
-    assert (tmp_path / "Third" / "train.800ms.jsonl.tokens.txt").read_text().splitlines() == list(protocol.tokens)
+    assert (out / "train.800ms.jsonl.tokens.txt").read_text().splitlines() == list(protocol.tokens)
 
 
 @pytest.mark.parametrize("invalid", ["", " ", " <|WAIT|>", "<|WAIT|>x", "<zh>好", "<spk1>hey", "<|DIRECT|>x"])

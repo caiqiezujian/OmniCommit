@@ -8,8 +8,8 @@ import numpy as np
 import pytest
 
 THIRD = Path(__file__).resolve().parents[1]
-sys.path[:0] = [str(THIRD), str(THIRD.parent)]
-from omnicommit.streaming import ReplayBackend
+sys.path.insert(0, str(THIRD))
+from third_asr.runtime.streaming import ReplayBackend
 from third_asr.protocol import DIRECT, WAIT, get_protocol
 from third_asr.service_backend import read_export_protocol
 from third_asr.service_session import ThirdStreamOptions

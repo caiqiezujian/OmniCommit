@@ -2,7 +2,7 @@
 
 Third 每轮接收一块新音频。默认 `explicit` 模式把 assistant 的两种回复训练为 `<|DIRECT|>新增原文` 和独立的 `<|WAIT|>`。同一轮可以提交两种语言的正文，相邻轮次也可以连续提交。语种或说话人变化时仍按文字的时间戳提交。音频结束后 user 发送 `<end_of_audio>`，assistant 回复 `<|WAIT|>`。
 
-从 Third 目录运行以下命令。原始语种、说话人和时间戳继续保存在源数据里，供检查语种切换和漏词时使用。最终训练 JSONL 只含 `audios` 和 `messages`，其中 `audios` 是指向原录音区间的虚拟引用；训练容器须能访问引用中的音频绝对路径。
+部署时将整个 `Third/` 目录复制到服务器，在该目录运行以下命令。数据构建、训练预检、MCore/HF 训练、LoRA 合并和 Web 服务都从本目录加载项目代码。模型、训练框架和数据按服务器原有路径使用。原始语种、说话人和时间戳保存在源数据里。最终训练 JSONL 中的 `audios` 引用原录音区间，训练容器须能读取引用中的音频绝对路径。
 
 ~~~bash
 cd /data/yb/Code/OmniCommit/Third
@@ -31,7 +31,7 @@ python Data-Scripts/build_sft.py \
   --output-dir /data/yb/Code/OmniCommit/datasets/third_recast_1000ms_001
 ~~~
 
-输入每行含一个原始音频路径、带归属的完整 assistant 参考转录、`output.segments[].source_text`，以及逐段对应的 `timestamps[].start_ms/end_ms`。时间相对于该录音起点，单位毫秒。可以直接使用 Second 拼接脚本生成的 `combined.jsonl`。每条有效录音在 `train.1000ms.jsonl` 中生成一行。构建摘要在 `summary.json`，无效记录的行号及错误在 `rejected.jsonl`。[Second 输入示例](../Second/README.md#1-准备输入)
+输入每行含一个原始音频路径、带归属的完整 assistant 参考转录、`output.segments[].source_text`，以及逐段对应的 `timestamps[].start_ms/end_ms`。时间相对于该录音起点，单位毫秒。也可以直接读取已有的 `combined.jsonl`。每条有效录音在 `train.1000ms.jsonl` 中生成一行。构建摘要在 `summary.json`，无效记录的行号及错误在 `rejected.jsonl`。
 
 默认等完整语义段到期再提交。若输入确有更细的、覆盖正文的 `timestamps[].spans[]`，可用 `--release-on timed-span` 采用子段终点。只有切换时刻或另存的字符数组时，先将对齐结果整理为这个输入格式。原蒸馏段中的 `action` 不决定新一轮的 WAIT。用 `--chunk-ms 1000` 可生成 1 秒网格。与已有 800 ms Second 模型做对照时，使用相同的源录音、提交粒度及训练配方。
 
@@ -48,9 +48,9 @@ python Data-Scripts/build_sft.py \
 
 ## 2. 检查并训练
 
-从完整仓库的 `Third/` 目录启动。`SFT-Scripts/train_sft.sh` 和 `SFT-Scripts/train_sft_swift4.sh` 都会直接指定 Third 的检查器、SWIFT 插件和模板，再调用仓库顶层 `SFT-Scripts/recipes/` 的训练脚本。预检前，日志会打印 `template=omnicommit_third_qwen3_omni` 和检查器、插件的实际路径。
+`SFT-Scripts/train_sft.sh` 和 `SFT-Scripts/train_sft_swift4.sh` 分别启动 MCore 和 HF 配方。两者的训练脚本、预检、虚拟音频读取和 SWIFT 插件都随 Third 一起部署。预检前，日志会打印 `template=omnicommit_third_qwen3_omni` 和 Third 检查器、插件的实际路径。
 
-下面的训练和导出示例使用第一个入口生成的文件。若使用上面的 1 秒重铸示例，训练数据路径填 `third_recast_1000ms_001/train.1000ms.jsonl`，合并时使用同文件旁的 `.tokens.txt`，启动服务时传 `--chunk-ms 1000`。在训练服务器上先检查前两条真实音频，去掉 `--rows 2 --decode` 可进行全量结构预检。
+MCore 示例使用 1 秒数据，其余示例展示 800 毫秒数据。按实际实验填写训练 JSONL、合并时使用的同名 `.tokens.txt` 和服务的 `--chunk-ms`。在训练服务器上可先检查前两条真实音频，去掉 `--rows 2 --decode` 可进行全量结构预检。
 
 ~~~bash
 python SFT-Scripts/check_sft.py \
@@ -58,14 +58,16 @@ python SFT-Scripts/check_sft.py \
   --rows 2 --decode
 ~~~
 
-**ms-swift 3.12.1 / MCore** 使用已转换的 MCore 基座。下面按 4 卡、每 1000 步保存给出，训练结果写入容器的 `/data` 挂载目录。
+**MCore 训练**使用已转换的 MCore 基座。下面的 1 秒实验使用八卡、长度 4096、global batch 64 和 micro batch 4，训练一个 epoch，每 1000 步保存一次。
 
 ~~~bash
 bash SFT-Scripts/train_sft.sh \
-  /data/data_process/lzy/qwen3_omni_mega/train/qwen3_omni_mcore_3.12.1 \
-  /data/yb/Code/OmniCommit/datasets/third_explicit_001/train.800ms.jsonl \
-  /data/yb/Code/OmniCommit/outputs/third-explicit-sft-001 \
-  --gpu-ids 1,2,3,4 --save_interval 1000
+  /data/yb/models/qwen3_omni_mcore_3.12.1 \
+  /data/yb/Code/OmniCommit/Third/datasets/data_10000h/train.1000ms.jsonl \
+  /data/yb/Code/OmniCommit/output/sft-1117-1S \
+  --gpu-ids 0,1,2,3,4,5,6,7 --attention_backend flash \
+  --packing false --padding_free false --micro_batch_size 4 --global_batch_size 64 \
+  --max_length 4096 --max_epochs 1 --split_dataset_ratio 0 --save_interval 1000
 ~~~
 
 **ms-swift 4.1.3 / Megatron** 使用原始 Hugging Face 基座，下面沿用 Second 的八卡配方。这是另一个训练入口，同一次实验选择对应环境的一个即可。
@@ -102,7 +104,7 @@ bash SFT-Scripts/merge_lora.sh \
 
 ## 4. 启动内网 Web 转录
 
-在推理环境中使用上一步导出的 HF 模型。默认后端沿用 FLEX 的 vLLM 0.11.1，`--backend hf` 可切换到 Transformers。将整个 OmniCommit 仓库部署到同一台机器，训练、导出和服务都会使用仓库内的共享组件。启动时的 `--chunk-ms` 决定当前服务的步长，按训练数据填写。
+在推理环境中使用上一步导出的 HF 模型。默认后端沿用 FLEX 的 vLLM 0.11.1，`--backend hf` 可切换到 Transformers。服务读取本目录内的网页与推理代码。启动时的 `--chunk-ms` 决定当前服务的步长，按训练数据填写。
 
 ~~~bash
 python -m pip install -r requirements-web.txt

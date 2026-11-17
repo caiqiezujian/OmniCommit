@@ -1,2 +1,7 @@
--r ../requirements-web.txt
+# Install in the HF or vLLM inference environment.
+-r requirements-data.txt
+numpy>=1.24,<3
+scipy>=1.10,<2
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
 webrtcvad-wheels>=2.0.14,<3

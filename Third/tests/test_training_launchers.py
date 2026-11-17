@@ -1,4 +1,4 @@
-"""Route Third data to the Third checker and template even with legacy Second launchers."""
+"""Launch Third with its own checker and template from an isolated deployment."""
 import os
 from pathlib import Path
 import shutil
@@ -7,7 +7,7 @@ import subprocess
 import pytest
 
 
-ROOT = Path(__file__).resolve().parents[2]
+THIRD = Path(__file__).resolve().parents[1]
 GPU_IDS = "0,1,2,3,4,5,6,7"
 
 
@@ -29,20 +29,12 @@ def find_bash():
     ("train_sft.sh", "--max_epochs", "--save_interval"),
     ("train_sft_swift4.sh", "--num_train_epochs", "--save_steps"),
 ])
-def test_third_launch_with_an_old_second_installation(tmp_path, launcher, epochs, save):
+def test_third_launch_from_isolated_deployment(tmp_path, launcher, epochs, save):
     bash = find_bash()
     work = tmp_path / "Third"
     scripts = work / "SFT-Scripts"
     scripts.mkdir(parents=True)
-    shutil.copy(ROOT / "Third" / "SFT-Scripts" / launcher, scripts / launcher)
-    recipes = Path("SFT-Scripts/recipes")
-    shutil.copytree(ROOT / recipes, tmp_path / recipes)
-
-    # In the reported deployment this script hardcoded Second's checker and
-    # rejected a valid <|DIRECT|>. Make delegation to that script observable.
-    legacy = tmp_path / "Second" / "SFT-Scripts" / launcher
-    legacy.parent.mkdir(parents=True)
-    legacy.write_bytes(b"echo 'Legacy Second launcher selected' >&2\nexit 41\n")
+    shutil.copy(THIRD / "SFT-Scripts" / launcher, scripts / launcher)
 
     dataset = "train.1000ms.jsonl"
     tokens = dataset + ".tokens.txt"

@@ -14,8 +14,8 @@ THIRD = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(THIRD))
 from third_asr.protocol import DIRECT, EOS, WAIT, get_protocol
 from third_asr.service_backend import build_backend, detect_model_protocol, read_export_protocol, validate_manifest
-from third_asr.sft_checks import SHARED_SFT, read_tokens, validate_row
-from omnicommit_audio import encode_chunk_ref
+from third_asr.sft_checks import read_tokens, validate_row
+from third_asr.chunk_refs import encode_chunk_ref
 
 
 def row_for(path, replies, mode="plain"):
@@ -55,24 +55,6 @@ def test_third_check_cli_decodes_multilingual_turns(tmp_path):
         validate_row(row_for(audio, [WAIT]))
 
 
-def test_encoded_audit_uses_third_template_and_checks(monkeypatch):
-    audit_main = runpy.run_path(str(THIRD / "SFT-Scripts/audit_encoded_lengths.py"))["main"]
-
-    def shared_main(argv, *, checks, template_name, plugin_name):
-        assert argv == ["arg"]
-        assert checks.validate_row is validate_row
-        assert template_name == "omnicommit_third_qwen3_omni"
-        assert plugin_name == "omnicommit_third_sft_plugin"
-        return 0
-
-    def load_shared(script):
-        assert Path(script) == SHARED_SFT / "audit_encoded_lengths.py"
-        return {"main": shared_main}
-
-    monkeypatch.setattr(runpy, "run_path", load_shared)
-    assert audit_main(["arg"]) == 0
-
-
 @pytest.mark.parametrize("mode", ["plain", "explicit"])
 def test_training_sidecar_matches_every_turn_and_its_loss(mode, tmp_path):
     profile = get_protocol(mode)
@@ -97,7 +79,7 @@ def test_training_sidecar_matches_every_turn_and_its_loss(mode, tmp_path):
     body_labels = [protocol_ids[DIRECT]] if mode == "explicit" else []
     labels = [-100, protocol_ids[WAIT], *body_labels, 100, *body_labels, 200, protocol_ids[WAIT]]
     encoded = {"labels": labels, "input_features": np.zeros((3, 1)), "feature_attention_mask": np.zeros((3, 1))}
-    check = runpy.run_path(str(SHARED_SFT / "audit_encoded_lengths.py"))["check_encoded_protocol"]
+    check = runpy.run_path(str(THIRD / "SFT-Scripts/audit_encoded_lengths.py"))["check_encoded_protocol"]
     check(row, encoded, protocol_ids)
     if mode == "explicit":
         labels[2] = -100
@@ -141,7 +123,7 @@ def test_export_manifest_selects_serving_protocol(mode, version, tmp_path):
 @pytest.mark.parametrize("mode,enabled,reserved", [("plain", True, None), ("explicit", False, None),
                                                    ("explicit", True, 5.0)])
 def test_only_explicit_recovery_reserves_long_audio_items(mode, enabled, reserved, monkeypatch):
-    monkeypatch.setattr("omnicommit.stream_cli.build_backend", lambda args, **options: options)
+    monkeypatch.setattr("third_asr.runtime.stream_cli.build_backend", lambda args, **options: options)
     args = SimpleNamespace(protocol=mode, enable_recovery=enabled, recovery_window_seconds=5.0)
     options = build_backend(args)
     assert options["manifest_validator"] is validate_manifest

@@ -8,8 +8,9 @@ from pathlib import Path
 import pytest
 
 
-REPO = Path(__file__).resolve().parents[2]
-THIRD = REPO / "Third"
+THIRD = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(THIRD))
+from third_asr.chunk_refs import encode_chunk_ref
 WAIT = "<|WAIT|>"
 DIRECT = "<|DIRECT|>"
 
@@ -36,14 +37,21 @@ def test_existing_second_dataset_matches_third_recast(tmp_path, number_format, p
     }
     timed = tmp_path / "timed.jsonl"
     timed.write_text(json.dumps(record) + "\n", encoding="utf-8")
-    for name in ("Second", "Third"):
-        protocol_args = ["--protocol", "plain"] if name == "Third" and protocol == "plain" else []
-        result = run_script(REPO / name / "Data-Scripts" / "build_sft.py", timed,
-                            "--chunk-ms", 800, "--output-dir", tmp_path / name,
-                            "--number-format", number_format, *protocol_args)
-        assert result.returncode == 0, result.stderr
+    result = run_script(THIRD / "Data-Scripts" / "build_sft.py", timed, "--chunk-ms", 800,
+                        "--output-dir", tmp_path / "Third", "--number-format", number_format,
+                        "--protocol", protocol)
+    assert result.returncode == 0, result.stderr
     name = "train.800ms.jsonl"
-    sample = (tmp_path / "Second" / name).read_text(encoding="utf-8")
+    numbers = "Use digits for numbers." if number_format == "normalized" else "Preserve spoken numbers."
+    messages = [{"role": "system", "content": (
+        "Transcribe new speech. Mark first text and changes with <language><speaker>. "
+        f"Emit {WAIT} if nothing is ready. {numbers}")}]
+    refs = []
+    for i, reply in enumerate([WAIT, original[0] + original[1], original[2], original[3]]):
+        refs.append(encode_chunk_ref(str(wav), i * 800 / 1000, (i + 1) * 800 / 1000, .8))
+        messages.extend([{"role": "user", "content": "<audio>"}, {"role": "assistant", "content": reply}])
+    messages.extend([{"role": "user", "content": "<end_of_audio>"}, {"role": "assistant", "content": WAIT}])
+    sample = json.dumps({"audios": refs, "messages": messages}) + "\n"
     wav.unlink()  # Conversion only changes the target protocol.
     source = tmp_path / "existing.jsonl"
     source.write_text("{invalid\n" + sample, encoding="utf-8")
@@ -51,7 +59,8 @@ def test_existing_second_dataset_matches_third_recast(tmp_path, number_format, p
     # Simulate copying just Third to a server. Keep its parent free of any
     # Second modules and start Python in an unrelated working directory.
     copied = tmp_path / "deployment" / "Third"
-    shutil.copytree(THIRD, copied, ignore=shutil.ignore_patterns("__pycache__", ".pytest_cache"))
+    shutil.copytree(THIRD / "Data-Scripts", copied / "Data-Scripts")
+    shutil.copytree(THIRD / "third_asr", copied / "third_asr", ignore=shutil.ignore_patterns("__pycache__"))
     convert = copied / "Data-Scripts" / "from_second_sft.py"
     protocol_args = ["--protocol", "plain"] if protocol == "plain" else []
     command = run_script(convert, source, "--output", output, *protocol_args, cwd=tmp_path)

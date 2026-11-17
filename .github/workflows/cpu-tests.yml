@@ -13,8 +13,11 @@ jobs:
         run: python -m pytest -q
       - name: Second streaming ASR tests
         run: python -m pytest -q Second/tests
-      - name: Third streaming ASR protocol and recovery tests
-        run: python -m pytest -q Third/tests
+      - name: Third standalone deployment
+        run: |
+          cp -a Third "$RUNNER_TEMP/Third"
+          cd "$RUNNER_TEMP/Third"
+          python -m pytest -q tests
       - name: Meeting page and transcript export
         run: node tests/test_web_ui_contract.mjs
       - name: Check training, export and server launchers

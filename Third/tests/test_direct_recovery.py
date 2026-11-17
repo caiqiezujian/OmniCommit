@@ -6,8 +6,8 @@ import numpy as np
 import pytest
 
 THIRD = Path(__file__).resolve().parents[1]
-sys.path[:0] = [str(THIRD), str(THIRD.parent)]
-from omnicommit.streaming import SAMPLE_RATE
+sys.path.insert(0, str(THIRD))
+from third_asr.runtime.streaming import SAMPLE_RATE
 from third_asr.protocol import DIRECT, WAIT
 from third_asr.recovery import SpeechActivity, novel_continuation
 from third_asr.service_session import ThirdStreamOptions, ThirdStreamSession

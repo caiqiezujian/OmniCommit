@@ -38,13 +38,13 @@ def detect_model_protocol(model_dir):
 
 
 def validate_manifest(tokenizer, manifest):
-    from omnicommit.inference_backend import validate_manifest_token_ids
+    from .runtime.inference_backend import validate_manifest_token_ids
     _manifest_mode(manifest)
     return validate_manifest_token_ids(tokenizer, manifest)
 
 
 def build_backend(args):
-    from omnicommit.stream_cli import build_backend as load_backend
+    from .runtime.stream_cli import build_backend as load_backend
     options = {}
     if getattr(args, "protocol", None) == "explicit" and getattr(args, "enable_recovery", False):
         options["max_audio_item_seconds"] = args.recovery_window_seconds

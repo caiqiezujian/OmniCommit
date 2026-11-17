@@ -3,15 +3,17 @@ from io import BytesIO
 from pathlib import Path
 import shutil
 import sys
+from types import SimpleNamespace
 import wave
 
 import numpy as np
 import pytest
 
 THIRD = Path(__file__).resolve().parents[1]
-sys.path[:0] = [str(THIRD), str(THIRD.parent)]
+sys.path.insert(0, str(THIRD))
 
-from omnicommit.streaming import ContextBudgetError, ReplayBackend
+from third_asr.runtime.media import MediaCursor
+from third_asr.runtime.streaming import ContextBudgetError, ReplayBackend
 from third_asr.protocol import EOS, WAIT, system_prompt
 from third_asr.service_backend import read_export_protocol, validate_manifest
 from third_asr.service_session import ThirdStreamOptions, ThirdStreamSession
@@ -59,6 +61,14 @@ def test_web_incremental_text_and_eos(kind):
             assert backend.messages[0]["content"] == system_prompt("normalized")
             assert [m["content"] for m in backend.messages[1:]] == [
                 "<audio>", "中文。Let's", "<audio>", " meet.", "<audio>", WAIT, EOS]
+
+
+def test_file_chunks_release_only_after_the_full_source_frame():
+    # At 44.1 kHz the first 101 ms ends between frames 4454 and 4455.
+    upload = SimpleNamespace(ready=True, claimed=True, sample_rate=44100, samples=44100)
+    cursor = MediaCursor(upload)
+    assert cursor.next_chunk(4454 / 44100, .101) is None
+    assert cursor._chunk_end_offset(.101) == 4455
 
 
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="requires FFmpeg")

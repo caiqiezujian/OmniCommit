@@ -4,7 +4,7 @@ import unicodedata
 
 import numpy as np
 
-from omnicommit.streaming import SAMPLE_RATE
+from .runtime.streaming import SAMPLE_RATE
 from .protocol import DIRECT
 
 
