@@ -3,8 +3,8 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const selected = () => document.querySelector("input[name=source]:checked").value;
 const player = $("player");
 let health, running, mediaURL;
-let events = [];
 let transcript = [];
+const turnLog = new MeetingTurnLog($, download);
 
 function status(message, error = false) {
   $("status").textContent = message;
@@ -38,32 +38,45 @@ function download(name, type, value) {
   setTimeout(() => URL.revokeObjectURL(url), 3000);
 }
 $("saveText").onclick = () => download("third.txt", "text/plain;charset=utf-8", transcript.join(""));
-$("saveLog").onclick = () => download("third.jsonl", "application/x-ndjson", events.map(e => JSON.stringify(e) + "\n").join(""));
+$("saveLog").onclick = () => download("third.jsonl", "application/x-ndjson", turnLog.current.model.map(e => JSON.stringify(e) + "\n").join(""));
+
+const sentences = typeof Intl.Segmenter === "function"
+  ? new Intl.Segmenter(undefined, {granularity: "sentence"}) : null;
+
+function appendTranscript(box, text) {
+  // A chunk can finish the sentence displayed by the preceding DIRECT.
+  const last = box.lastElementChild;
+  const tail = (last?.textContent ?? "") + text;
+  const parts = sentences ? Array.from(sentences.segment(tail), s => s.segment)
+    : tail.match(/[^\r\n]+(?:\r\n?|\n)?|\r\n?|\n/gu) ?? [];
+  const rows = parts.map(part => {
+    const row = document.createElement("div");
+    row.className = "segment";
+    row.textContent = part;
+    return row;
+  });
+  if (last) last.replaceWith(...rows);
+  else box.append(...rows);
+}
 
 function showResult(result) {
   if (result.type !== "result") return;
-  events.push(result);
   $("saveLog").disabled = false;
   if (result.action === "DIRECT") {
     const text = result.display_text;
     transcript.push(text);
     const box = $("words");
     const follow = box.scrollHeight - box.scrollTop - box.clientHeight < 32;
-    box.append(document.createTextNode(text));
+    appendTranscript(box, text);
     if (follow) box.scrollTop = box.scrollHeight;
     $("saveText").disabled = false;
   }
-  const li = document.createElement("li");
-  li.textContent = (result.event === "end_of_audio" ? "音频结束" : result.end_seconds.toFixed(2) + " s") +
-    "  " + result.text + (result.recovery ? "  [补识别：" + result.recovery.status + "]" : "");
-  $("turns").prepend(li);
-  if ($("turns").children.length > 60) $("turns").lastElementChild.remove();
   $("heard").textContent = result.end_seconds.toFixed(1) + " s";
   $("latency").textContent = result.generation_seconds.toFixed(2) + " s";
 }
 
 class Channel {
-  constructor(onFailure) {
+  constructor(onFailure, onEvent) {
     this.socket = new WebSocket((location.protocol === "https:" ? "wss:" : "ws:") + "//" + location.host + "/stream");
     this.open = new Promise((resolve, reject) => {
       this.socket.onopen = resolve;
@@ -81,6 +94,7 @@ class Channel {
       this.pending = null;
       try {
         const row = JSON.parse(event.data);
+        onEvent(row);
         if (row.type === "error") throw Error(row.error);
         pending.resolve(row);
       } catch (error) { pending.reject(error); }
@@ -248,14 +262,21 @@ $("start").onclick = async () => {
       upload = await response.json();
       if (!response.ok) throw Error(upload.error || "文件上传失败");
     } else await openCapture(state);
-    const channel = state.channel = new Channel(error => state.queue.fail(error));
+    let logStarted = false;
+    const channel = state.channel = new Channel(error => state.queue.fail(error), row => {
+      if (row.type === "ready" && row.protocol === "third") {
+        turnLog.start(state.kind, state.kind === "file" ? $("file").files[0].name : "");
+        logStarted = true;
+      }
+      if (logStarted) turnLog.append(row);
+    });
     await channel.open;
     const ready = await channel.request({
       type: "start", sample_rate: 16000, source_kind: state.kind, media_id: upload?.media_id
     });
     if (ready.protocol !== "third") throw Error("服务未加载 Third 协议");
-    events = []; transcript = [];
-    $("words").replaceChildren(); $("turns").replaceChildren();
+    transcript = [];
+    $("words").replaceChildren();
     $("heard").textContent = $("queued").textContent = "0.0 s";
     $("saveLog").disabled = $("saveText").disabled = true;
     status("正在转录");

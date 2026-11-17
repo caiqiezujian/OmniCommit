@@ -100,7 +100,11 @@ def test_web_from_standalone_cli(deployed, tmp_path):
         def visit(app, **kwargs):
             with TestClient(app) as client:
                 assert client.get("/health").json()["action_protocol"] == "explicit"
-                assert client.get("/").status_code == 200
+                page = client.get("/")
+                assert page.status_code == 200
+                for asset in ("style.css", "app.js", "log-archive.js", "turn-log.js"):
+                    url = "/web/" + asset
+                    assert url in page.text and client.get(url).status_code == 200
                 with client.websocket_connect("/stream") as ws:
                     ws.send_json({"type": "start", "sample_rate": 16000, "source_kind": "microphone"})
                     assert ws.receive_json()["protocol"] == "third"

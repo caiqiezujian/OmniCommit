@@ -3,41 +3,85 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>OmniCommit Third · 实时转录</title>
+  <title>OmniCommit Third · 实时会议转录</title>
   <link rel="stylesheet" href="/web/style.css">
+  <script defer src="/web/log-archive.js"></script>
+  <script defer src="/web/turn-log.js"></script>
   <script type="module" src="/web/app.js"></script>
 </head>
 <body>
-  <header><div><strong>OmniCommit</strong><span>Third</span></div><p id="health" role="status">正在连接模型…</p></header>
+  <header><strong>OmniCommit Third</strong><span>多语种流式转录</span></header>
   <main>
-    <aside>
-      <h1>流式转录</h1>
-      <fieldset id="settings">
-        <legend>音频来源</legend>
-        <label><input type="radio" name="source" value="microphone" checked> 麦克风</label>
-        <label><input type="radio" name="source" value="system"> 电脑声音</label>
-        <label><input type="radio" name="source" value="file"> 音视频文件</label>
-        <p class="hint" id="captureHelp">浏览器采音需要 HTTPS 或 localhost。</p>
-        <div id="fileOptions" hidden>
-          <input id="file" type="file" accept="audio/*,video/*" aria-label="音视频文件">
-          <label><input id="playback" type="checkbox" checked> 跟随播放器进度</label>
-          <p class="hint">取消勾选即可连续逐块识别整个文件。</p>
+    <div class="grid">
+      <section class="card" aria-labelledby="sourceTitle">
+        <h2 id="sourceTitle">音频来源</h2>
+        <fieldset id="settings" aria-labelledby="sourceTitle">
+          <div class="tabs">
+            <label><input type="radio" name="source" value="microphone" checked><span>麦克风</span></label>
+            <label><input type="radio" name="source" value="system"><span>电脑声音</span></label>
+            <label><input type="radio" name="source" value="file"><span>音视频文件</span></label>
+          </div>
+          <p class="hint">音频块时长：<span id="step">—</span></p>
+          <div id="fileOptions" hidden>
+            <label>选择本地文件 <input id="file" type="file" accept="audio/*,video/*"></label>
+            <video id="player" controls playsinline hidden></video>
+            <label><input id="playback" type="checkbox" checked> 跟随播放器进度</label>
+            <p class="hint">取消勾选即可连续逐块识别整个文件。</p>
+          </div>
+        </fieldset>
+        <div class="buttons">
+          <button id="start" class="primary" disabled>开始转录</button>
+          <button id="stop" disabled>结束并处理尾部</button>
         </div>
-      </fieldset>
-      <video id="player" controls playsinline hidden></video>
-      <div class="buttons"><button id="start" disabled>开始转录</button><button id="stop" disabled>结束</button></div>
-      <p id="status" role="status">等待开始</p>
-      <dl><div><dt>音频步长</dt><dd id="step">—</dd></div><div><dt>已处理音频</dt><dd id="heard">0.0 s</dd></div>
-      <div><dt>本地积压</dt><dd id="queued">0.0 s</dd></div><div><dt>最近推理</dt><dd id="latency">—</dd></div></dl>
-    </aside>
-    <section>
-      <div class="title"><h2>转录正文</h2><button id="saveText" disabled>导出 TXT</button></div>
-      <article id="words" aria-label="已提交的转录正文" aria-live="polite"></article>
-      <details><summary>逐轮记录</summary>
-        <div class="title"><p class="hint">显示最近 60 轮</p><button id="saveLog" disabled>导出完整 JSONL</button></div>
-        <ol id="turns" reversed></ol>
-      </details>
-    </section>
+        <p id="status" class="status" role="status">等待开始</p>
+        <p id="health" class="hint" role="status">正在连接模型…</p>
+        <p id="captureHelp" class="hint">麦克风与电脑声音需要 HTTPS 或 localhost；电脑声音需在共享窗口中勾选共享音频。</p>
+        <div class="controls">
+          <div class="metric">已处理：<span id="heard">0.0 s</span></div>
+          <div class="metric">本地积压：<span id="queued">0.0 s</span></div>
+          <div class="metric">最近推理：<span id="latency">—</span></div>
+        </div>
+      </section>
+      <section class="card" aria-labelledby="transcriptTitle">
+        <h2 id="transcriptTitle">实时转录</h2>
+        <div class="buttons">
+          <button id="saveText" disabled>导出 TXT</button>
+          <button id="saveLog" disabled>导出 JSONL</button>
+        </div>
+        <p class="hint">正文只显示已提交的原文。等待和补识别记录可在逐轮日志里查看。</p>
+        <div id="words" class="transcript" aria-label="已提交的转录正文" aria-live="polite"></div>
+        <details id="logPanel" open>
+          <summary id="logTitle">逐轮日志 · WAIT / DIRECT</summary>
+          <div class="log-toolbar">
+            <label>会议 <select id="logSession" aria-label="日志会议"></select></label>
+            <label>显示
+              <select id="logFilter">
+                <option value="model">模型全部轮次</option>
+                <option value="WAIT">仅 WAIT</option>
+                <option id="committedFilter" value="DIRECT">仅 DIRECT</option>
+                <option value="all">全部事件（含文件轮询）</option>
+              </select>
+            </label>
+            <button id="logTxt">下载逐轮 TXT</button>
+            <button id="logJsonl">下载完整日志 JSONL</button>
+          </div>
+          <div class="log-nav">
+            <button id="logFirst">最早</button>
+            <button id="logPrev">上一页</button>
+            <button id="logNext">下一页</button>
+            <button id="logLatest">看最新</button>
+            <label><input type="checkbox" id="logFollow"> 跟随最新</label>
+            <span id="logRange"></span>
+            <span id="logCounts" class="hint"></span>
+          </div>
+          <p id="logProgress" class="hint"></p>
+          <p id="logError" class="error" hidden></p>
+          <div id="events" tabindex="0" aria-label="逐轮日志内容"></div>
+          <p class="hint">日志保存在当前浏览器。点开一条记录可查看完整字段。</p>
+          <p class="error" id="logWarning" role="status" hidden></p>
+        </details>
+      </section>
+    </div>
   </main>
 </body>
 </html>
