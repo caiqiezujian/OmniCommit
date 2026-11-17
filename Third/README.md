@@ -48,7 +48,9 @@ python Data-Scripts/build_sft.py \
 
 ## 2. 检查并训练
 
-训练、审计、合并与 Web 服务使用完整仓库。下面的训练和导出示例使用第一个入口生成的文件。若使用上面的 1 秒重铸示例，训练数据路径填 `third_recast_1000ms_001/train.1000ms.jsonl`，合并时使用同文件旁的 `.tokens.txt`，启动服务时传 `--chunk-ms 1000`。在训练服务器上先检查前两条真实音频，去掉 `--rows 2 --decode` 可进行全量结构预检。
+从完整仓库的 `Third/` 目录启动。`SFT-Scripts/train_sft.sh` 和 `SFT-Scripts/train_sft_swift4.sh` 都会直接指定 Third 的检查器、SWIFT 插件和模板，再调用仓库顶层 `SFT-Scripts/recipes/` 的训练脚本。预检前，日志会打印 `template=omnicommit_third_qwen3_omni` 和检查器、插件的实际路径。
+
+下面的训练和导出示例使用第一个入口生成的文件。若使用上面的 1 秒重铸示例，训练数据路径填 `third_recast_1000ms_001/train.1000ms.jsonl`，合并时使用同文件旁的 `.tokens.txt`，启动服务时传 `--chunk-ms 1000`。在训练服务器上先检查前两条真实音频，去掉 `--rows 2 --decode` 可进行全量结构预检。
 
 ~~~bash
 python SFT-Scripts/check_sft.py \

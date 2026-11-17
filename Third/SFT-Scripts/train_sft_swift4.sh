@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
-# Use the same optimizer, packing, distributed settings and checkpoint cadence as Second.
 set -euo pipefail
 recipe_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-export OMNICOMMIT_SFT_CHECK="$recipe_dir/check_sft.py"
-export OMNICOMMIT_SFT_PLUGIN="$recipe_dir/omnicommit_third_sft_plugin.py"
-export OMNICOMMIT_SFT_TEMPLATE=omnicommit_third_qwen3_omni
-exec bash "$recipe_dir/../../Second/SFT-Scripts/train_sft_swift4.sh" "$@"
+exec bash "$recipe_dir/../../SFT-Scripts/recipes/train_hf.sh" \
+  "$recipe_dir/check_sft.py" "$recipe_dir/omnicommit_third_sft_plugin.py" \
+  omnicommit_third_qwen3_omni "$@"
