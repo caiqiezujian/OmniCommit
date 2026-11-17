@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import io
 import json
+import logging
 import math
 import time
 from urllib.parse import quote
@@ -15,6 +16,7 @@ import wave
 import numpy as np
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 from .runtime.streaming import SAMPLE_RATE
 from .service_session import ThirdStreamSession
@@ -22,6 +24,11 @@ from .service_session import ThirdStreamSession
 
 PCM_TYPES = {"audio/pcm", "application/octet-stream"}
 WAV_TYPES = {"audio/wav", "audio/wave", "audio/x-wav"}
+logger = logging.getLogger(__name__)
+
+
+class Transcript(BaseModel):
+    src: str
 
 
 def decode_json_audio(body, sample_limit):
@@ -68,9 +75,8 @@ async def read_packet(request, sample_limit):
         if len(body) + len(piece) > limit:
             raise HTTPException(413, "Audio packet exceeds configured size limit")
         body.extend(piece)
-    received_at = time.monotonic()
     if media == "application/json":
-        return decode_json_audio(body, sample_limit), received_at
+        return decode_json_audio(body, sample_limit)
     if media in WAV_TYPES:
         if len(body) < 12 or int.from_bytes(body[4:8], "little") + 8 > len(body):
             raise HTTPException(400, "Incomplete WAV container")
@@ -91,7 +97,7 @@ async def read_packet(request, sample_limit):
         raise HTTPException(400, "Send at least one whole PCM16 sample")
     samples = np.frombuffer(body, dtype="<i2").astype(np.float32)
     samples /= 32768.0
-    return samples, received_at
+    return samples
 
 
 @dataclass
@@ -102,7 +108,6 @@ class Meeting:
     tail: np.ndarray = None
     last: object = None
     job: object = None
-    needs_collection: bool = False
 
     def process(self, audio, ending):
         """Worker thread only. Never submit short intermediate packets as final model turns."""
@@ -130,6 +135,9 @@ class Meeting:
         text = "".join(turn["display_text"] for turn in turns)
         gaps = [dict(turn["truncation"], turn=turn["turn"], event=turn["event"]) for turn in turns
                 if turn.get("truncation", {}).get("status") == "gap"]
+        for gap in gaps:
+            logger.warning("Meeting %r ASR gap at %.3f-%.3f seconds (turn %d)",
+                           self.meeting_id, gap["start_seconds"], gap["end_seconds"], gap["turn"])
         if gaps and status == "ok":
             status = "partial"
         action = None
@@ -148,13 +156,13 @@ class Meeting:
 
 
 def create_app(backend_factory, options, *, max_meetings=16, max_in_flight=8,
-               response_timeout_ms=900, idle_timeout_seconds=600, max_packet_seconds=8.0,
+               idle_timeout_seconds=600, max_packet_seconds=8.0,
                upload_timeout_seconds=10):
     """backend_factory creates one thread-safe inference adapter, shared by all meeting workers."""
     for name, value in (("max_meetings", max_meetings), ("max_in_flight", max_in_flight)):
         if type(value) is not int or value < 1:
             raise ValueError(f"{name} must be a positive integer")
-    for name, value in (("response_timeout_ms", response_timeout_ms), ("idle_timeout_seconds", idle_timeout_seconds),
+    for name, value in (("idle_timeout_seconds", idle_timeout_seconds),
                         ("max_packet_seconds", max_packet_seconds), ("upload_timeout_seconds", upload_timeout_seconds)):
         if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
             raise ValueError(f"{name} must be positive and finite")
@@ -228,7 +236,7 @@ def create_app(backend_factory, options, *, max_meetings=16, max_in_flight=8,
                 "max_batch_size": getattr(backend, "max_batch_size", 1),
                 "batch_wait_ms": getattr(backend, "batch_wait_ms", 0),
                 "batch_stats": backend.stats() if hasattr(backend, "stats") else {},
-                "response_timeout_ms": response_timeout_ms, "idle_timeout_seconds": idle_timeout_seconds,
+                "idle_timeout_seconds": idle_timeout_seconds,
                 "max_packet_seconds": max_packet_seconds, "upload_timeout_seconds": upload_timeout_seconds}
 
     def respond(outcome):
@@ -245,10 +253,10 @@ def create_app(backend_factory, options, *, max_meetings=16, max_in_flight=8,
             raise HTTPException(422, "Invalid meeting_id")
         expire()
         if key in terminal:
-            raise HTTPException(409, "Meeting has ended, failed or expired. GET its result or use a new meeting_id")
+            raise HTTPException(409, "Meeting has ended, failed or expired. Use a new meeting_id")
         meeting = active.get(key)
-        if key in reserved or (meeting is not None and meeting.needs_collection):
-            raise HTTPException(409, "Previous packet outstanding. GET the meeting result before sending another")
+        if key in reserved:
+            raise HTTPException(409, "A packet is still being processed for this meeting")
         if ending and meeting is None:
             raise HTTPException(404, "Unknown meeting")
         if not meeting and len(active.keys() | reserved) >= max_meetings:
@@ -277,31 +285,25 @@ def create_app(backend_factory, options, *, max_meetings=16, max_in_flight=8,
         reserve(key, ending)
         try:
             if ending:
-                pcm, received_at = np.empty(0, dtype=np.float32), time.monotonic()
+                pcm = np.empty(0, dtype=np.float32)
             else:
                 try:
-                    pcm, received_at = await asyncio.wait_for(read_packet(request, sample_limit), upload_timeout_seconds)
+                    pcm = await asyncio.wait_for(read_packet(request, sample_limit), upload_timeout_seconds)
                 except asyncio.TimeoutError as exc:
                     raise HTTPException(408, "Upload timed out; packet not accepted") from exc
             meeting = active.get(key)
             if meeting is None:
-                meeting = active[key] = Meeting(key, ThirdStreamSession(backend, options), received_at)
-            meeting.needs_collection = True
+                meeting = active[key] = Meeting(key, ThirdStreamSession(backend, options), time.monotonic())
             job = meeting.job = asyncio.create_task(dispatch(meeting, pcm, ending))
         except BaseException:
             reserved.discard(key)
             raise
-        remaining = max(0., received_at + response_timeout_ms / 1000 - time.monotonic())
-        # Timeout/disconnect releases the HTTP waiter; the model still owns this meeting until it finishes.
-        done, _ = await asyncio.wait((job,), timeout=remaining)
-        if not done:
-            return pending(key)
-        outcome = job.result()
-        if meeting.last is outcome and meeting.job is None:
-            meeting.needs_collection = False
-        return respond(outcome)
+        # A disconnected caller must not cancel work that can already have advanced the session.
+        code, body = await asyncio.shield(job)
+        return respond((code, {"src": body["text"]} if code == 200 else body))
 
-    @app.post("/v1/meetings/{meeting_id}/chunks", summary="Append one audio packet to a meeting",
+    @app.post("/v1/meetings/{meeting_id}/chunks", summary="Transcribe one audio packet",
+              response_model=Transcript,
               openapi_extra={"requestBody": {"required": True,
                   "description": "16 kHz mono audio. JSON uses base64 raw little-endian float32. Binary uses PCM16.",
                   "content": {
@@ -310,18 +312,18 @@ def create_app(backend_factory, options, *, max_meetings=16, max_in_flight=8,
                                    "description": "Standard base64 of normalized mono float32 LE samples"}}}},
                       **{media: {"schema": {"type": "string", "format": "binary"}}
                          for media in ("audio/pcm", "audio/wav", "application/octet-stream")}}}},
-              responses={200: {"description": "Model result, partial result with explicit gaps, or buffered audio"},
-                         202: {"description": "Accepted and still processing; poll the Location URL"},
+              responses={200: {"description": "New transcript text for this packet, empty when nothing was emitted"},
                          409: {"description": "Outstanding operation or closed meeting"},
                          429: {"description": "Capacity reached; packet was not accepted"}})
     async def chunk(meeting_id: str, request: Request):
         return await post(meeting_id, request, False)
 
-    @app.post("/v1/meetings/{meeting_id}/end")
+    @app.post("/v1/meetings/{meeting_id}/end", response_model=Transcript,
+              summary="Finish the meeting and return any final transcript text")
     async def end(meeting_id: str, request: Request):
         return await post(meeting_id, request, True)
 
-    @app.get("/v1/meetings/{meeting_id}/result")
+    @app.get("/v1/meetings/{meeting_id}/result", include_in_schema=False)
     async def result(meeting_id: str):
         expire()
         if meeting_id in terminal:
@@ -331,8 +333,6 @@ def create_app(backend_factory, options, *, max_meetings=16, max_in_flight=8,
             raise HTTPException(404, "Unknown meeting or result has expired")
         if meeting_id in reserved or meeting.last is None:
             return pending(meeting_id)
-        meeting.needs_collection = False
-        meeting.touched = time.monotonic()
         return respond(meeting.last)
 
     return app

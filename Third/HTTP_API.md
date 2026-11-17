@@ -1,140 +1,80 @@
-# Third 会议转录 HTTP API
+# Third 会议转录 HTTP 接口
 
-每个会议使用独立的 `meeting_id`。调用方按录音顺序上传短音频，同一会议等上一包返回最终结果再发下一包。不同会议可以同时发送。会议 ID 放在 URL 中，音频可以通过 JSON 的 `data` 字段发送 Base64 编码的 float32 波形，也可以在请求体中直接发送 PCM16 或 WAV。接口面向内网，无需令牌或客户端序号。
+每次发送一包音频，服务处理完就返回 **HTTP 200** 和一个字符串字段 `src`。它只包含本包新提交的转录。调用方按顺序把每次的 `src` 追加到会议记录，空字符串可以直接略过。
 
-## 1. 启动
+## 上传音频
 
-在现有 Third 推理环境使用 **vLLM 0.11.1** 和已合并的 Third HF 模型。下面按 1 秒训练步长举例。800 毫秒训练的模型改为 `--chunk-ms 800`。HTTP 服务与 18891 网页各自加载一份模型，单卡压测时请把这张 GPU 单独分配给 HTTP 进程。
+`POST /v1/meetings/{meeting_id}/chunks`，请求头为 `Content-Type: application/json`。
+
+~~~json
+{"data":"<音频的 Base64 字符串>"}
+~~~
+
+`data` 是 16 kHz、单声道、小端 float32 原始波形的标准 Base64 编码，幅值归一化到 `[-1, 1]`。1 秒是 16000 个样本。调用方直接发送已有的 Base64 字符串即可。
+
+假设一包有 3 秒。第 1 秒提交“请联系”，第 2 秒等待，第 3 秒提交“张伟。”。调用方只会收到一次响应：
+
+~~~json
+{"src":"请联系张伟。"}
+~~~
+
+整包没有新增正文时返回 `{"src":""}`。同一会议使用同一 ID，等到这一包返回后再发送下一包。一次请求包含多秒音频时，服务依序完成各个模型步长再返回。同步耗时随音频长度、GPU 负载和生成的字数变化。
+
+### Python 对接示例
+
+~~~python
+import requests
+
+meeting = "http://服务器内网IP:18892/v1/meetings/meeting-001"
+
+# 每来一包就调用一次，audio_base64 是上游已有的字符串。
+def transcribe(audio_base64):
+    response = requests.post(meeting + "/chunks", json={"data": audio_base64}, timeout=60)
+    response.raise_for_status()
+    return response.json()["src"]
+
+# 会议结束时调用一次，取走最后的新增文字并释放会议。
+def finish():
+    response = requests.post(meeting + "/end", timeout=60)
+    response.raise_for_status()
+    return response.json()["src"]
+~~~
+
+### 在服务器上测试一包 WAV
+
+用 16 kHz、单声道、PCM16 WAV 可以直接检查服务。接口也支持裸 PCM16 小端样本，请求头为 `Content-Type: audio/pcm`。
 
 ~~~bash
-cd /data/yb/Code/OmniCommit/Third
-python -m pip install -r requirements-web.txt
-CUDA_VISIBLE_DEVICES=0 bash start_http.sh \
+curl -fsS -H 'Content-Type: audio/wav' --data-binary @chunk.wav \
+  http://127.0.0.1:18892/v1/meetings/demo-001/chunks
+curl -fsS -X POST http://127.0.0.1:18892/v1/meetings/demo-001/end
+~~~
+
+## 部署
+
+在现有 Third 的 vLLM 0.11.1 推理环境中启动。将模型路径换成实际合并的 Third HF 模型目录，选择一张显存足够的 GPU。
+
+~~~bash
+cd /data/yb/Code/OmniCommit
+CUDA_VISIBLE_DEVICES=0 bash Third/start_http.sh \
   /data/yb/Code/OmniCommit/models/third-explicit-merged \
-  --port 18892 --chunk-ms 1000 \
-  --window-seconds 60 --discard-seconds 50 \
-  --max-new-tokens 512 --max-context-tokens 4352 \
-  --max-meetings 16 --max-in-flight 8 --batch-size 4 \
-  --response-timeout-ms 900
+  --port 18892 --chunk-ms 1000
 ~~~
 
 ~~~bash
 curl -fsS http://127.0.0.1:18892/health
 ~~~
 
-看到 `"ready":true` 和 `"service":"third_http"` 即可接入。同一端口的 `/openapi.json` 提供接口定义。一个进程持有会议上下文和一份 GPU 引擎。模型使用导出时的 `explicit` 或 `plain` 协议，窗口超过 60 秒时按 50 秒裁剪。HTTP 默认走常规解码。若需和网页比较连续有声 WAIT 的补识别，显式模型启动时可加 `--recovery`，并按该配置重新压测。
+HTTP 默认按 1 秒步长解码，单包最长 8 秒。如果对方每包最长 30 秒，启动时加 `--max-packet-seconds 30`。默认每轮输出上限 512 token，总上下文 4352 token，音频窗口 60 秒，每次裁剪 50 秒。默认最多保留 16 场会议、同时接收或处理 8 个请求、每批至多 4 路。前端或其他服务已在使用 GPU 时，应按 `nvidia-smi` 的实际空闲显存选卡。
 
-| 参数 | 作用 |
-| --- | --- |
-| `--max-meetings 16` | 同时保留 16 场会议的上下文，包含暂时没有新音频的会议。 |
-| `--max-in-flight 8` | 同时接受最多 8 个上传或处理中的会议操作，容量满时返回 429。 |
-| `--batch-size 4`、`--batch-wait-ms 2` | vLLM 一次最多为 4 个独立请求生成，每批从首个请求排队开始，最多等 2 毫秒凑批。只有一路时也可立即或在等待期结束后处理。 |
-| `--chunk-ms` | 默认 800。服务会跨请求累积不足一轮的音频，再按这个长度送模型。 |
-| `--max-new-tokens 512`、`--max-context-tokens 4352` | 每轮最多生成 512 个新 token。总预算也提高了 256，以保留原有 3840 个输入 token 的空间。启动时显式填写的值优先。 |
-| `--max-packet-seconds 8` | 单个上传包的最长音频。要逐包获取一轮模型结果，建议每包恰好发送一个模型步长。 |
-| `--upload-timeout-seconds 10` | 接收单包请求体的时限。超时释放该会议的上传名额，返回 408，可以重新发该包。 |
-| `--response-timeout-ms 900` | 从服务端收到完整请求体开始计算的同步等待预算。超过预算就返回 202，GPU 继续完成该包。 |
-| `--idle-timeout-seconds 600` | 没有在处理的会议连续闲置达到该时长后释放。会议状态存在内存，重启进程会清空。 |
+音频格式错误或超长、同一会议重叠发包、容量已满、引擎失败，都会返回相应的非 200 状态码。网络超时时，已经接收的包可能仍在处理，重复 POST 会有重复转录的风险。部署方排查截断时可以查看服务日志或最近一包的诊断记录 `GET /v1/meetings/{meeting_id}/result`。正常对接只用两个 POST 接口。
 
-## 2. 传一包、取结果、结束
-
-### JSON + Base64 float32
-
-`POST /v1/meetings/{meeting_id}/chunks` 使用 `Content-Type: application/json`，请求体为 `{"data":"<Base64 字符串>"}`。`data` 编码的是 **16 kHz、单声道、小端 float32 的原始采样字节**。幅值按音频惯例归一化到 `[-1, 1]`，1 秒有 16000 个样本，编码前为 64000 字节。请直接传裸样本，WAV 头、MP3 文件、PCM16 字节均有各自的格式。已拿到符合此约定的 Base64 字符串时可原样放入 `data`。
-
-下面的客户端示例从真实音频读取 float32 波形。它按服务的模型步长发送，处理 `202`，并在文件末尾取回尾音结果。运行示例需要 `requests` 和 `soundfile`。
-
-~~~python
-import base64
-import time
-
-import requests
-import soundfile as sf
-
-base = "http://127.0.0.1:18892"
-meeting = base + "/v1/meetings/demo-001"
-
-with requests.Session() as client:
-    def collect(response):
-        while response.status_code == 202:
-            time.sleep(0.05)
-            response = client.get(base + response.json()["result_url"], timeout=5)
-        response.raise_for_status()
-        return response.json()
-
-    health = client.get(base + "/health", timeout=5)
-    health.raise_for_status()
-    frames = round(16000 * health.json()["chunk_seconds"])
-    with sf.SoundFile("meeting.16k.wav") as recording:
-        if (recording.samplerate, recording.channels) != (16000, 1):
-            raise ValueError("需要 16 kHz 单声道音频")
-        for wave_data in recording.blocks(blocksize=frames, dtype="float32"):
-            raw = wave_data.astype("<f4", copy=False).tobytes()
-            data = base64.b64encode(raw).decode("ascii")
-            result = collect(client.post(meeting + "/chunks", json={"data": data}, timeout=5))
-            print(result["status"], result["action"], result["text"], result["gaps"])
-    result = collect(client.post(meeting + "/end", timeout=5))
-    print(result["status"], result["action"], result["text"], result["gaps"])
-~~~
-
-### 二进制 PCM16 和 WAV
-
-假设 `chunk.wav` 包含会议最初的 1 秒，格式为单声道、16 kHz、PCM16 无压缩 WAV。在服务器上可以直接测试：
+## 用真实音频测延迟
 
 ~~~bash
-curl -i -X POST http://127.0.0.1:18892/v1/meetings/demo-001/chunks \
-  -H 'Content-Type: audio/wav' --data-binary @chunk.wav
+python Third/tools/bench_http.py /data/test/meeting.16k.wav \
+  --url http://127.0.0.1:18892 --wire-format json-f32 \
+  --concurrency 1 2 4 8 --seconds 16 --slo-ms 1000
 ~~~
 
-如果上游提供裸 PCM，将请求头改为 `Content-Type: audio/pcm`，请求体填写有符号 16 位小端、单声道、16 kHz 的样本。`application/octet-stream` 也按相同格式处理。1 秒裸 PCM 正好 32000 字节。每个 WAV 包须自带 WAV 头。
-
-| 响应 | 调用方处理 |
-| --- | --- |
-| `200`，`status="ok"`，`action="DIRECT"` | 将 `text` 追加到该会议的转录中。只包含本包新提交的正文，保留原始空格。 |
-| `200`，`status="ok"`，`action="WAIT"` | 本次模型确实返回了 WAIT，正文为空。可以发送下一包。 |
-| `200`，`status="buffered"` | 已收音频尚不足一次模型步长，`action=null`。继续发下一包，剩余秒数见 `buffered_seconds`。 |
-| `200`，`status="partial"` | 包内有模型输出截断且未恢复的轮次。取走其他成功轮次的 `text`，保存 `gaps` 中的会议秒数区间供复核，继续发送下一包。没有成功正文时 `action=null`。 |
-| `202`，`status="processing"` | 已接受这包，模型结果尚未就绪。用 GET 查询同一响应中的 `result_url`，拿到最终结果后再发下一包。 |
-| `409` | 检查同一会议是否已有未取回的操作，或 ID 已结束。用 GET 读取其状态。 |
-| `429` | 这次上传未被接收，调用方可稍后重新发送该包。 |
-| `400 / 413 / 415` | 分别检查数据完整性、包时长/体积、音频格式。 |
-| `500`，`status="error"` | 该会议本次处理失败。`turns` 和 `text` 保留同一包内已成功的轮次，`unprocessed_seconds` 给出尚未完成的音频量。该会议结束。 |
-
-例如下面是一条超时响应，HTTP 状态为 202：
-
-~~~json
-{"meeting_id":"demo-001","status":"processing","action":null,"result_url":"/v1/meetings/demo-001/result"}
-~~~
-
-~~~bash
-curl -i http://127.0.0.1:18892/v1/meetings/demo-001/result
-~~~
-
-GET 在处理期间返回 202。完成后可读到最近一个操作的最终结果。一个请求覆盖多个模型步长时，`turns` 保留每轮的 `action`、`display_text` 及音频时间，顶层 `text` 按顺序拼接新增正文，`heard_seconds` 是会议已经过模型处理的累计秒数。一次 POST 响应在网络中丢失时，先查结果；本协议按顺序发送，没有逐包重发去重能力。
-
-最后一包发送并取回后结束会议，服务处理不足一步的尾音，再执行模型的结束轮。此接口同样可能返回 202。终态为 `status="ended"`，需要取走其中新增的 `text`，并检查 `gaps` 中的待复核区间。若最后一包已报告缺口且没有新音频，结束事件只关闭会议。结束或失败的最近结果在内存中短暂保留，建议每场新会议使用新的 ID。
-
-~~~bash
-curl -i -X POST http://127.0.0.1:18892/v1/meetings/demo-001/end
-~~~
-
-## 3. 在 A800 上测一秒内能返回多少路实际结果
-
-准备一段多说话、含正常停顿的 **16 kHz 单声道 PCM16 WAV**。下面在客户端按真实音频节奏发包，依次模拟 1、2、4、8 场会议，并为每场截取不同的录音区间。每场 16 秒，整段 WAV 至少需要 240 秒。省略 `--seconds` 会根据可用时长自动分配，每场最多 30 秒。默认从 `/health` 读取服务的模型步长。
-
-~~~bash
-cd /data/yb/Code/OmniCommit/Third
-python tools/bench_http.py /data/test/meeting.16k.wav \
-  --url http://127.0.0.1:18892 --wire-format json-f32 --concurrency 1 2 4 8 \
-  --seconds 16 --slo-ms 1000 > a800-concurrency.jsonl
-cat a800-concurrency.jsonl
-~~~
-
-`--wire-format json-f32` 将 WAV 里每一包 PCM16 转成归一化 float32，再通过 Base64 JSON 上传。压测输出中的 `wire_format` 标明该轮的传输格式。省略此参数时沿用裸 PCM16 上传。
-
-- `timely_percent_of_planned` 是全部计划发送的包里，首次 POST 就在预算内拿到真实 `DIRECT` 或 `WAIT` 的比例。要每包 1 秒内拿到推理判断，应检查该比例是否达到 100%，并核对 `first_post_202`、`unsent`、`errors` 及 `cleanup_errors`。模型是否确实出字还可分别看 `direct`、`wait`。
-- `final_model_result_ms.p95/p99` 从客户端将请求体写入套接字计到读完整个模型结果，包含 202 后的查询时间。`audio_ready_to_model_result_ms.p99` 还包含上一个请求过慢导致的积压。`model_results_late_from_audio_ready` 直接统计这类端到端超时。建议在实际调用方机器上测，也让网络路径与生产一致。
-- `/health` 中的 `batch_stats.largest_batch` 是启动以来一次提交给模型的最大请求数，可检查服务是否真正合批。稳定档位还应跨窗口验证，例如 4 路、每路 120 秒需要至少 480 秒音频，使用 `--concurrency 4 --seconds 120` 复测。
-- `partial_packets` 和 `end_with_gap` 分别统计含未恢复截断的音频包和结束操作。压测继续发送后续音频，有缺口的包不会被计为达标；存在缺口时工具最终返回非零状态。
-
-上述 16 场常驻、8 个在途、4 个合批都是可调整的配置。A800 能满足一秒目标的并发数取决于权重、上下文长度、输出文本长度、预热及负载，需要读取实际压测结果。
+该示例需要至少 240 秒的 16 kHz 单声道 PCM16 WAV。每个模拟会议取不同的片段，按音频就绪时间发包，测量调用方实际拿到 `src` 的耗时。空字符串也算一次成功的 HTTP 回复，压测会单独统计空结果。

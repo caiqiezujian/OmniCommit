@@ -10,7 +10,7 @@ import pytest
 
 @pytest.mark.parametrize("extra, expected_budgets", [
     ([], (512, 4352)),
-    (["--max-new-tokens", "768", "--max-context-tokens", "4608"], (768, 4608)),
+    (["--max-new-tokens", "768", "--max-context-tokens", "4608", "--response-timeout-ms", "900"], (768, 4608)),
 ])
 def test_http_launcher_uses_trained_protocol_and_sizes_model_for_batching(tmp_path, monkeypatch, extra, expected_budgets):
     uvicorn = pytest.importorskip("uvicorn")
@@ -36,7 +36,7 @@ def test_http_launcher_uses_trained_protocol_and_sizes_model_for_batching(tmp_pa
         assert options.protocol == "explicit" and options.enable_recovery
         assert options.chunk_seconds == 1 and options.context_policy == "window"
         assert (options.window_seconds, options.discard_seconds) == (60, 50)
-        assert limits["max_in_flight"] == 8 and limits["response_timeout_ms"] == 900
+        assert limits["max_in_flight"] == 8 and "response_timeout_ms" not in limits
         adapter = factory()
         try:
             assert adapter.max_batch_size == 6
@@ -45,7 +45,7 @@ def test_http_launcher_uses_trained_protocol_and_sizes_model_for_batching(tmp_pa
         return "app"
 
     monkeypatch.setattr(http_service, "create_app", inspect)
-    launcher.main(["--model", str(tmp_path), "--chunk-ms", "1000", "--batch-size", "6", "--recovery", *extra])
+    launcher.main(["--model", str(tmp_path), "--batch-size", "6", "--recovery", *extra])
     assert (engine.call_args.kwargs["max_new_tokens"], engine.call_args.kwargs["max_context_tokens"]) == expected_budgets
     assert engine.call_args.kwargs["max_audio_turns"] == 60
     assert engine.call_args.kwargs["max_audio_seconds"] == launcher.ThirdStreamOptions.recovery_window_seconds

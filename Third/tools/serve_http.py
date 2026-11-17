@@ -19,7 +19,7 @@ def main(argv=None):
                         recovery_window_seconds=ThirdStreamOptions.recovery_window_seconds)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18892)
-    parser.add_argument("--chunk-ms", type=int, default=800, help="Model audio step used during SFT")
+    parser.add_argument("--chunk-ms", type=int, default=1000, help="Model audio step in milliseconds (default: 1000)")
     parser.add_argument("--window-seconds", type=float, default=ThirdStreamOptions.window_seconds)
     parser.add_argument("--discard-seconds", type=float, default=ThirdStreamOptions.discard_seconds)
     parser.add_argument("--protocol", choices=("auto", "plain", "explicit"), default="auto")
@@ -33,25 +33,27 @@ def main(argv=None):
                         help="Maximum number of different meetings in a single vLLM generate call")
     parser.add_argument("--batch-wait-ms", type=float, default=2.0,
                         help="Maximum time to wait for a batch to fill after its first job arrives")
-    parser.add_argument("--response-timeout-ms", type=float, default=900,
-                        help="Inference response budget after receiving the body, then return HTTP 202")
+    # Accept existing deployment commands; POST now waits for the transcription.
+    parser.add_argument("--response-timeout-ms", type=float, help=argparse.SUPPRESS)
     parser.add_argument("--upload-timeout-seconds", type=float, default=10,
                         help="Release the meeting slot if the client stalls while uploading one packet")
     parser.add_argument("--idle-timeout-seconds", type=float, default=600)
     parser.add_argument("--max-packet-seconds", type=float, default=8.0)
     args = parser.parse_args(argv)
+    if args.response_timeout_ms is not None:
+        print("--response-timeout-ms is obsolete: successful POST requests wait for src.", file=sys.stderr)
     if not 1 <= args.port <= 65535:
         parser.error("--port must be in 1..65535")
     if args.backend != "replay" and args.model is None:
         parser.error("--model is required for real inference")
     if min(args.max_meetings, args.max_in_flight, args.max_batch_size) < 1:
         parser.error("meeting, in-flight and batch limits must be positive")
-    for name in ("response_timeout_ms", "upload_timeout_seconds", "idle_timeout_seconds", "max_packet_seconds"):
+    for name in ("upload_timeout_seconds", "idle_timeout_seconds", "max_packet_seconds"):
         value = getattr(args, name)
         if not math.isfinite(value) or value <= 0:
             parser.error("--" + name.replace("_", "-") + " must be positive and finite")
-    if not math.isfinite(args.batch_wait_ms) or not 0 <= args.batch_wait_ms < args.response_timeout_ms:
-        parser.error("--batch-wait-ms must be nonnegative and shorter than --response-timeout-ms")
+    if not math.isfinite(args.batch_wait_ms) or args.batch_wait_ms < 0:
+        parser.error("--batch-wait-ms must be nonnegative and finite")
     try:
         args.chunk_seconds = args.chunk_ms / 1000
         args.max_window_seconds = args.window_seconds
@@ -79,7 +81,7 @@ def main(argv=None):
                             batch_wait_ms=args.batch_wait_ms)
 
     app = create_app(load_model, options, max_meetings=args.max_meetings, max_in_flight=args.max_in_flight,
-                     response_timeout_ms=args.response_timeout_ms, idle_timeout_seconds=args.idle_timeout_seconds,
+                     idle_timeout_seconds=args.idle_timeout_seconds,
                      max_packet_seconds=args.max_packet_seconds, upload_timeout_seconds=args.upload_timeout_seconds)
     # Meeting histories and one copy of the GPU engine live in this process.
     uvicorn.run(app, host=args.host, port=args.port, workers=1)

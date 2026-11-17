@@ -37,32 +37,26 @@ class Client:
         cls = HTTPSConnection if address.scheme == "https" else HTTPConnection
         self.connection = cls(address.hostname, address.port, timeout=timeout)
         self.prefix = address.path.rstrip("/")
-        self.timeout = timeout
 
     def request(self, method, path, body=None, *, content_type="application/octet-stream"):
         headers = {"Content-Type": content_type} if body is not None else {}
+        started = time.perf_counter()
         self.connection.request(method, self.prefix + path, body, headers=headers)
-        sent = time.perf_counter()  # Body written to the local socket.
         response = self.connection.getresponse()
         data = response.read()
         arrived = time.perf_counter()
-        if response.status >= 400:
+        if response.status != 200:
             raise HTTPStatusError(response.status, data)
         result = json.loads(data)
         if not isinstance(result, dict):
             raise ValueError("Service returned a non-object JSON response")
-        return response.status, result, sent, arrived
+        return result, started, arrived
 
-    def collect(self, path, status, result, arrived):
-        deadline = arrived + self.timeout
-        while status == 202:
-            if time.perf_counter() >= deadline:
-                raise TimeoutError("Delayed model result polling exceeded --timeout")
-            time.sleep(.02)
-            status, result, _, arrived = self.request("GET", path + "/result")
-        if status != 200:
-            raise ValueError(f"Unexpected final HTTP {status}")
-        return result, arrived
+    def post(self, path, body=None, *, content_type="application/octet-stream"):
+        result, started, arrived = self.request("POST", path, body, content_type=content_type)
+        if set(result) != {"src"} or not isinstance(result["src"], str):
+            raise ValueError("Expected a 200 JSON response with a single string field 'src'")
+        return result["src"], started, arrived
 
     def close(self):
         self.connection.close()
@@ -71,11 +65,10 @@ class Client:
 @dataclass
 class MeetingStats:
     sent: int = 0
-    delayed: int = 0
     timely: int = 0
-    actions: Counter = field(default_factory=Counter)
-    first_reply_ms: list = field(default_factory=list)
-    result_ms: list = field(default_factory=list)
+    nonempty_src: int = 0
+    empty_src: int = 0
+    post_ms: list = field(default_factory=list)
     from_ready_ms: list = field(default_factory=list)
     error: str = ""
     cleanup_error: str = ""
@@ -109,28 +102,20 @@ def stream_meeting(url, audio, first, frames, step, meeting, gate, slo_ms, timeo
                 stats.sent += 1
                 possibly_admitted = True
                 try:
-                    status, result, sent, arrived = client.request("POST", path + "/chunks", body,
-                                                                   content_type=content_type)
+                    src, started, arrived = client.post(path + "/chunks", body, content_type=content_type)
                 except HTTPStatusError as exc:
                     if 400 <= exc.status < 500:
                         possibly_admitted = admitted
                     raise
                 admitted = True
-                stats.first_reply_ms.append((arrived - sent) * 1000)
-                delayed = status == 202
-                stats.delayed += int(delayed)
-                result, arrived = client.collect(path, status, result, arrived)
-                if result.get("status") in ("buffered", "partial"):
-                    stats.actions[result["status"]] += 1
-                    continue
-                action = result.get("action")
-                if action not in ("DIRECT", "WAIT"):
-                    raise ValueError(f"Missing model action: {result.get('status')!r}")
-                stats.actions[action] += 1
-                elapsed = (arrived - sent) * 1000
-                stats.result_ms.append(elapsed)
+                if src:
+                    stats.nonempty_src += 1
+                else:
+                    stats.empty_src += 1
+                elapsed = (arrived - started) * 1000
+                stats.post_ms.append(elapsed)
                 stats.from_ready_ms.append((arrived - ready) * 1000)
-                stats.timely += int(not delayed and elapsed <= slo_ms)
+                stats.timely += int(elapsed <= slo_ms)
     except (ValueError, HTTPException, OSError, ImportError, threading.BrokenBarrierError, wave.Error) as exc:
         stats.error = str(exc) or type(exc).__name__
         # Each meeting sends in order. Ambiguous failures must not replay audio.
@@ -141,10 +126,7 @@ def stream_meeting(url, audio, first, frames, step, meeting, gate, slo_ms, timeo
             try:
                 if stats.error:
                     client.close()  # A failed or timed-out read can leave an unusable socket.
-                status, result, _, arrived = client.request("POST", path + "/end")
-                result, _ = client.collect(path, status, result, arrived)
-                if result.get("gaps"):
-                    stats.actions["end_with_gap"] += 1
+                client.post(path + "/end")
             except HTTPStatusError as exc:
                 if admitted or exc.status != 404:
                     stats.cleanup_error = str(exc)
@@ -164,20 +146,15 @@ def report(meetings, chunks, slo_ms):
     planned = chunks * len(meetings)
     sent = sum(m.sent for m in meetings)
     timely = sum(m.timely for m in meetings)
-    actions = sum((m.actions for m in meetings), Counter())
     due = [v for m in meetings for v in m.from_ready_ms]
     errors = Counter(m.error for m in meetings if m.error)
     return dict(concurrency=len(meetings), planned_chunks=planned, sent=sent, unsent=planned - sent,
-                first_post_202=sum(m.delayed for m in meetings),
-                direct=actions["DIRECT"], wait=actions["WAIT"], buffered=actions["buffered"],
-                partial_packets=actions["partial"], end_with_gap=actions["end_with_gap"],
-                first_post_with_model_result_within_slo=timely,
-                planned_without_timely_model_result=planned - timely,
+                nonempty_src=sum(m.nonempty_src for m in meetings), empty_src=sum(m.empty_src for m in meetings),
+                responses_within_slo=timely,
                 timely_percent_of_planned=round(100 * timely / planned, 2),
-                model_results_late_from_audio_ready=sum(v > slo_ms for v in due),
-                first_http_reply_ms=percentiles(v for m in meetings for v in m.first_reply_ms),
-                final_model_result_ms=percentiles(v for m in meetings for v in m.result_ms),
-                audio_ready_to_model_result_ms=percentiles(due),
+                late_from_audio_ready=sum(v > slo_ms for v in due),
+                post_latency_ms=percentiles(v for m in meetings for v in m.post_ms),
+                audio_ready_to_result_ms=percentiles(due),
                 http_4xx=sum(n for e, n in errors.items() if e.startswith("HTTP 4")),
                 http_5xx=sum(n for e, n in errors.items() if e.startswith("HTTP 5")),
                 errors=dict(errors), cleanup_errors=dict(Counter(m.cleanup_error for m in meetings if m.cleanup_error)))
@@ -193,7 +170,7 @@ def main(argv=None):
                         help="Send raw PCM16 or a JSON object with base64 float32 samples (requires NumPy)")
     parser.add_argument("--seconds", type=float, help="Audio seconds per meeting; default up to 30 s")
     parser.add_argument("--slo-ms", type=float, default=1000)
-    parser.add_argument("--timeout", type=float, default=15., help="Socket and delayed-result polling timeout in seconds")
+    parser.add_argument("--timeout", type=float, default=15., help="HTTP socket timeout in seconds")
     args = parser.parse_args(argv)
     if min(args.concurrency) < 1 or args.chunk_ms is not None and args.chunk_ms < 1:
         parser.error("--concurrency and --chunk-ms must be positive")
@@ -204,7 +181,7 @@ def main(argv=None):
     try:
         probe = Client(args.url, args.timeout)
         try:
-            _, health, _, _ = probe.request("GET", "/health")
+            health, _, _ = probe.request("GET", "/health")
         finally:
             probe.close()
         if health.get("service") != "third_http" or not health.get("ready"):
@@ -239,7 +216,7 @@ def main(argv=None):
                        for n in range(size)]
             row = report([f.result() for f in futures], math.ceil(frames / step), args.slo_ms)
         print(json.dumps(row, ensure_ascii=False), flush=True)
-        failed |= bool(row["errors"] or row["cleanup_errors"] or row["partial_packets"] or row["end_with_gap"])
+        failed |= bool(row["errors"] or row["cleanup_errors"])
         first_meeting += size
     return int(failed)
 
