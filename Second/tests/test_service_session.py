@@ -182,3 +182,65 @@ def test_30_minute_rolling_meeting_keeps_reference_and_reconstructs_sparse_histo
     assert "spk7" in s.backend.messages[0]["content"] and "<zh><spk7>开始" in s.backend.messages[1]["content"]
     assert len(s.references["spk7"].audio) == 8000 and s.speakers == ["spk7", "spk3"]
     assert s.step(end_of_audio=True)["text"] == WAIT
+
+
+def test_window_60_discard_50_keeps_prefix_between_rotations_even_through_waits():
+    s = SecondStreamSession(Script(repeat(WAIT)), SecondStreamOptions(chunk_seconds=1))
+    for end in range(1, 112):
+        # Mark the source second in every sample to verify what the model got.
+        pcm = np.full(16000, (end - 1) / 128, dtype=np.float32)
+        row = s.step(pcm)
+        start = 0 if end <= 60 else (50 if end <= 110 else 100)
+        assert [int(a[0] * 128) for a in s.backend.audios] == list(range(start, end))
+        assert len(s.backend.messages) == 2 * (end - start)
+        assert row["window_start_seconds"] == start
+        assert row["retained_audio_seconds"] == end - start
+        assert row["discarded_seconds"] == (50 if end in (61, 111) else 0)
+        assert row["evicted_this_turn"] == (end in (61, 111))
+        assert "inferred_commit_seconds" not in row and "unverified_audio_seconds" not in row
+    final = s.step(end_of_audio=True)
+    assert final["discarded_seconds"] == 0 and final["window_start_seconds"] == 100
+    assert len(s.backend.audios) == 11
+
+
+def test_window_rounds_discard_to_complete_turn_and_counts_actual_final_audio():
+    options = SecondStreamOptions(chunk_seconds=.7, window_seconds=2.5, discard_seconds=1)
+    s = SecondStreamSession(Script(repeat(WAIT)), options)
+    pcm = np.ones(11200, dtype=np.float32)
+    for _ in range(3):
+        s.step(pcm)
+    row = s.step(pcm)
+    assert row["window_start_seconds"] == pytest.approx(1.4)
+    assert row["discarded_seconds"] == pytest.approx(1.4)
+    assert len(s.backend.audios) == 2
+    s.step(pcm)
+    row = s.step(pcm[:6400], final_chunk=True)
+    assert row["retained_audio_seconds"] == pytest.approx(2.5)
+    assert row["discarded_seconds"] == 0
+
+
+def test_failed_window_rotation_restores_history_then_retry_and_attribute_bare_text():
+    model = Script(["<en><spk7>first", " second", "oops<bad>", " third"])
+    opts = SecondStreamOptions(chunk_seconds=.5, window_seconds=1., discard_seconds=1.)
+    s = SecondStreamSession(model, opts)
+    s.step(HALF_SECOND)
+    s.step(HALF_SECOND)
+    previous = list(s.history)
+    with pytest.raises(SecondReplyError):
+        s.step(HALF_SECOND)
+    assert s.history == previous and s.heard_seconds == 1
+    assert not s.evicted_this_turn and not s.heuristic_eviction
+    assert s._last_attribution_before_history == (None, None)
+    result = s.step(HALF_SECOND)
+    assert result["discarded_seconds"] == 1.
+    assert len(model.audios) == 1 and "<en><spk7>" in model.messages[0]["content"]
+    assert result["segments"] == [{"language": "en", "speaker": "spk7", "text": " third"}]
+
+
+@pytest.mark.parametrize("window,discard", [
+    (True, 1), (10, False), (.1, .1), (1, 2), (1, 0), (float("nan"), 1),
+    (10, float("inf")), (10**1000, 1),
+])
+def test_invalid_window_options(window, discard):
+    with pytest.raises(ValueError):
+        SecondStreamOptions(window_seconds=window, discard_seconds=discard)

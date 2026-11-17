@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import sys
 
 import numpy as np
 
@@ -18,7 +19,23 @@ class SecondReplyError(ValueError):
 
 @dataclass
 class SecondStreamOptions(StreamOptions):
+    context_policies = ("window", "verified", "rolling")
     number_format: str = "normalized"
+    context_policy: str = "window"
+    window_seconds: float = 60.0
+    discard_seconds: float = 50.0
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.context_policy == "window":
+            for name in ("window_seconds", "discard_seconds"):
+                value = getattr(self, name)
+                if type(value) not in (float, int) or not 0 < value <= sys.float_info.max:
+                    raise ValueError(f"{name} must be positive and finite")
+            if self.chunk_seconds > self.window_seconds:
+                raise ValueError("window_seconds must be at least chunk_seconds")
+            if self.discard_seconds > self.window_seconds:
+                raise ValueError("discard_seconds must not exceed window_seconds")
 
 
 class SecondStreamSession(StreamSession):
@@ -29,6 +46,62 @@ class SecondStreamSession(StreamSession):
     def __init__(self, backend, options=None):
         super().__init__(backend, options or SecondStreamOptions())
         self._recovered_text = {}
+        self._before_rotation = None
+
+    def _window_start(self):
+        return self.history[0].start if self.history else self.heard_seconds
+
+    def _prepare_audio_context(self, duration):
+        if self.options.context_policy != "window":
+            return super()._prepare_audio_context(duration)
+        start = self._window_start()
+        end = self.heard_seconds + duration
+        if end - start <= self.options.window_seconds + 1e-8:
+            return
+
+        # Keep audio/assistant pairs indivisible. If a boundary falls inside
+        # one pair, drop through its end; never replay a reply with half its audio.
+        cutoff = max(start + self.options.discard_seconds, end - self.options.window_seconds)
+        count = len(self.history)
+        for index, turn in enumerate(self.history, 1):
+            if turn.end + 1e-8 >= cutoff:
+                count = index
+                break
+        removed = self.history[:count]
+        # Hold the old state until this decode succeeds. A rejected answer
+        # can be retried with the same (or a shorter final) piece of audio.
+        self._before_rotation = (self.history, self._speakers_before_history,
+                                 self._last_attribution_before_history, self._recovered_text,
+                                 self.heuristic_eviction)
+        self.history = self.history[count:]
+        self._speakers_before_history = self._speakers_before_history.copy()
+        for turn in removed:
+            for attribution in turn.attributions:
+                self._speakers_before_history.add(attribution[1])
+                self._last_attribution_before_history = attribution
+        self.evicted_this_turn = True
+        if removed[-1].end > self.verified_commit_seconds:
+            self.heuristic_eviction = True
+
+    def step(self, audio=None, *, end_of_audio=False, final_chunk=False):
+        if self.options.context_policy != "window":
+            return super().step(audio, end_of_audio=end_of_audio, final_chunk=final_chunk)
+        start = self._window_start()
+        try:
+            result = super().step(audio, end_of_audio=end_of_audio, final_chunk=final_chunk)
+        except Exception:
+            if self._before_rotation is not None:
+                (self.history, self._speakers_before_history, self._last_attribution_before_history,
+                 self._recovered_text, self.heuristic_eviction) = self._before_rotation
+                self.evicted_this_turn = False
+            raise
+        finally:
+            self._before_rotation = None
+        result["window_start_seconds"] = self._window_start()
+        result["discarded_seconds"] = result["window_start_seconds"] - start
+        # A bounded audio window has no estimate of what the model consumed.
+        del result["unverified_audio_seconds"], result["inferred_commit_seconds"]
+        return result
 
     def remember_recovery(self, item):
         self._recovered_text[item["segment_id"]] = (item["audio_end_seconds"], item["text"])

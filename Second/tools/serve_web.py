@@ -25,7 +25,7 @@ def milliseconds(value):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    add_runtime_arguments(parser, include_chunk=False)
+    add_runtime_arguments(parser, include_chunk=False, include_rolling=False)
     add_web_arguments(parser)
     parser.add_argument("--gap-asr-model", type=Path, metavar="LOCAL_CT2_DIR",
                         help="Recover missed speech in the background with a local multilingual "
@@ -34,8 +34,11 @@ def main(argv=None):
     chunk.add_argument("--chunk-ms", dest="chunk_seconds", type=milliseconds, metavar="MS",
                        help="Integer audio step in milliseconds, e.g. 500, 700, 800 or 1000")
     chunk.add_argument("--chunk-seconds", type=float, help="Equivalent step in seconds")
-    parser.set_defaults(chunk_seconds=.5, number_format="normalized", port=18890,
-                        backend="vllm", context_policy="rolling")
+    parser.add_argument("--window-seconds", type=float, default=SecondStreamOptions.window_seconds,
+                        help="Default maximum live audio in a request, including its new chunk (seconds)")
+    parser.add_argument("--discard-seconds", type=float, default=SecondStreamOptions.discard_seconds,
+                        help="Oldest live audio to drop at each window overflow (seconds)")
+    parser.set_defaults(chunk_seconds=.5, number_format="normalized", port=18890, backend="vllm")
     args = parser.parse_args(argv)
     if args.backend != "replay" and args.model is None:
         parser.error("--model is required for real inference")

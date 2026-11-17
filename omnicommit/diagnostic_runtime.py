@@ -17,13 +17,17 @@ MODELS_DIR = Path(__file__).resolve().parents[1] / "models"
 
 
 def add_diagnostic_arguments(parser):
-    add_runtime_arguments(parser, include_chunk=False)
+    add_runtime_arguments(parser, include_chunk=False, context_policies=("verified", "rolling", "window"))
+    parser.add_argument("--window-seconds", type=float, default=argparse.SUPPRESS,
+                        help="Second window policy: maximum retained audio including the new chunk (default 60 s)")
+    parser.add_argument("--discard-seconds", type=float, default=argparse.SUPPRESS,
+                        help="Second window policy: audio removed on each overflow (default 50 s)")
     parser.add_argument("--protocol", choices=("auto", "first", "second"), default="auto",
                         help="Default: infer the ASR protocol from the merged checkpoint manifest")
     parser.add_argument("--chunk-ms", type=_chunk_seconds, dest="chunk_seconds", metavar="MS",
                         help=f"New audio per turn in integer milliseconds (1–{MAX_CHUNK_MS}; default: 500)")
     # Mirror start_server.sh and Second/tools/serve_web.py.
-    parser.set_defaults(chunk_seconds=.5, backend="vllm", context_policy="rolling",
+    parser.set_defaults(chunk_seconds=.5, backend="vllm", context_policy=None,
                         number_format="normalized")
 
 
@@ -91,8 +95,18 @@ def resolve_runtime(args):
     else:
         args.model, protocol = _resolve_checkpoint(args)
 
+    if args.context_policy is None:
+        args.context_policy = "window" if protocol == "second" else "rolling"
+    if args.context_policy == "window" and protocol != "second":
+        raise ValueError("The window context policy requires a Second checkpoint")
+    if args.context_policy != "window" and (hasattr(args, "window_seconds") or hasattr(args, "discard_seconds")):
+        raise ValueError("--window-seconds and --discard-seconds require Second's window context policy")
+
     if protocol == "second":
         from Second.second_asr.service_backend import build_backend
         from Second.second_asr.service_session import SecondStreamOptions, SecondStreamSession
-        return protocol, runtime_options(args, SecondStreamOptions), SecondStreamSession, partial(build_backend, args)
+        options = runtime_options(args, SecondStreamOptions)
+        if options.context_policy == "window":
+            args.window_seconds = options.window_seconds  # Size the engine for the selected audio window.
+        return protocol, options, SecondStreamSession, partial(build_backend, args)
     return protocol, runtime_options(args, StreamOptions), StreamSession, partial(build_web_backend, args)

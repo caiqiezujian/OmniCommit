@@ -67,6 +67,8 @@ class ObservedBackend:
 
 def context_state(session):
     head = session.history[0].start if session.history else session.heard_seconds
+    if session.options.context_policy == "window":
+        return {"history_start_seconds": head}
     watermark = session.verified_commit_seconds
     if session.options.context_policy == "rolling":
         watermark = max(watermark, session.inferred_commit_seconds)
@@ -90,6 +92,13 @@ def run_file(args, write):
             backend = backend_factory()
             observed = ObservedBackend(backend)
             session = session_factory(observed, options)
+            settings = asdict(options)
+            if options.context_policy == "window":
+                for field in ("recent_seconds", "rolling_tail_seconds", "max_context_seconds", "max_pending_seconds"):
+                    settings.pop(field)
+            else:
+                settings.pop("window_seconds", None)
+                settings.pop("discard_seconds", None)
             write({"type": "ready", "protocol": protocol, "backend": type(backend).__name__,
                    "requested_dtype": args.dtype,
                    "engine_options": {key: getattr(args, key) for key in (
@@ -99,7 +108,7 @@ def run_file(args, write):
                    "mm_processor_cache_gb": getattr(backend, "mm_processor_cache_gb", None),
                    "model": str(args.model) if args.model else None,
                    "source_kind": "file", "input": str(args.input.resolve()),
-                   "chunk_ms": round(options.chunk_seconds * 1000), **asdict(options),
+                   "chunk_ms": round(options.chunk_seconds * 1000), **settings,
                    "max_context_tokens": args.max_context_tokens, "max_new_tokens": args.max_new_tokens,
                    "automatic_reference": "disabled"})
             # EOF is a separate, text-only turn, as it is in the web file player.

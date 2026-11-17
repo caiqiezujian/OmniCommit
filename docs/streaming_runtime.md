@@ -17,7 +17,7 @@ CUDA_VISIBLE_DEVICES=0 python tools/diagnose_stream.py /data/test/meeting.mp4 \
   --output /data/yb/Code/OmniCommit/outputs/meeting.1000ms.jsonl
 ```
 
-第二版使用同一条命令，将 `--model` 改成实际的 `second-merged` 目录。若仓库的 `models/omnicommit-merged` 和 `models/second-merged` 中只有一个可用模型，可省略 `--model`。`--chunk-ms` 的单位是毫秒，例如 `200`、`800` 或 `1000`。默认采用启动脚本的 vLLM、rolling 和 normalized 配置。若网页服务用了 HF 或自定义上下文预算，请传入相同的参数。做对照时在网页用文件输入，关闭自动参照，使用相同代码版本且不添加人工提交边界或说话人参照。命令行按文件顺序处理每块，运行时间由推理速度决定。
+第二版使用同一条命令，将 `--model` 改成实际的 `second-merged` 目录，并传入网页所选的窗口，例如 `--window-seconds 60 --discard-seconds 50`。若仓库的 `models/omnicommit-merged` 和 `models/second-merged` 中只有一个可用模型，可省略 `--model`。`--chunk-ms` 的单位是毫秒，例如 `200`、`800` 或 `1000`。两版默认使用 vLLM 和 normalized 数字格式，第一版采用 rolling，第二版采用固定窗口。若网页服务用了 HF 或自定义上下文预算，请传入相同的参数。做对照时在网页用文件输入，保持相同的代码版本，并关闭自动参照与局部补识别。命令行按文件顺序处理每块，运行时间由推理速度决定。
 
 用 `.jsonl` 输出时，每轮完成即写入，可在另一个终端用 `tail -f` 查看。用 `.json` 则在结束时得到事件数组。Web 日志选「逐轮日志 → 下载完整日志 JSONL」，对齐两边 `type=result` 的 `turn`、`event`、`end_seconds`、`action` 和 `text`。播放器的 `file_wait` 只表示等待文件播放。
 
@@ -29,8 +29,8 @@ diff -u <(jq -c "$fields" web-events.jsonl) <(jq -c "$fields" meeting.1000ms.jso
 ```
 
 - **模型回复**：`raw_model_text` 保留后端返回的原文，包括 `<|WAIT|>`。解析失败的原文保存在错误事件里。`consecutive_audio_waits` 只统计连续返回 WAIT 的音频块。
-- **上下文裁剪**：`history_start_seconds` 是当前模型保留的最早一轮音频起点。发生裁剪时，`trimmed_interval_seconds` 给出本轮移出的区间。默认 rolling 保留近期约 12 秒，并受提交边界约束，只能按完整轮次移出较早历史。
-- **预算报错**：错误行中的 `heard_seconds` 是最后成功处理的位置，`attempted_end_seconds` 是尝试处理的位置。`commit_watermark_seconds` 是当前策略使用的边界，`pending_audio_seconds` 是截至最后成功轮次仍待确认的秒数。若下一块会超过 30 秒待确认预算，服务和脚本都在该轮调用后端前停止。此时 `backend_called` 为 `false`，`raw_model_text` 为 `null`，命令退出码为 1，先前轮次保留。上下文时长和模型 token 数另有各自的上限。
+- **上下文裁剪。** `history_start_seconds` 是保留的最早一轮音频起点，`trimmed_interval_seconds` 给出本轮移出的区间。第一版的 rolling 保留近期约 12 秒，并受提交边界约束。第二版网页和默认诊断在加入新块会超出窗口时按完整轮次批量移出旧历史。
+- **预算报错。** 错误行中的 `heard_seconds` 是最后成功处理的位置，`attempted_end_seconds` 是尝试处理的位置。在 rolling 和 verified 策略下，`commit_watermark_seconds` 给出提交边界，`pending_audio_seconds` 给出待确认时长；超出待确认预算时服务会在调用后端前报错。第二版固定窗口在连续 WAIT 时照常裁剪，模型仍受 token 和音频槽位上限约束。
 
 如果两边从同一位置持续 WAIT，可以从人工听到的新语种起点截出一段有清晰人声的音频，用同一条命令和新的输出文件单独跑。如果短片能出字，优先检查切换前的历史及训练中的切换示例。如果短片仍持续 WAIT，再与离线 ASR 对照。两条路径共用模型、提示词和会话逻辑，这个实验可以排查网页传输或显示差异，单凭一致的 WAIT 无法确定是训练数据造成的。
 

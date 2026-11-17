@@ -56,6 +56,7 @@ def parse_reply(reply, allowed_tokens=None):
 
 @dataclass
 class StreamOptions:
+    context_policies = ("verified", "rolling")
     chunk_seconds: float = .5
     recent_seconds: float = 12.0
     max_context_seconds: float = 30.0
@@ -79,8 +80,8 @@ class StreamOptions:
         if type(self.max_speakers) is not int or self.max_speakers < 1:
             raise ValueError("max_speakers must be a positive integer")
         system_prompt(self.number_format)
-        if self.context_policy not in ("verified", "rolling"):
-            raise ValueError("context_policy must be verified or rolling")
+        if self.context_policy not in self.context_policies:
+            raise ValueError("context_policy must be one of " + ", ".join(self.context_policies))
 
 
 @dataclass
@@ -200,6 +201,22 @@ class StreamSession:
     def _pending_seconds(self, commit):
         return self.heard_seconds - commit
 
+    def _prepare_audio_context(self, duration):
+        self._trim()
+        commit = self.verified_commit_seconds
+        if self.options.context_policy == "rolling":
+            commit = max(commit, self.inferred_commit_seconds)
+        pending = self._pending_seconds(commit) + duration
+        retained = duration + sum(t.end - t.start for t in self.history)
+        if pending > self.options.max_pending_seconds + 1e-8:
+            raise ContextBudgetError(
+                f"Unverified pending audio exceeded budget ({pending:.2f}s > "
+                f"{self.options.max_pending_seconds:g}s; {self.options.context_policy} policy, "
+                f"commit watermark {commit:.2f}s, attempted audio end {self.heard_seconds + duration:.2f}s)"
+            )
+        if retained > self.options.max_context_seconds + 1e-8:
+            raise ContextBudgetError("Context audio budget exhausted; cannot safely evict uncommitted speech")
+
     def step(self, audio=None, *, end_of_audio=False, final_chunk=False):
         self._check_open()
         self.evicted_this_turn = False
@@ -218,20 +235,7 @@ class StreamSession:
             if np.max(np.abs(pcm)) > 1.001:
                 raise ValueError("Audio samples must be in [-1,1]")
             duration = len(pcm) / SAMPLE_RATE
-            self._trim()
-            commit = self.verified_commit_seconds
-            if self.options.context_policy == "rolling":
-                commit = max(commit, self.inferred_commit_seconds)
-            pending = self._pending_seconds(commit) + duration
-            retained = duration + sum(t.end - t.start for t in self.history)
-            if pending > self.options.max_pending_seconds + 1e-8:
-                raise ContextBudgetError(
-                    f"Unverified pending audio exceeded budget ({pending:.2f}s > "
-                    f"{self.options.max_pending_seconds:g}s; {self.options.context_policy} policy, "
-                    f"commit watermark {commit:.2f}s, attempted audio end {self.heard_seconds + duration:.2f}s)"
-                )
-            if retained > self.options.max_context_seconds + 1e-8:
-                raise ContextBudgetError("Context audio budget exhausted; cannot safely evict uncommitted speech")
+            self._prepare_audio_context(duration)
             # Match SFT's last short-tail padding without inventing source time.
             short_chunk = len(pcm) < round(self.options.chunk_seconds * SAMPLE_RATE)
             minimum = self._minimum_input_samples(final_chunk or short_chunk)

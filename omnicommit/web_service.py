@@ -29,7 +29,7 @@ def create_app(backend_factory, options, *, max_sessions=1,
                media_cursor_factory=MediaCursor,
                protocol_name="first", chunk_ms_choices=LIVE_CHUNK_MS, gap_service_factory=None,
                web_directory=None, allowed_controls=None,
-               protocol_settings=None):
+               protocol_settings=None, session_settings=(), context_warning=None):
     from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
     from fastapi.responses import FileResponse, JSONResponse
     from fastapi.staticfiles import StaticFiles
@@ -93,6 +93,7 @@ def create_app(backend_factory, options, *, max_sessions=1,
                 "gap_recovery": gap_service is not None,
                 "max_sessions": max_sessions, "chunk_seconds": options.chunk_seconds, **chunk_settings,
                 "context_policy": options.context_policy,
+                **{key: getattr(options, key) for key in session_settings},
                 "backend": type(backend).__name__ if backend else None,
                 "native_prefix_caching": getattr(backend, "enable_prefix_caching", False),
                 "native_mm_processor_cache": getattr(backend, "mm_processor_cache_gb", 0) > 0,
@@ -181,14 +182,15 @@ def create_app(backend_factory, options, *, max_sessions=1,
             range_keys = ("file_start_seconds", "file_end_seconds")
             if source_kind != "file" and any(key in init for key in range_keys):
                 raise ValueError("A file range requires an uploaded file session")
-            session_options = options
+            overrides = {key: init[key] for key in session_settings if key in init}
             if chunk_ms_choices:
                 chunk_ms = init.get("chunk_ms", round(options.chunk_seconds * 1000))
                 if type(chunk_ms) is not int or not min_ms <= chunk_ms <= max_ms:
                     raise ValueError(f"chunk_ms must be an integer between {min_ms} and {max_ms}")
-                session_options = replace(options, chunk_seconds=chunk_ms / 1000)
+                overrides["chunk_seconds"] = chunk_ms / 1000
             elif "chunk_ms" in init:
                 raise ValueError("This service uses a fixed chunk length")
+            session_options = replace(options, **overrides) if overrides else options
             if source_kind == "file":
                 upload = media_store.claim(init.get("media_id"))
                 cursor = media_cursor_factory(upload, start_seconds=init.get("file_start_seconds", 0),
@@ -206,7 +208,8 @@ def create_app(backend_factory, options, *, max_sessions=1,
                 **({"file_start_seconds": cursor.start_seconds, "file_end_seconds": cursor.end_seconds}
                    if cursor is not None else {}),
                 "context_policy": session_options.context_policy, "backend": type(backend).__name__,
-                "warning": "Rolling mode is an unverified tail heuristic" if session_options.context_policy == "rolling" else "Verified watermarks required before safe context eviction",
+                **{key: getattr(session_options, key) for key in session_settings},
+                "warning": context_warning or ("Rolling mode is an unverified tail heuristic" if session_options.context_policy == "rolling" else "Verified watermarks required before safe context eviction"),
                 "automatic_reference": "experimental_qwen" if reference_provider is not None else "disabled",
                 "auto_reference": "experimental_qwen" if reference_provider is not None else "disabled",
                 **(protocol_settings or {})})
@@ -248,6 +251,8 @@ def create_app(backend_factory, options, *, max_sessions=1,
                     event = json.loads(packet.get("text", ""))
                     if "chunk_ms" in event:
                         raise ValueError("chunk_ms can only be selected when starting a session")
+                    if any(key in event for key in session_settings):
+                        raise ValueError("Window settings can only be selected when starting a session")
                     if any(key in event for key in range_keys):
                         raise ValueError("The file range can only be selected when starting a session")
                     if event.get("type") == "end":
@@ -444,10 +449,11 @@ def serve_web(parser, args, backend_factory, options, app_factory):
                 ssl_keyfile=args.ssl_keyfile)
 
 
-def build_web_backend(args, *, manifest_validator=None):
+def build_web_backend(args, *, manifest_validator=None, audio_window_seconds=None):
     bounds = web_chunk_ms_bounds(args.chunk_seconds, args.max_reference_seconds)
     return build_backend(args, manifest_validator=manifest_validator,
-                         chunk_seconds_choices=[ms / 1000 for ms in bounds])
+                         chunk_seconds_choices=[ms / 1000 for ms in bounds],
+                         audio_window_seconds=audio_window_seconds)
 
 
 def main(argv=None):

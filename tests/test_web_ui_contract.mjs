@@ -243,6 +243,9 @@ assert.match(html, /<label id="chunkLabel" for="chunkMs">/);
 assert.match(html, /<input id="chunkMs" type="number"/);
 const picker = elements.get('chunkPresets'), field = elements.get('chunkMs');
 const chunkSettings = document.getElementById('chunkSettings');
+const windowSettings = elements.get('windowSettings');
+const windowField = elements.get('windowSeconds'), discardField = elements.get('discardSeconds');
+windowField.focus = discardField.focus = () => {};
 field.focus = () => { field.focused = true; };
 chunkSettings.hidden = true;
 const sockets = [];
@@ -274,6 +277,7 @@ async function startMeeting(source) {
 }
 vm.runInContext("identifyService({protocol:'first',chunk_seconds:.5})",context);
 assert.equal(chunkSettings.hidden, true);
+assert.equal(windowSettings.hidden, true);
 const [legacySocket, legacyStart] = await startMeeting('microphone');
 assert.deepEqual(legacyStart, {type:'start',sample_rate:16000,source_kind:'microphone'});
 legacySocket.close();
@@ -287,7 +291,8 @@ presetSocket.close();
 await vm.runInContext('cleanup()',context);
 for (const service of [
   {protocol:'first',chunk_seconds:.8,chunk_ms_choices:[500,700,800,1000],chunk_ms_min:200,chunk_ms_max:5000},
-  {protocol:'second',chunk_seconds:.601,chunk_ms_choices:[500,601,700,800,1000],chunk_ms_min:100,chunk_ms_max:1800},
+  {protocol:'second',chunk_seconds:.601,chunk_ms_choices:[500,601,700,800,1000],chunk_ms_min:100,chunk_ms_max:1800,
+    window_seconds:60,discard_seconds:50},
 ]) {
   // A fresh page receives its capabilities and default from its own service.
   picker.replaceChildren();
@@ -297,6 +302,23 @@ for (const service of [
   assert.equal(chunkSettings.hidden, false);
   assert.equal(field.hidden, false);
   assert.equal(field.value, String(Math.round(service.chunk_seconds * 1000)));
+  assert.equal(windowSettings.hidden, service.protocol !== 'second');
+  assert.equal(elements.get('verifiedCommit').hidden, service.protocol === 'second');
+  if (service.protocol === 'second') {
+    assert.equal(windowField.value, '60');
+    assert.equal(discardField.value, '50');
+    for (const [w, d, message] of [['',1,'窗口长度'],[.5,.5,'一个音频块'],[12,0,'丢弃长度'],[20,21,'丢弃长度']]) {
+      windowField.value = String(w);
+      discardField.value = String(d);
+      const before = sockets.length;
+      await elements.get('start').onclick();
+      assert.equal(sockets.length, before);
+      assert.equal(windowField.disabled || discardField.disabled, false);
+      assert.match(elements.get('status').textContent, new RegExp(message));
+    }
+    windowField.value = '20';
+    discardField.value = '10.5';
+  }
   assert.deepEqual(picker.children.map(option => option.textContent), ['常用值', ...service.chunk_ms_choices.map(ms => ms + ' ms')]);
   assert.equal(elements.get('brand').textContent, service.protocol === 'first' ? 'OmniCommit' : 'OmniCommit Second');
   for (const value of ['', 'x', '400.5', String(service.chunk_ms_min - 1), String(service.chunk_ms_max + 1)]) {
@@ -320,8 +342,17 @@ for (const service of [
     const [ws, start] = await startMeeting(source);
     assert.equal(start.chunk_ms, ms);
     assert.equal(start.source_kind, source);
+    let windowConfig = {};
+    if (service.protocol === 'second') {
+      windowConfig = {window_seconds:20, discard_seconds:10.5};
+      assert.equal(start.window_seconds,20);
+      assert.equal(start.discard_seconds,10.5);
+      assert.equal(windowField.disabled && discardField.disabled, true);
+    } else {
+      assert.equal('window_seconds' in start || 'discard_seconds' in start, false);
+    }
     if (source === 'file') assert.equal(start.media_id,'file-7');
-    await ws.onmessage({data:JSON.stringify({...service,type:'ready',chunk_seconds:ms/1000})});
+    await ws.onmessage({data:JSON.stringify({...service,...windowConfig,type:'ready',chunk_seconds:ms/1000})});
     assert.equal(vm.runInContext('step',context), ms * 16);
     assert.equal(picker.disabled, true);
     assert.match(elements.get('serviceDescription').textContent, new RegExp(ms + ' ms'));
@@ -335,7 +366,14 @@ for (const service of [
     }
     vm.runInContext('identifyService(stepService)',context);
     assert.equal(field.value, String(ms));
-    await ws.onmessage({data:JSON.stringify({type:'result',event:'end_of_audio',action:'WAIT',text:'<|WAIT|>'})});
+    await ws.onmessage({data:JSON.stringify({type:'result',event:'end_of_audio',action:'WAIT',text:'<|WAIT|>',
+      window_start_seconds:10.5,end_seconds:21,discarded_seconds:10.5,num_cached_tokens:32})});
+    if (service.protocol === 'second') {
+      assert.equal(windowField.value,'20');
+      assert.equal(discardField.value,'10.5');
+      assert.match(elements.get('windowStatus').textContent,/10.5–21 秒.*丢弃 10.5 秒.*32 tokens/);
+    }
+    assert.equal(windowField.disabled || discardField.disabled, false);
     assert.equal(picker.disabled, false);
     assert.equal(field.disabled, false);
   }

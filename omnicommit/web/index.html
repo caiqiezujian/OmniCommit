@@ -24,6 +24,13 @@
 <select id="chunkPresets" aria-label="常用音频块时长"></select>
 <span id="chunkRange" class="hint" hidden></span>
 </div>
+<div id="windowSettings" hidden>
+<div class="file-range" role="group" aria-label="流式推理窗口">
+<label for="windowSeconds">窗口长度（秒）<input id="windowSeconds" type="number" step="any" min="0" required aria-describedby="windowHelp"></label>
+<label for="discardSeconds">每次丢弃长度（秒）<input id="discardSeconds" type="number" step="any" min="0" required aria-describedby="windowHelp"></label>
+</div>
+<p id="windowHelp" class="hint">加入下一块会超出窗口时，从开头丢弃一段旧音频。每次开始转录时应用这组设置。</p>
+</div>
 <div id="filePanel" hidden><label>选择本地文件 <input id="file" type="file" accept="audio/*,video/*"></label><video id="media" controls playsinline></video>
 <div class="file-range" role="group" aria-label="文件转录区间">
 <label for="fileStart">转录起点<input id="fileStart" type="text" placeholder="文件开头" aria-describedby="fileRangeHelp"></label>
@@ -33,7 +40,7 @@
 <div id="micPanel"><p id="sourceHelp">允许浏览器使用麦克风，开始后按音频块实时识别。</p><label id="mixLabel" hidden><input type="checkbox" id="mixMic"> 同时采集麦克风</label></div>
 <div class="buttons"><button id="start" class="primary">开始转录</button><button id="stop" disabled>结束并处理尾部</button></div>
 <p id="status" class="status" role="status">等待开始</p><p id="warning" class="error" role="alert" hidden></p><p id="autoStatus" class="hint"></p><p id="references" class="hint"></p><p class="hint">麦克风与电脑声音需要 HTTPS 或 localhost；电脑声音需在共享窗口中勾选共享音频。</p>
-<div class="controls"><div class="metric" id="processed">已处理：0.0 秒</div><div class="metric" id="pending">本地积压：0.0 秒</div><div class="metric" id="latency">最近推理：—</div></div>
+<div class="controls"><div class="metric" id="processed">已处理：0.0 秒</div><div class="metric" id="pending">本地积压：0.0 秒</div><div class="metric" id="latency">最近推理：—</div><div class="metric" id="windowStatus" hidden></div></div>
 </section><section class="card"><h2>实时转录</h2><div class="buttons"><button id="exportTxt">导出 TXT</button><button id="exportJson">导出 JSON</button></div>
 <p class="hint" id="transcriptHelp">正文只显示已提交的文字；说话人与语种由模型识别，长会议结果需要实际验证。</p>
 <p id="gapStatus" class="hint" role="status" hidden></p><div id="transcript" class="transcript" aria-live="polite"></div>
@@ -53,7 +60,7 @@
 <div id="events" tabindex="0" aria-label="逐轮日志内容"></div>
 <p class="hint">日志保存在当前浏览器。点开一条记录可查看完整字段。</p>
 <p class="error" id="logWarning" role="status" hidden></p></details>
-<details><summary>人工核验与声音参照</summary><p class="hint">以下秒数从本次转录起点算起。仅填写已听到、确认完整且身份可靠的区间。</p><label>已完整提交至（秒）<input id="through" type="number" step=".1" min="0"></label><button id="commit">确认提交位置</button><label>说话人 <input id="refSpeaker" value="spk1"></label><label>语种 <input id="refLanguage" value="zh"></label><label>参照起点（秒） <input id="refStart" type="number" step=".1" min="0"></label><label>参照终点（秒） <input id="refEnd" type="number" step=".1" min="0"></label><label>参照转录 <input id="refText"></label><label><input id="verified" type="checkbox"> 已核验声音清晰、身份准确且没有重叠发言</label><button id="reference">保存参照</button></details>
+<details><summary>人工核验与声音参照</summary><p class="hint">以下秒数从本次转录起点算起。仅填写已听到、确认完整且身份可靠的区间。</p><div id="verifiedCommit"><label>已完整提交至（秒）<input id="through" type="number" step=".1" min="0"></label><button id="commit">确认提交位置</button></div><label>说话人 <input id="refSpeaker" value="spk1"></label><label>语种 <input id="refLanguage" value="zh"></label><label>参照起点（秒） <input id="refStart" type="number" step=".1" min="0"></label><label>参照终点（秒） <input id="refEnd" type="number" step=".1" min="0"></label><label>参照转录 <input id="refText"></label><label><input id="verified" type="checkbox"> 已核验声音清晰、身份准确且没有重叠发言</label><button id="reference">保存参照</button></details>
 </section></div></main>
 <script src="/web/log-archive.js"></script>
 <script src="/web/turn-log.js"></script>
@@ -67,6 +74,8 @@ const turnLog = new MeetingTurnLog($, download);
 const firstTranscriptHelp = $('transcriptHelp').textContent;
 let acceptedChunkMs = null;
 const chunkInput = $('chunkMs'), chunkPresets = $('chunkPresets');
+const windowInput = $('windowSeconds'), discardInput = $('discardSeconds');
+let windowSupported = false;
 chunkPresets.onchange = () => {
   if (!chunkInput.hidden && chunkPresets.value) {
     chunkInput.value = chunkPresets.value;
@@ -81,6 +90,15 @@ function identifyService(info) {
   $('brand').textContent = brand;
   const ready = info.type === 'ready';
   const defaultMs = Math.round(info.chunk_seconds * 1000);
+  const hasWindow = second && Number.isFinite(info.window_seconds) && Number.isFinite(info.discard_seconds);
+  if (hasWindow && (!windowSupported || ready)) {
+    windowInput.value = String(info.window_seconds);
+    discardInput.value = String(info.discard_seconds);
+  }
+  windowSupported = hasWindow;
+  $('windowSettings').hidden = !hasWindow;
+  $('verifiedCommit').hidden = hasWindow;
+  if (!hasWindow) $('windowStatus').hidden = true;
   if (ready) {
     acceptedChunkMs = defaultMs;
     $('serviceDescription').textContent = '多语种 · 多说话人流式转录 · 每块 ' + acceptedChunkMs + ' ms';
@@ -247,7 +265,10 @@ function updateTranscript(result) {
 function transmit(){if(!socket||socket.readyState!==1||busy)return;if(controlQueue.length){busy=true;socket.send(JSON.stringify({type:'control',...controlQueue.shift()}));return;}if(queue.length){busy=true;socket.send(queue.shift());return;}if(mode==='file'&&!ending){pollFile();return;}if(ending&&!ended){ended=true;busy=true;socket.send(JSON.stringify({type:'end'}));}}
 function pcmPacket(samples){const pcm=new Int16Array(samples.length);samples.forEach((v,i)=>pcm[i]=Math.round(Math.max(-1,Math.min(1,v))*32767));return pcm.buffer;}
 function capture(samples){if(!capturing)return;partial.push(...samples);while(partial.length>=step)queue.push(pcmPacket(partial.splice(0,step)));$('pending').textContent='本地积压：'+(queue.length*step/16000).toFixed(1)+' 秒';if(queue.length*step/16000>10)stopCapture('处理积压超过 10 秒，已停止采集，正在处理已接收音频。');transmit();}
-async function cleanup(){capturing=false;initializing=false;clearInterval(polling);polling=null;if(mode==='file')$('media').pause();$('file').disabled=$('fileStart').disabled=$('fileEnd').disabled=false;for(const s of streams)s.getTracks().forEach(t=>t.stop());streams=[];if(context&&context.state!=='closed')await context.close();context=null;node=null;sources=[];$('start').disabled=false;chunkInput.disabled=chunkPresets.disabled=false;$('stop').disabled=true;$('serviceDescription').textContent='多语种 · 多说话人流式转录';document.querySelectorAll('[data-mode]').forEach(b=>b.disabled=false);render();}
+function lockInferenceSettings(locked) {
+  chunkInput.disabled = chunkPresets.disabled = windowInput.disabled = discardInput.disabled = locked;
+}
+async function cleanup(){capturing=false;initializing=false;clearInterval(polling);polling=null;if(mode==='file')$('media').pause();$('file').disabled=$('fileStart').disabled=$('fileEnd').disabled=false;for(const s of streams)s.getTracks().forEach(t=>t.stop());streams=[];if(context&&context.state!=='closed')await context.close();context=null;node=null;sources=[];$('start').disabled=false;lockInferenceSettings(false);$('stop').disabled=true;$('serviceDescription').textContent='多语种 · 多说话人流式转录';document.querySelectorAll('[data-mode]').forEach(b=>b.disabled=false);render();}
 async function stopCapture(message){if(stopping||ending)return;stopping=true;$('stop').disabled=true;try{if(mode==='file'){$('media').pause();fileFinalSeconds=fileReleasePosition();fileStopping=true;status(message||'正在处理已播放音频和尾部文字…');transmit();return;}else if(capturing&&node){await new Promise((resolve,reject)=>{const timer=setTimeout(()=>{stopAck=null;reject(Error('采集器停止确认超时'));},2000);stopAck=()=>{clearTimeout(timer);resolve();};node.port.postMessage('stop');});capturing=false;if(partial.length){queue.push(pcmPacket(partial));partial=[];}}ending=true;status(message||'正在处理剩余音频和尾部文字…');transmit();}catch(e){failed=true;status(e.message,true);await cleanup();if(socket)socket.close();}}
 function control(event){if(finished){const has=id=>speakers.some(s=>s.speaker===id);if(event.op==='rename_speaker'&&has(event.speaker)&&event.name){speakers.find(s=>s.speaker===event.speaker).name=event.name;}else if(event.op==='correct_segment'&&has(event.speaker)&&segments.some(s=>s.segment_id===event.segment_id)){segments.find(s=>s.segment_id===event.segment_id).display_speaker=event.speaker;}else if(event.op==='merge_speakers'&&has(event.source)&&has(event.target)&&event.source!==event.target){for(const s of segments)if(s.display_speaker===event.source)s.display_speaker=event.target;for(const key of Object.keys(aliases))if(aliases[key]===event.source)aliases[key]=event.target;aliases[event.source]=event.target;speakers=speakers.filter(s=>s.speaker!==event.source);}else{status('修正失败：说话人或片段不存在。',true);return;}log({type:'local_correction',...event});render();status('已更新本次导出结果。');return;}if(!socket||socket.readyState!==1||ending){status('当前会话不可修改。',true);return;}controlQueue.push(event);transmit();}
 function fileReleasePosition() {
@@ -351,6 +372,21 @@ $('start').onclick=async()=>{
       return;
     }
   }
+  let windowOptions = {};
+  if (windowSupported) {
+    const windowSeconds = Number(windowInput.value), discardSeconds = Number(discardInput.value);
+    if (!Number.isFinite(windowSeconds) || windowSeconds <= 0 || windowSeconds < requestedChunkMs / 1000) {
+      status('窗口长度须大于零，且至少能容纳一个音频块。', true);
+      windowInput.focus();
+      return;
+    }
+    if (!Number.isFinite(discardSeconds) || discardSeconds <= 0 || discardSeconds > windowSeconds) {
+      status('每次丢弃长度须大于零，且不能超过窗口长度。', true);
+      discardInput.focus();
+      return;
+    }
+    windowOptions = {window_seconds:windowSeconds, discard_seconds:discardSeconds};
+  }
   let requestedStart = null, requestedEnd = null;
   if (mode === 'file') {
     try {
@@ -359,7 +395,7 @@ $('start').onclick=async()=>{
       validateFileRange(requestedStart, requestedEnd, Infinity);
     } catch (error) {status(error.message, true); return;}
   }
-  chunkInput.disabled = chunkPresets.disabled = true;
+  lockInferenceSettings(true);
   try {
     const previousSocket = socket;
     socket = null;
@@ -369,6 +405,7 @@ $('start').onclick=async()=>{
     fileStartSeconds=0;fileEndSeconds=null;finished=false;initializing=true;lastProcessed=0;captureError=false;
     render();
     $('warning').hidden=true;$('warning').textContent='';$('gapStatus').hidden=true;
+    $('windowStatus').hidden=true;
     $('processed').textContent='已处理：0.0 秒';
     $('start').disabled=$('file').disabled=$('fileStart').disabled=$('fileEnd').disabled=true;
     document.querySelectorAll('[data-mode]').forEach(b=>b.disabled=true);
@@ -390,7 +427,7 @@ $('start').onclick=async()=>{
     socket.binaryType='arraybuffer';
     socket.onopen=()=>{
       if(socket!==sessionSocket)return;
-      const start = {type:'start', sample_rate:16000, source_kind:mode};
+      const start = {type:'start', sample_rate:16000, source_kind:mode, ...windowOptions};
       if (fileId) {
         start.media_id = fileId;
         if (requestedStart !== null) start.file_start_seconds = requestedStart;
@@ -449,7 +486,16 @@ $('start').onclick=async()=>{
         if(row.automatic_reference&&row.automatic_reference.status==='error'){
           $('autoStatus').textContent='自动参照本会话已停用，转录继续；请核查服务日志。';
         }
-        if(row.evicted_this_turn&&!reportedTrim){
+        if (windowSupported && Number.isFinite(row.window_start_seconds) && Number.isFinite(row.end_seconds)) {
+          const seconds = value => Number(value.toFixed(3));
+          const range = seconds(row.window_start_seconds) + '–' + seconds(row.end_seconds) + ' 秒';
+          let metric = '模型窗口（会话时间）：' + range;
+          if (row.discarded_seconds > 0) metric += ' · 本轮丢弃 ' + seconds(row.discarded_seconds) + ' 秒';
+          if (Number.isInteger(row.num_cached_tokens) && row.num_cached_tokens >= 0) metric += ' · KV 命中 ' + row.num_cached_tokens + ' tokens';
+          $('windowStatus').textContent = metric;
+          $('windowStatus').hidden = false;
+        }
+        if(!windowSupported&&row.evicted_this_turn&&!reportedTrim){
           reportedTrim=true;
           if(!captureError){
             $('warning').hidden=false;

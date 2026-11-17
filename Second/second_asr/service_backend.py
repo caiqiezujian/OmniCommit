@@ -36,4 +36,5 @@ def validate_manifest(tokenizer, manifest):
 
 def build_backend(args):
     from omnicommit.web_service import build_web_backend
-    return build_web_backend(args, manifest_validator=validate_manifest)
+    return build_web_backend(args, manifest_validator=validate_manifest,
+                             audio_window_seconds=getattr(args, "window_seconds", None))

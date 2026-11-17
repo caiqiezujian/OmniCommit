@@ -15,7 +15,7 @@ from omnicommit.diagnostic_runtime import add_diagnostic_arguments, resolve_runt
 from omnicommit.streaming import SAMPLE_RATE
 from tools.compare_stream_traces import read_trace, records
 from tools.diagnose_stream import ObservedBackend, open_trace, pcm_sha256
-from tools.diagnose_switch_segment import SESSION_OPTIONS
+from tools.diagnose_switch_segment import session_option_names
 
 
 def select_probes(frames, args):
@@ -42,7 +42,7 @@ def engine_from_trace(header):
     parser = argparse.ArgumentParser(add_help=False)
     add_diagnostic_arguments(parser)
     cmd = ["--backend", backend, "--model", header["model"], "--dtype", header["requested_dtype"]]
-    for name in SESSION_OPTIONS:
+    for name in session_option_names(header):
         cmd.extend(("--" + name.replace("_", "-"), str(header[name])))
     for name, value in header.get("engine_options", {}).items():
         if name in ("attention", "device_map", "tensor_parallel_size", "gpu_memory_utilization", "vllm_image_slots"):

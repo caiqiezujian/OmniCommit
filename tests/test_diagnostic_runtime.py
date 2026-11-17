@@ -48,12 +48,30 @@ def test_model_selection_defaults_precedence_and_lazy_load(tmp_path, monkeypatch
     args = arguments("--protocol", "second", "--chunk-ms", "200")
     protocol, options, session, make_backend = runtime.resolve_runtime(args)
     assert args.model == second and protocol == "second" and options.chunk_seconds == .2
+    assert (options.context_policy, options.window_seconds, options.discard_seconds) == ("window", 60, 50)
     assert session.__name__ == "SecondStreamSession"
     monkeypatch.setenv("OMNICOMMIT_MODEL", str(first))
     assert runtime.resolve_runtime(arguments())[0] == "first"
     assert runtime.resolve_runtime(arguments("--model", str(second)))[0] == "second"
     with pytest.raises(ValueError, match="conflicting"):
         runtime.resolve_runtime(arguments("--protocol", "second"))
+
+
+@pytest.mark.parametrize("policy", ["rolling", "verified"])
+def test_explicit_second_legacy_trace_policy(policy):
+    _, options, _, _ = runtime.resolve_runtime(arguments("--protocol", "second", "--backend", "replay",
+                                                        "--context-policy", policy))
+    assert options.context_policy == policy
+
+
+@pytest.mark.parametrize("flags", [
+    ["--protocol", "first", "--context-policy", "window"],
+    ["--protocol", "first", "--window-seconds", "60"],
+    ["--protocol", "second", "--context-policy", "rolling", "--discard-seconds", "5"],
+])
+def test_incompatible_window_arguments_are_detected(flags):
+    with pytest.raises(ValueError, match="window"):
+        runtime.resolve_runtime(arguments("--backend", "replay", *flags))
 
 
 @pytest.mark.parametrize("bad", [None, {}, {"schema_version": 3}, {"schema_version": True},

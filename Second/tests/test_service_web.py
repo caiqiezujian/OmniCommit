@@ -33,6 +33,64 @@ def send_audio(socket, frames=11200):
     return socket.receive_json()
 
 
+def test_windowed_meetings_do_not_share_settings_or_crop_schedules():
+    # Both return only WAIT, including the turns that cross a window boundary.
+    app = create_app(ReplayBackend, SecondStreamOptions(chunk_seconds=1), max_sessions=2)
+    with TestClient(app) as client, client.websocket_connect("/stream") as mic, client.websocket_connect("/stream") as system:
+        defaults = client.get("/health").json()
+        assert (defaults["window_seconds"], defaults["discard_seconds"]) == (60, 50)
+        for sock, kind, window, discard in ((mic, "microphone", 4, 3), (system, "system", 3, 1)):
+            ready = start(sock, kind, window_seconds=window, discard_seconds=discard)
+            assert (ready["window_seconds"], ready["discard_seconds"]) == (window, discard)
+        for mic_start, system_start in [(0, 0), (0, 0), (0, 0), (0, 1), (3, 2)]:
+            for sock, expected in ((mic, mic_start), (system, system_start)):
+                row = send_audio(sock, 16000)
+                assert row["window_start_seconds"] == expected
+                assert row["end_seconds"] - expected == row["retained_audio_seconds"]
+        mic.send_json({"type": "end", "window_seconds": 10})
+        assert mic.receive_json()["type"] == "error"
+        system.send_json({"type": "end"})
+        assert system.receive_json()["event"] == "end_of_audio"
+
+
+@pytest.mark.parametrize("fields", [
+    {"window_seconds": 2, "discard_seconds": 3}, {"window_seconds": 0}, {"discard_seconds": True},
+    {"window_seconds": "60"}, {"discard_seconds": 0}, {"window_seconds": .25, "discard_seconds": .25}
+])
+def test_invalid_window_fails_before_audio_is_accepted(fields):
+    with TestClient(create_app(ReplayBackend, SecondStreamOptions())) as client, client.websocket_connect("/stream") as sock:
+        sock.send_json({"type": "start", "sample_rate": 16000, **fields})
+        error = sock.receive_json()
+        assert error["type"] == "error" and error["heard_seconds"] == 0
+
+
+def test_web_rejects_window_that_exceeds_loaded_engine_audio_slots():
+    engine = ReplayBackend()
+    engine.max_audio_turns = 22  # 16 speaker reference slots, six slots for live audio.
+    with TestClient(create_app(lambda: engine, SecondStreamOptions())) as client, client.websocket_connect("/stream") as sock:
+        sock.send_json({"type": "start", "sample_rate": 16000, "chunk_ms": 500,
+                        "window_seconds": 4, "discard_seconds": 2})
+        error = sock.receive_json()
+        assert error["type"] == "error" and "3 秒" in error["error"]
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="requires FFmpeg")
+def test_file_range_uses_meeting_relative_window_and_keeps_absolute_playback_time():
+    wav = io.BytesIO()
+    sf.write(wav, np.zeros(10 * 16000, dtype=np.int16), 16000, format="WAV", subtype="PCM_16")
+    with TestClient(create_app(ReplayBackend, SecondStreamOptions())) as client, client.websocket_connect("/stream") as sock:
+        upload = client.post("/api/media", content=wav.getvalue()).json()
+        ready = start(sock, "file", media_id=upload["media_id"], chunk_ms=1000, window_seconds=3,
+                      discard_seconds=2, file_start_seconds=4, file_end_seconds=9)
+        assert ready["file_start_seconds"] == 4 and ready["window_seconds"] == 3
+        for turn, head in enumerate([0, 0, 0, 2, 2], 1):
+            sock.send_json({"type": "file_next", "release_seconds": 4 + turn})
+            row = sock.receive_json()
+            assert (row["window_start_seconds"], row["end_seconds"], row["source_end_seconds"]) == (head, turn, 4 + turn)
+        sock.send_json({"type": "end"})
+        assert sock.receive_json()["window_start_seconds"] == 2
+
+
 def test_concurrent_meetings_negotiate_independent_chunk_lengths():
     app = create_app(ReplayBackend, SecondStreamOptions(chunk_seconds=.701), max_sessions=2)
     with TestClient(app) as client:

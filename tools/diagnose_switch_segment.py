@@ -21,9 +21,12 @@ from tools import compare_switch_segment
 
 RUNS = {"hf": ("HFBackend", None), "vllm-on": ("VLLMBackend", True),
         "vllm-off": ("VLLMBackend", False)}
-SESSION_OPTIONS = ("protocol", "chunk_ms", "number_format", "context_policy", "recent_seconds",
-                   "rolling_tail_seconds", "max_context_seconds", "max_pending_seconds", "max_speakers",
-                   "max_reference_seconds", "max_total_reference_seconds", "max_context_tokens", "max_new_tokens")
+def session_option_names(header):
+    common = ("protocol", "chunk_ms", "number_format", "context_policy", "max_speakers",
+              "max_reference_seconds", "max_total_reference_seconds", "max_context_tokens", "max_new_tokens")
+    if header.get("context_policy") == "window":
+        return common + ("window_seconds", "discard_seconds")
+    return common + ("recent_seconds", "rolling_tail_seconds", "max_context_seconds", "max_pending_seconds")
 
 
 def read_settings(paths):
@@ -33,7 +36,7 @@ def read_settings(paths):
             header = json.loads(stream.readline())
         if not isinstance(header, dict) or header.get("type") != "ready":
             raise ValueError(f"{path}: expected a diagnose_stream ready header")
-        for key in (*SESSION_OPTIONS, "input", "model", "requested_dtype", "backend", "enable_prefix_caching",
+        for key in (*session_option_names(header), "input", "model", "requested_dtype", "backend", "enable_prefix_caching",
                     "mm_processor_cache_gb", "automatic_reference"):
             if key not in header:
                 raise ValueError(f"{path}: missing ready.{key}")
@@ -45,7 +48,7 @@ def read_settings(paths):
         headers[name] = header
     hf = headers["hf"]
     for name in ("vllm-on", "vllm-off"):
-        for key in ("input", "model", "requested_dtype", *SESSION_OPTIONS):
+        for key in ("input", "model", "requested_dtype", *session_option_names(hf)):
             if headers[name][key] != hf[key]:
                 raise ValueError(f"{paths[name]}: ready.{key} differs from {paths['hf']}")
     if headers["vllm-on"]["mm_processor_cache_gb"] != headers["vllm-off"]["mm_processor_cache_gb"]:
@@ -106,7 +109,7 @@ def run_experiment(args):
 
     base = [sys.executable, str(ROOT / "tools" / "diagnose_stream.py"), str(clip),
             "--model", str(model), "--dtype", common["requested_dtype"]]
-    for key in SESSION_OPTIONS:
+    for key in session_option_names(common):
         base.extend(("--" + key.replace("_", "-"), str(common[key])))
     failed = []
     report_args = ["--start-seconds", str(args.start_seconds), "--end-seconds", str(args.end_seconds),

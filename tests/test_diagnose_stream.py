@@ -23,12 +23,12 @@ def wav(path, frames):
     return path
 
 
-def trace(tmp_path, audio, replies, ms, protocol, extension):
+def trace(tmp_path, audio, replies, ms, protocol, extension, *extra):
     scripted = tmp_path / "replies.json"
     scripted.write_text(json.dumps(replies), encoding="utf-8")
     output = tmp_path / ("trace." + extension)
     status = cli([str(audio), "--chunk-ms", str(ms), "--backend", "replay",
-                  "--protocol", protocol, "--replies", str(scripted), "--output", str(output)])
+                  "--protocol", protocol, "--replies", str(scripted), "--output", str(output), *extra])
     data = output.read_text(encoding="utf-8")
     rows = json.loads(data) if extension == "json" else [json.loads(line) for line in data.splitlines()]
     return status, rows
@@ -46,13 +46,14 @@ def test_cli_file_matches_websocket_turn_for_turn(tmp_path, protocol, extension)
     code, rows = trace(tmp_path, audio, replies, 200, protocol, extension)
     assert code == 0 and rows[0]["type"] == "ready"
     assert rows[0]["protocol"] == protocol and rows[0]["chunk_ms"] == 200
-    assert rows[0]["context_policy"] == "rolling" and rows[0]["number_format"] == "normalized"
+    policy = "window" if protocol == "second" else "rolling"
+    assert rows[0]["context_policy"] == policy and rows[0]["number_format"] == "normalized"
     assert rows[0]["enable_prefix_caching"] is None and rows[0]["mm_processor_cache_gb"] is None
     if protocol == "first":
         app_factory, options_type = create_app, StreamOptions
     else:
         app_factory, options_type = second_app, SecondStreamOptions
-    app = app_factory(lambda: ReplayBackend(replies), options_type(context_policy="rolling", number_format="normalized"))
+    app = app_factory(lambda: ReplayBackend(replies), options_type(context_policy=policy, number_format="normalized"))
     with TestClient(app) as client, client.websocket_connect("/stream") as socket:
         upload = client.post("/api/media", content=audio.read_bytes()).json()
         socket.send_json({"type": "start", "sample_rate": 16000, "source_kind": "file",
@@ -64,11 +65,23 @@ def test_cli_file_matches_websocket_turn_for_turn(tmp_path, protocol, extension)
             else:
                 socket.send_json({"type": "file_next", "release_seconds": .45, "final": True})
             web = socket.receive_json()
+            specific = ("window_start_seconds", "discarded_seconds") if policy == "window" else ("inferred_commit_seconds",)
             for key in ("type", "event", "turn", "action", "text", "segments", "start_seconds",
-                        "end_seconds", "retained_audio_seconds", "evicted_this_turn", "inferred_commit_seconds"):
+                        "end_seconds", "retained_audio_seconds", "evicted_this_turn", *specific):
                 assert web[key] == cli_row[key]
     assert [r["raw_model_text"] for r in rows[1:]] == replies
     assert [r["end_seconds"] for r in rows[1:]] == pytest.approx([.2, .4, .45, .45])
+
+
+def test_second_window_discards_from_a_wait_streak_and_reports_the_actual_cut(tmp_path):
+    audio = wav(tmp_path / "meeting.wav", 5 * 16000)
+    code, rows = trace(tmp_path, audio, [WAIT] * 6, 1000, "second", "jsonl",
+                       "--window-seconds", "3", "--discard-seconds", "2")
+    assert code == 0
+    assert (rows[0]["window_seconds"], rows[0]["discard_seconds"]) == (3, 2)
+    assert [r["history_start_seconds"] for r in rows[1:]] == [0, 0, 0, 2, 2, 2]
+    assert rows[4]["trimmed_interval_seconds"] == [0, 2]
+    assert all("pending_audio_seconds" not in r for r in rows[1:])
 
 
 def test_late_wait_budget_matches_failed_meeting(tmp_path):

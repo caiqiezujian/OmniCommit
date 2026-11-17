@@ -68,9 +68,12 @@ def compare(path_a, trace_a, path_b, trace_b):
     header_b, b = trace_b
     # These settings affect the input or dialogue. Engine/cache settings and
     # generation timings are intentionally allowed to differ between runs.
-    fields = ("input", "model", "protocol", "chunk_ms", "context_policy", "recent_seconds",
-              "rolling_tail_seconds", "max_pending_seconds", "max_context_seconds", "number_format",
+    fields = ("input", "model", "protocol", "chunk_ms", "context_policy", "number_format",
               "max_context_tokens", "max_new_tokens", "automatic_reference")
+    if header_a.get("context_policy") == "window":
+        fields += ("window_seconds", "discard_seconds")
+    else:
+        fields += ("recent_seconds", "rolling_tail_seconds", "max_pending_seconds", "max_context_seconds")
     if "requested_dtype" in header_a and "requested_dtype" in header_b:
         fields += ("requested_dtype",)
     for key in fields:
