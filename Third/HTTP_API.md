@@ -69,6 +69,65 @@ HTTP 默认按 1 秒步长解码，单包最长 8 秒。如果对方每包最长
 
 音频格式错误或超长、同一会议重叠发包、容量已满、引擎失败，都会返回相应的非 200 状态码。网络超时时，已经接收的包可能仍在处理，重复 POST 会有重复转录的风险。部署方排查截断时可以查看服务日志或最近一包的诊断记录 `GET /v1/meetings/{meeting_id}/result`。正常对接只用两个 POST 接口。
 
+### 定位某次 HTTP 409
+
+新版服务会把拒绝原因和推理异常同时打印到启动终端的标准错误。即使用原来的 `> logs/service.log 2>&1` 方式启动，也能在这个文件中搜索 `request_rejected`。例如同一会议的上一包还在推理时，日志会给出 `reason=in_flight`、`blocking_phase=processing`、阻塞请求的 ID 和已耗时的毫秒数。
+
+调用方遇到 409 时，记录会议 ID、响应头 `X-Request-ID` 和响应正文中的 `detail`。Python 调用方可以在 `raise_for_status()` 之前读取这些信息。
+
+~~~python
+if response.status_code == 409:
+    print(response.headers.get("X-Request-ID"), response.text)
+~~~
+
+服务默认将请求日志按 JSONL 追加到仓库下的 `Third/logs/http-requests.jsonl`。可在启动命令中加 `--request-log /data/logs/third-http.jsonl` 指定位置。启动时会打印实际路径，目录无法写入时改写到标准错误。每条记录使用 UTC 时间，文件达到 20 MiB 后轮转，最多保留 5 个历史文件。日志中的转录统计使用字符数，会议音频和转录正文留在原有的数据通路中。
+
+在仓库根目录执行以下命令，按会议或请求查询。较早的记录也可能在同目录的 `.1` 至 `.5` 文件中。
+
+~~~bash
+jq -c --arg m 'meeting-001' 'select(.meeting_id == $m)' Third/logs/http-requests.jsonl
+jq -c --arg r '替换为请求ID' \
+  'select(.request_id == $r or .blocking_request_id == $r or .last_request_id == $r)' \
+  Third/logs/http-requests.jsonl
+~~~
+
+- `request_rejected` 且 `reason=in_flight` 表示本次请求被拒绝。用 `blocking_request_id` 查上一条请求。`blocking_operation` 标识正在执行的操作，`blocking_phase=upload` 表示还在收包，`processing` 表示正在处理。每个会议串行发包，最后一包返回后再调用 `/end`。
+- `reason=ended`、`failed`、`expired` 分别表示会议已经结束、处理失败、空闲过期。用 `last_request_id` 回查该会议最后一次请求，新会议分配新的 ID。空闲超时默认 600 秒，实际值见 `/health` 中的 `idle_timeout_seconds`。
+- 成功请求的 `request_finished` 给出耗时 `duration_ms` 和新增文本的字符数 `src_chars`。`src_chars=0` 是有效结果。如果前一包在客户端超时，服务器可能仍在处理，先查该会议的日志或 `GET /v1/meetings/{meeting_id}/result`。该接口返回最近一包的状态，自动重发同一包可能重复转录。
+
+### 录下整场会议，逐轮检查输入与输出
+
+在启动 HTTP 服务时加 `--debug-dir` 即可记录接下来收到的会议。调用方继续使用相同的 `/chunks` 和 `/end`。普通运行保留请求摘要，启用详细模式的运行另存原始请求、音频和带正文的逐轮记录。
+
+~~~bash
+cd /data/yb/Code/OmniCommit
+CUDA_VISIBLE_DEVICES=0 bash Third/start_http.sh \
+  /data/yb/Code/OmniCommit/models/third-explicit-merged \
+  --port 18892 --chunk-ms 1000 \
+  --debug-dir /data/yb/Code/OmniCommit/Third/logs/http-debug
+~~~
+
+每个会议使用单独目录，目录名是会议 ID 的完整 SHA-256。目录中的 `events.jsonl` 按事件记录 UTC 时间、会议 ID 和请求 ID。第一包的请求 ID 同时标识这一次会话，重复使用同一会议 ID 时，可按 `session_started` 找到新的起点。
+
+| 要检查的问题 | 查看哪些记录 |
+|---|---|
+| 调用方送来了什么？ | `request_received` 有请求类型和声明长度。对完整收到且在大小限制内的受支持请求体，`request_body.body_file` 指向原始字节，`body_sha256` 可核对重发。有效音频的 `packet_audio.audio_file` 是可播放的 16 kHz 单声道浮点 WAV。 |
+| 这一轮到底听到了哪段？ | `packet_audio` 和 `turn_started` 都给出整场会议的 `start_sample`、`end_sample`，区间左闭右开。两个区间相交的部分就是这包贡献给这一轮的音频。除以 16000 可换算成秒。 |
+| 模型实际说了什么？ | `model_call` 记录交给后端的消息历史、各音频输入的采样点数和解码前缀。`model_reply.raw_text` 保存后端交回的原始字符串，包括动作 token。初次解码、截断重试、补识别按 `kind`、`call_id` 区分。后端抛异常时查 `model_error`。 |
+| 服务做了什么处理，最终回了什么？ | `turn_finished.turn_result` 有动作、显示正文、时间区间、耗时及该轮产生的恢复或截断信息。`response` 记录服务生成的响应码和完整响应体。客户端断线时，此记录仍可用于核对服务端结果。 |
+
+例如，从仓库根目录查看某场会议中每一轮模型的原话，再按请求检查返回的 `src`：
+
+~~~bash
+meeting='meeting-001'
+meeting_hash=$(printf '%s' "$meeting" | sha256sum | cut -d ' ' -f1)
+trace="Third/logs/http-debug/$meeting_hash/events.jsonl"
+jq -c 'select(.event=="model_reply") | {request_id,turn,kind,raw_text}' "$trace"
+jq -c 'select(.event=="response") | {request_id,status_code,body}' "$trace"
+~~~
+
+若请求在读包前因 409 被拒绝，详细日志会记录拒绝原因和响应，没有对应的请求体或 WAV。调试目录中保存真实录音和正文；使用 JSON Base64 float32 连续发包时，原始请求体和 WAV 合计约 0.54 GB/小时，另加逐轮日志。归档持续保留，由部署方清理。移除 `--debug-dir` 并重启服务即可结束详细采集。
+
 ## 用真实音频测延迟
 
 ~~~bash

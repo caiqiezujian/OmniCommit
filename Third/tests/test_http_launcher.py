@@ -29,7 +29,9 @@ def test_http_launcher_uses_trained_protocol_and_sizes_model_for_batching(tmp_pa
     engine = Mock(return_value=SimpleNamespace(generate_batch=lambda calls: [], max_batch_size=6))
     monkeypatch.setattr(vllm_backend, "VLLMBackend", engine)
     monkeypatch.setattr(recovery, "check_recovery_dependencies", lambda: None)
-    run = Mock()
+    from third_asr.http_logging import request_event
+
+    run = Mock(side_effect=lambda *a, **kw: request_event("test_event"))
     monkeypatch.setattr(uvicorn, "run", run)
 
     def inspect(factory, options, **limits):
@@ -45,9 +47,12 @@ def test_http_launcher_uses_trained_protocol_and_sizes_model_for_batching(tmp_pa
         return "app"
 
     monkeypatch.setattr(http_service, "create_app", inspect)
-    launcher.main(["--model", str(tmp_path), "--batch-size", "6", "--recovery", *extra])
+    request_log = tmp_path / "logs" / "http.jsonl"
+    launcher.main(["--model", str(tmp_path), "--batch-size", "6", "--recovery",
+                   "--request-log", str(request_log), *extra])
     assert (engine.call_args.kwargs["max_new_tokens"], engine.call_args.kwargs["max_context_tokens"]) == expected_budgets
     assert engine.call_args.kwargs["max_audio_turns"] == 60
     assert engine.call_args.kwargs["max_audio_seconds"] == launcher.ThirdStreamOptions.recovery_window_seconds
     assert engine.call_args.kwargs["max_batch_size"] == 6
     run.assert_called_once_with("app", host="127.0.0.1", port=18892, workers=1)
+    assert json.loads(request_log.read_text(encoding="utf-8"))["event"] == "test_event"

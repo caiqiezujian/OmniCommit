@@ -7,6 +7,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from third_asr.http_logging import DEFAULT_REQUEST_LOG, open_request_log
 from third_asr.runtime.stream_cli import add_runtime_arguments, runtime_options
 from third_asr.service_backend import build_backend, detect_model_protocol
 from third_asr.service_session import ThirdStreamOptions
@@ -19,6 +20,10 @@ def main(argv=None):
                         recovery_window_seconds=ThirdStreamOptions.recovery_window_seconds)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18892)
+    parser.add_argument("--request-log", type=Path, default=DEFAULT_REQUEST_LOG, metavar="FILE",
+                        help="Rotating JSONL request log (default: Third/logs/http-requests.jsonl)")
+    parser.add_argument("--debug-dir", type=Path, metavar="DIR",
+                        help="Record per-meeting audio, model inputs/replies, per-turn results and HTTP responses")
     parser.add_argument("--chunk-ms", type=int, default=1000, help="Model audio step in milliseconds (default: 1000)")
     parser.add_argument("--window-seconds", type=float, default=ThirdStreamOptions.window_seconds)
     parser.add_argument("--discard-seconds", type=float, default=ThirdStreamOptions.discard_seconds)
@@ -80,11 +85,16 @@ def main(argv=None):
         return BatchBackend(lambda: build_backend(args), max_batch_size=args.max_batch_size,
                             batch_wait_ms=args.batch_wait_ms)
 
-    app = create_app(load_model, options, max_meetings=args.max_meetings, max_in_flight=args.max_in_flight,
-                     idle_timeout_seconds=args.idle_timeout_seconds,
-                     max_packet_seconds=args.max_packet_seconds, upload_timeout_seconds=args.upload_timeout_seconds)
     # Meeting histories and one copy of the GPU engine live in this process.
-    uvicorn.run(app, host=args.host, port=args.port, workers=1)
+    with open_request_log(args.request_log):
+        if args.debug_dir is not None:
+            print(f"[http] Detailed capture (audio and transcripts): {args.debug_dir.expanduser().absolute()}",
+                  file=sys.stderr, flush=True)
+        app = create_app(load_model, options, max_meetings=args.max_meetings, max_in_flight=args.max_in_flight,
+                         idle_timeout_seconds=args.idle_timeout_seconds,
+                         max_packet_seconds=args.max_packet_seconds, upload_timeout_seconds=args.upload_timeout_seconds,
+                         debug_dir=args.debug_dir, debug_model=str(args.model) if args.model is not None else None)
+        uvicorn.run(app, host=args.host, port=args.port, workers=1)
 
 
 if __name__ == "__main__":
