@@ -189,9 +189,8 @@ class Meeting:
         if trace.archive is not None and not ending:
             start = self.received_samples
             self.received_samples += len(audio)
-            audio_file = trace.archive.audio(self.meeting_id, trace.request_id, audio)
             trace.debug("packet_audio", start_sample=start, end_sample=self.received_samples,
-                        sample_rate=SAMPLE_RATE, audio_file=audio_file,
+                        sample_rate=SAMPLE_RATE,
                         buffered_before_samples=0 if self.tail is None else len(self.tail))
         if self.tail is not None:
             audio = np.concatenate((self.tail, audio))
@@ -412,8 +411,7 @@ def create_app(backend_factory, options, *, max_meetings=16, max_in_flight=8,
                     media, body = await asyncio.wait_for(read_packet_body(request, sample_limit), upload_timeout_seconds)
                     upload_ms = trace.elapsed_ms()
                     if archive is not None:
-                        body_file = await asyncio.to_thread(archive.body, key, trace.request_id, body)
-                        trace.debug("request_body", content_type=media, body_bytes=len(body), body_file=body_file,
+                        trace.debug("request_body", content_type=media, body_bytes=len(body),
                                     body_sha256=hashlib.sha256(body).hexdigest())
                     pcm = decode_packet(media, body, sample_limit)
                     del body

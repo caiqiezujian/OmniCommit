@@ -95,9 +95,9 @@ jq -c --arg r '替换为请求ID' \
 - `reason=ended`、`failed`、`expired` 分别表示会议已经结束、处理失败、空闲过期。用 `last_request_id` 回查该会议最后一次请求，新会议分配新的 ID。空闲超时默认 600 秒，实际值见 `/health` 中的 `idle_timeout_seconds`。
 - 成功请求的 `request_finished` 给出耗时 `duration_ms` 和新增文本的字符数 `src_chars`。`src_chars=0` 是有效结果。如果前一包在客户端超时，服务器可能仍在处理，先查该会议的日志或 `GET /v1/meetings/{meeting_id}/result`。该接口返回最近一包的状态，自动重发同一包可能重复转录。
 
-### 录下整场会议，逐轮检查输入与输出
+### 通过 events.jsonl 逐轮检查会议转录
 
-在启动 HTTP 服务时加 `--debug-dir` 即可记录接下来收到的会议。调用方继续使用相同的 `/chunks` 和 `/end`。普通运行保留请求摘要，启用详细模式的运行另存原始请求、音频和带正文的逐轮记录。
+在启动命令中加 `--debug-dir`，服务就会为每场会议写一份 `events.jsonl`。这是该会议调试目录中唯一新增的文件。它保存逐轮转录正文、模型输入上下文、HTTP 响应和错误详情，音频输入用采样区间和请求体摘要记录。调用方继续使用相同的 `/chunks` 和 `/end`。
 
 ~~~bash
 cd /data/yb/Code/OmniCommit
@@ -111,12 +111,12 @@ CUDA_VISIBLE_DEVICES=0 bash Third/start_http.sh \
 
 | 要检查的问题 | 查看哪些记录 |
 |---|---|
-| 调用方送来了什么？ | `request_received` 有请求类型和声明长度。对完整收到且在大小限制内的受支持请求体，`request_body.body_file` 指向原始字节，`body_sha256` 可核对重发。有效音频的 `packet_audio.audio_file` 是可播放的 16 kHz 单声道浮点 WAV。 |
+| 是否收到了同一包数据？ | `request_received` 有请求类型和声明长度。对于完整收到且在大小限制内的受支持请求体，`request_body` 记录 `content_type`、实际字节数 `body_bytes` 和 `body_sha256`。比较两次请求的摘要即可核对请求体字节是否一致。 |
 | 这一轮到底听到了哪段？ | `packet_audio` 和 `turn_started` 都给出整场会议的 `start_sample`、`end_sample`，区间左闭右开。两个区间相交的部分就是这包贡献给这一轮的音频。除以 16000 可换算成秒。 |
 | 模型实际说了什么？ | `model_call` 记录交给后端的消息历史、各音频输入的采样点数和解码前缀。`model_reply.raw_text` 保存后端交回的原始字符串，包括动作 token。初次解码、截断重试、补识别按 `kind`、`call_id` 区分。后端抛异常时查 `model_error`。 |
 | 服务做了什么处理，最终回了什么？ | `turn_finished.turn_result` 有动作、显示正文、时间区间、耗时及该轮产生的恢复或截断信息。`response` 记录服务生成的响应码和完整响应体。客户端断线时，此记录仍可用于核对服务端结果。 |
 
-例如，从仓库根目录查看某场会议中每一轮模型的原话，再按请求检查返回的 `src`：
+在仓库根目录执行以下命令，可以查看某场会议每轮模型的原话，再按请求检查返回的 `src`。
 
 ~~~bash
 meeting='meeting-001'
@@ -126,7 +126,7 @@ jq -c 'select(.event=="model_reply") | {request_id,turn,kind,raw_text}' "$trace"
 jq -c 'select(.event=="response") | {request_id,status_code,body}' "$trace"
 ~~~
 
-若请求在读包前因 409 被拒绝，详细日志会记录拒绝原因和响应，没有对应的请求体或 WAV。调试目录中保存真实录音和正文；使用 JSON Base64 float32 连续发包时，原始请求体和 WAV 合计约 0.54 GB/小时，另加逐轮日志。归档持续保留，由部署方清理。移除 `--debug-dir` 并重启服务即可结束详细采集。
+若请求在读包前因 409 被拒绝，按同一请求 ID 查看 `request_rejected` 和 `response` 即可定位原因。升级后沿用原启动命令并重启服务即可切换到仅保存事件的格式。旧版已生成的 `.wav` 和 `.body` 文件由部署方按需清理。
 
 ## 用真实音频测延迟
 

@@ -4,16 +4,13 @@ import hashlib
 import json
 import logging
 from pathlib import Path
-import re
-import tempfile
 import threading
 
 from .http_logging import request_event
-from .training_audio import SAMPLE_RATE
 
 
 class DebugArchive:
-    """Write each meeting's JSONL and payload files under a path-safe directory."""
+    """Append diagnostic events to one JSONL file per meeting."""
 
     def __init__(self, directory):
         self.directory = Path(directory).expanduser().absolute()
@@ -47,39 +44,3 @@ class DebugArchive:
                 handle.write(line)
         except (OSError, TypeError, ValueError, RecursionError) as exc:
             self._report("event", exc, meeting_id, request_id)
-
-    def _artifact(self, meeting_id, request_id, extension, write):
-        temp = None
-        try:
-            # The HTTP service creates UUID4 hex IDs. Never use arbitrary paths from requests.
-            if not isinstance(request_id, str) or not re.fullmatch(r"[0-9a-f]{32}", request_id):
-                raise ValueError("Expected a server-generated request ID")
-            folder = self._folder(meeting_id)
-            destination = folder / (request_id + extension)
-            with tempfile.NamedTemporaryFile(dir=folder, prefix=".", suffix=".tmp", delete=False) as handle:
-                temp = Path(handle.name)
-                write(handle)
-            temp.replace(destination)
-            temp = None
-            return destination.name
-        except (OSError, ValueError, TypeError, RuntimeError, ImportError) as exc:
-            self._report(extension, exc, meeting_id, request_id)
-        finally:
-            if temp is not None:
-                try:
-                    temp.unlink(missing_ok=True)
-                except OSError as exc:
-                    self._report("cleanup", exc, meeting_id, request_id)
-        return None
-
-    def body(self, meeting_id, request_id, data):
-        """Preserve the exact bytes of the bounded HTTP request body."""
-        return self._artifact(meeting_id, request_id, ".body", lambda handle: handle.write(data))
-
-    def audio(self, meeting_id, request_id, pcm):
-        """Save the validated 16 kHz mono float32 signal without PCM16 rounding."""
-        def write_wav(handle):
-            import soundfile as sf
-            sf.write(handle, pcm, SAMPLE_RATE, format="WAV", subtype="FLOAT")
-
-        return self._artifact(meeting_id, request_id, ".wav", write_wav)

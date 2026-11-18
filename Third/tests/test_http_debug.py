@@ -9,7 +9,6 @@ import threading
 
 import numpy as np
 import pytest
-import soundfile as sf
 
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
@@ -36,8 +35,9 @@ def post_samples(client, samples):
 
 
 def read_archive(root):
-    events_file, = root.rglob("events.jsonl")
-    return events_file.parent, [json.loads(line) for line in events_file.read_text(encoding="utf-8").splitlines()]
+    events_file, = (path for path in root.rglob("*") if path.is_file())
+    assert events_file.name == "events.jsonl"
+    return [json.loads(line) for line in events_file.read_text(encoding="utf-8").splitlines()]
 
 
 def for_request(events, response, name):
@@ -51,8 +51,8 @@ def check_response(events, response):
     assert saved["body"] == response.json()
 
 
-def test_replay_archive_preserves_original_audio_turns_and_http_results(tmp_path):
-    # Retain float32 samples below PCM16 precision; one model turn spans both packets.
+def test_text_archive_preserves_packet_boundaries_turns_and_http_results(tmp_path):
+    # One model turn spans both packets.
     first = np.resize(np.array([1e-9, -.12345678], dtype="f4"), 128)
     second = np.resize(np.array([.99999, -.00000034, .25], dtype="f4"), 2 * STEP)
     replies = [WAIT, DIRECT + "谢谢。", DIRECT + " Bye.", WAIT]
@@ -64,18 +64,15 @@ def test_replay_archive_preserves_original_audio_turns_and_http_results(tmp_path
 
     assert [r.status_code for r in [buffered, spoken, ended, rejected]] == [200, 200, 200, 409]
     assert [r.json() for r in [buffered, spoken, ended]] == [{"src": ""}, {"src": "谢谢。"}, {"src": " Bye."}]
-    directory, events = read_archive(tmp_path)
+    events = read_archive(tmp_path)
     start = 0
-    captured = []
     for response, samples in [(buffered, first), (spoken, second)]:
         packet, = for_request(events, response, "packet_audio")
         assert (packet["start_sample"], packet["end_sample"]) == (start, start + len(samples))
-        file = directory / packet["audio_file"]
-        assert sf.info(file).subtype == "FLOAT"
-        recorded, rate = sf.read(file, dtype="float32")
-        assert rate == 16000
-        np.testing.assert_array_equal(recorded, samples)
-        captured.append(recorded)
+        assert "audio_file" not in packet
+        body, = for_request(events, response, "request_body")
+        assert "body_file" not in body
+        assert base64.b64encode(samples.astype("<f4").tobytes()).decode("ascii") not in json.dumps(events)
         start += len(samples)
     assert not for_request(events, rejected, "packet_audio")
     assert not for_request(events, ended, "packet_audio")
@@ -101,9 +98,9 @@ def test_replay_archive_preserves_original_audio_turns_and_http_results(tmp_path
     assert [row["raw_text"] for row in raw] == replies
     assert [row["call_id"] for row in raw] == [row["call_id"] for row in calls]
     assert len({row["call_id"] for row in calls}) == 4
-    # Reconstruct the wire responses using only the saved input and raw model replies.
+    # Reuse the caller's original inputs with the archived model replies.
     with TestClient(make_app(None, [row["raw_text"] for row in raw])) as replay:
-        recovered = [post_samples(replay, data).json() for data in captured]
+        recovered = [post_samples(replay, data).json() for data in (first, second)]
         recovered.append(replay.post(URL + "/end").json())
     assert recovered == [r.json() for r in (buffered, spoken, ended)]
 
@@ -116,7 +113,7 @@ def test_malformed_model_reply_keeps_partial_commit_and_failed_response(tmp_path
     assert failed.status_code == 500
     assert failed.json()["text"] == "已经提交"
     assert rejected.status_code == 409
-    _, events = read_archive(tmp_path)
+    events = read_archive(tmp_path)
     finished, = for_request(events, failed, "turn_finished")
     assert finished["turn_result"] == failed.json()["turns"][0]
     assert len(for_request(events, failed, "model_call")) == 2
@@ -129,16 +126,17 @@ def test_malformed_model_reply_keeps_partial_commit_and_failed_response(tmp_path
     assert conflict["last_request_id"] == failed.headers["X-Request-ID"]
 
 
-def test_invalid_json_saved_verbatim_without_audio_or_inference(tmp_path):
-    raw = b' {\r\n "data": "malformed"   '
+def test_invalid_json_logs_size_and_hash_only(tmp_path):
+    raw = b' {\r\n "data": "private-malformed-payload"   '
     with TestClient(make_app(tmp_path, [])) as client:
         invalid = client.post(URL + "/chunks", content=raw, headers={"Content-Type": "application/json"})
     assert invalid.status_code == 400
-    directory, events = read_archive(tmp_path)
+    events = read_archive(tmp_path)
     body, = for_request(events, invalid, "request_body")
     assert body["body_bytes"] == len(raw)
     assert body["body_sha256"] == hashlib.sha256(raw).hexdigest()
-    assert (directory / body["body_file"]).read_bytes() == raw
+    assert "body_file" not in body
+    assert "private-malformed-payload" not in json.dumps(events)
     assert not for_request(events, invalid, "packet_audio")
     assert not for_request(events, invalid, "model_call")
     check_response(events, invalid)
@@ -165,7 +163,7 @@ def test_busy_payload_is_rejected_before_ingestion(tmp_path):
         finally:
             release.set()
         accepted = pending.result(timeout=3)
-    _, events = read_archive(tmp_path)
+    events = read_archive(tmp_path)
     conflict, = for_request(events, busy, "request_rejected")
     assert conflict["reason"] == "in_flight"
     assert conflict["blocking_request_id"] == accepted.headers["X-Request-ID"]

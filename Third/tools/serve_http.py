@@ -23,7 +23,7 @@ def main(argv=None):
     parser.add_argument("--request-log", type=Path, default=DEFAULT_REQUEST_LOG, metavar="FILE",
                         help="Rotating JSONL request log (default: Third/logs/http-requests.jsonl)")
     parser.add_argument("--debug-dir", type=Path, metavar="DIR",
-                        help="Record per-meeting audio, model inputs/replies, per-turn results and HTTP responses")
+                        help="Write per-meeting events.jsonl with packet metadata, model calls/replies and HTTP results")
     parser.add_argument("--chunk-ms", type=int, default=1000, help="Model audio step in milliseconds (default: 1000)")
     parser.add_argument("--window-seconds", type=float, default=ThirdStreamOptions.window_seconds)
     parser.add_argument("--discard-seconds", type=float, default=ThirdStreamOptions.discard_seconds)
@@ -88,7 +88,7 @@ def main(argv=None):
     # Meeting histories and one copy of the GPU engine live in this process.
     with open_request_log(args.request_log):
         if args.debug_dir is not None:
-            print(f"[http] Detailed capture (audio and transcripts): {args.debug_dir.expanduser().absolute()}",
+            print(f"[http] Meeting event logs (events.jsonl): {args.debug_dir.expanduser().absolute()}",
                   file=sys.stderr, flush=True)
         app = create_app(load_model, options, max_meetings=args.max_meetings, max_in_flight=args.max_in_flight,
                          idle_timeout_seconds=args.idle_timeout_seconds,
