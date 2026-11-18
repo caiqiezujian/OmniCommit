@@ -10,6 +10,10 @@ sys.path.insert(0, str(script_dir.parent))
 from third_asr.chunk_refs import PREFIX
 from third_asr.training_audio import SAMPLE_RATE, materialize_chunk_refs
 
+if os.environ.get("OMNICOMMIT_ACTION_ROWS") == "1":
+    from third_asr.mcore_action_rows import install_action_rows
+    install_action_rows()
+
 if os.environ.get("OMNICOMMIT_SFT_ATTENTION_COMPAT") == "1":
     from omnicommit_attention_compat import install_attention_compat, install_swift_loader_compat
     install_attention_compat()

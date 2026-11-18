@@ -58,16 +58,19 @@ python SFT-Scripts/check_sft.py \
   --rows 2 --decode
 ~~~
 
-**MCore 训练**使用已转换的 MCore 基座。下面的 1 秒实验使用八卡、长度 4096、global batch 64 和 micro batch 4，训练一个 epoch，每 1000 步保存一次。
+本分支的两个训练入口默认使用 `--vocab-update action-rows`。显式模式会从本次训练的 tokenizer 读取 `<|WAIT|>`、`<|DIRECT|>` 的 ID。词嵌入表和输出表分别为这两个 ID 学习两行修正量，普通词的行固定。Thinker 的 LoRA 仍参与训练，音频编码器和对齐层继续冻结。动作和转录正文都参与原有的全词表预测损失，所以模型听到英文时仍要学会输出相应的英文单词。
+
+**MCore 训练**使用已转换的 MCore 基座。下面沿用 1 秒训练集、八卡、4096 packing、micro batch 2、global batch 128，训练一个 epoch，每 1000 步保存一次。对照实验可将 `--vocab-update` 改为 `full`，并另设一个输出目录。
 
 ~~~bash
 bash SFT-Scripts/train_sft.sh \
   /data/yb/models/qwen3_omni_mcore_3.12.1 \
   /data/yb/Code/OmniCommit/Third/datasets/data_10000h/train.1000ms.jsonl \
-  /data/yb/Code/OmniCommit/output/sft-1117-1S \
+  /data/yb/Code/OmniCommit/output/sft-1S-pack4096-g128-actionrows \
   --gpu-ids 0,1,2,3,4,5,6,7 --attention_backend flash \
-  --packing false --padding_free false --micro_batch_size 4 --global_batch_size 64 \
-  --max_length 4096 --max_epochs 1 --split_dataset_ratio 0 --save_interval 1000
+  --vocab-update action-rows --packing true --padding_free true \
+  --max_length 4096 --packing_length 4096 --micro_batch_size 2 --global_batch_size 128 \
+  --max_epochs 1 --split_dataset_ratio 0 --save_interval 1000
 ~~~
 
 **ms-swift 4.1.3 / Megatron** 使用原始 Hugging Face 基座，下面沿用 Second 的八卡配方。这是另一个训练入口，同一次实验选择对应环境的一个即可。
@@ -80,7 +83,7 @@ bash SFT-Scripts/train_sft_swift4.sh \
   --gpu-ids 0,1,2,3,4,5,6,7 --save_steps 1000
 ~~~
 
-两个配方都冻结音频编码器和对齐层，对 Thinker 做 LoRA，保存词嵌入和输出层。训练模板为 `omnicommit_third_qwen3_omni`。可在 SWIFT 环境用实际处理器检查序列长度及 assistant 监督位置：
+动作行模式适用于这两个配方的 TP=1、PP=1、CP=1 和输入输出词表独立的 Thinker。原有的专家并行和数据并行可以照常使用。启动后查看日志中的 `[action-rows]`，这一行给出实际 token ID、词表可训练参数量 `vocabulary_trainable` 和本进程模型的可训练参数量。显式模式下，前者等于四行向量的参数量。纯正文模式只训练 WAIT 的输入和输出两行。训练模板为 `omnicommit_third_qwen3_omni`。可在 SWIFT 环境用实际处理器检查序列长度及 assistant 监督位置。
 
 ~~~bash
 python SFT-Scripts/audit_encoded_lengths.py \
@@ -93,13 +96,15 @@ python SFT-Scripts/audit_encoded_lengths.py \
 
 传入原始 HF 基座、实际含 `adapter_config.json` 和适配器权重的 checkpoint、导出目录，以及此次训练的 token 清单。显式模型合并时校验 WAIT 和 DIRECT 的 ID，以及两个 token 在词嵌入和输出层的训练权重，写出 v4 协议清单。旧纯正文模型沿用 v3。要启用强制 DIRECT 解码，需要用显式数据训练并合并的新权重。
 
+动作行 checkpoint 仍保存两张完整的词表矩阵，方便沿用 SWIFT 的标准 LoRA 合并和原有 Web 服务。训练时节省的是普通词行的梯度及优化器状态。合并时使用 `--require-action-rows` 会核对 checkpoint 中的 `omnicommit_action_rows.json`、各动作的 ID、普通词行相对于原始 HF 基座的值，以及合并后的两张表。使用 `--vocab-update full` 训练的对照组按原方式合并，省略此参数。
+
 ~~~bash
 bash SFT-Scripts/merge_lora.sh \
   /data/models/qwen3_omni_original_hf \
-  /data/yb/Code/OmniCommit/outputs/third-explicit-sft-001/checkpoint-1000 \
-  /data/yb/Code/OmniCommit/models/third-explicit-merged \
-  --special-tokens /data/yb/Code/OmniCommit/datasets/third_explicit_001/train.800ms.jsonl.tokens.txt \
-  --gpu-ids 0
+  /data/yb/Code/OmniCommit/output/sft-1S-pack4096-g128-actionrows/checkpoint-1000 \
+  /data/yb/Code/OmniCommit/models/third-actionrows-merged \
+  --special-tokens /data/yb/Code/OmniCommit/Third/datasets/data_10000h/train.1000ms.jsonl.tokens.txt \
+  --require-action-rows --gpu-ids 0
 ~~~
 
 ## 4. 启动内网 Web 转录
@@ -109,8 +114,8 @@ bash SFT-Scripts/merge_lora.sh \
 ~~~bash
 python -m pip install -r requirements-web.txt
 CUDA_VISIBLE_DEVICES=0 bash start_server.sh \
-  /data/yb/Code/OmniCommit/models/third-explicit-merged \
-  --chunk-ms 800 --port 18891
+  /data/yb/Code/OmniCommit/models/third-actionrows-merged \
+  --chunk-ms 1000 --port 18891
 ~~~
 
 在浏览器打开 `http://服务器内网IP:18891`。可在服务器执行 `curl http://127.0.0.1:18891/health` 检查 Third 服务的就绪状态。网页支持麦克风、浏览器共享的系统声音和音视频文件。浏览器远程采音通常需要 HTTPS，localhost 可以直接使用。直接提供 HTTPS 时可传 `--ssl-certfile` 和 `--ssl-keyfile`。系统声音取决于浏览器能否共享所选来源的音频轨道。服务器读取音视频文件需要 `ffmpeg`。服务面向内网，无需访问令牌。

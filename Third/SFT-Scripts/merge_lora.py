@@ -21,6 +21,7 @@ import time
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from third_asr.action_rows_manifest import read_action_rows_manifest
 from third_asr.service_backend import read_export_protocol
 
 VOCAB_KEYS = ("thinker.model.embed_tokens.weight", "thinker.lm_head.weight")
@@ -129,7 +130,49 @@ def protocol_ids(tokenizer, tokens):
     return ids
 
 
-def preflight(base, adapter, tokens_file):
+def compare_vocab_rows(reference, actual, target, *, skip_ids=(), rows_per_read=2048):
+    """Compare every requested row in bounded slices, including the final partial slice."""
+    import torch
+    from safetensors import safe_open
+
+    row_count = reference["shape"][0]
+    if actual["shape"][0] < row_count or actual["shape"][1:] != reference["shape"][1:]:
+        raise ValueError(f"Vocabulary shape mismatch for {target}")
+    skips = sorted({row for row in skip_ids if 0 <= row < row_count})
+    with safe_open(reference["file"], framework="pt", device="cpu") as src, \
+            safe_open(actual["file"], framework="pt", device="cpu") as dst:
+        original = src.get_slice(reference["key"])
+        result = dst.get_slice(actual["key"])
+        first = 0
+        for stop in [*skips, row_count]:
+            for start in range(first, stop, rows_per_read):
+                end = min(stop, start + rows_per_read)
+                values = result[start:end]
+                if not torch.equal(original[start:end].to(values.dtype), values):
+                    raise ValueError(f"Vocabulary rows differ for {target} in [{start}, {end})")
+            first = stop + 1
+
+
+def action_rows_changed(reference, saved, token_ids):
+    """Report missing source rows as None when training expanded the base vocabulary."""
+    import torch
+    from safetensors import safe_open
+
+    changes = {}
+    with safe_open(reference["file"], framework="pt", device="cpu") as src, \
+            safe_open(saved["file"], framework="pt", device="cpu") as dst:
+        original = src.get_slice(reference["key"])
+        trained = dst.get_slice(saved["key"])
+        for token, index in token_ids.items():
+            value = trained[index:index + 1]
+            if not torch.isfinite(value).all():
+                raise ValueError(f"Nonfinite trained row for {token} in {saved['key']}")
+            changes[token] = (not torch.equal(original[index:index + 1].to(value.dtype), value)
+                              if index < reference["shape"][0] else None)
+    return changes
+
+
+def preflight(base, adapter, tokens_file, *, require_action_rows=False):
     with diagnostic_stage("Import transformers.AutoTokenizer (may initialize PyTorch)"):
         from transformers import AutoTokenizer
 
@@ -154,6 +197,7 @@ def preflight(base, adapter, tokens_file):
     with diagnostic_stage("Reconstruct and validate the full training token inventory"):
         tokenizer.add_special_tokens({"additional_special_tokens": tokens})
         ids = protocol_ids(tokenizer, tokens)
+        action_rows = read_action_rows_manifest(adapter, ids, required=require_action_rows)
     base_weights = weight_inventory(base, "model")
     adapter_weights = weight_inventory(adapter, "adapter_model")
     if not any("lora_A" in key for key in adapter_weights) or not any("lora_B" in key for key in adapter_weights):
@@ -162,6 +206,7 @@ def preflight(base, adapter, tokens_file):
     if expected_vocab < len(tokenizer):
         expected_vocab = ((len(tokenizer) + 127) // 128) * 128
     modules = {}
+    changed = {}
     for target in VOCAB_KEYS:
         if target not in base_weights:
             raise ValueError(f"Original base is missing {target}")
@@ -174,9 +219,16 @@ def preflight(base, adapter, tokens_file):
         if max(ids.values()) >= shape[0]:
             raise ValueError(f"Protocol IDs do not fit saved module {key}")
         modules[target] = {"key": key, **adapter_weights[key]}
+        if action_rows:
+            with diagnostic_stage(f"Compare frozen base vocabulary with saved adapter: {target}"):
+                base_tensor = {"key": target, **base_weights[target]}
+                compare_vocab_rows(base_tensor, modules[target], target, skip_ids=ids.values())
+                changed[target] = action_rows_changed(base_tensor, modules[target], ids)
     return {"tokens": tokens, "manifest_metadata": manifest_metadata,
             "protocol_token_ids": ids, "tokenizer_length": len(tokenizer),
             "expected_vocab_size": expected_vocab, "saved_modules": modules,
+            "action_rows": action_rows,
+            "action_rows_changed_from_base": changed,
             "base_tensor_shapes": {key: value["shape"] for key, value in base_weights.items()},
             "training_base_recorded": training_args.get("model"),
             "training_args_tokens_verified": True}
@@ -224,9 +276,14 @@ def verify_export(output, expected):
                     if not torch.isfinite(actual).all() or not torch.equal(reference, actual):
                         raise ValueError(f"Saved protocol row was not preserved: {target}, token_id={token_id}")
         checked.append(target)
+        if expected.get("action_rows"):
+            with diagnostic_stage(f"Verify entire vocabulary in merged model: {target}"):
+                compare_vocab_rows(saved, {"key": target, **exported}, target)
     return {"protocol_token_ids": expected["protocol_token_ids"], "tokenizer_length": len(tokenizer),
             "vocab_size": expected["expected_vocab_size"], "tensor_count": len(inventory),
             "trained_protocol_rows_preserved_in": checked, "processor_load_verified": True,
+            "frozen_base_rows_verified": bool(expected.get("action_rows")),
+            "action_rows_changed_from_base": expected["action_rows_changed_from_base"],
             "inference_verified": False}
 
 
@@ -251,6 +308,8 @@ def main(argv=None):
     parser.add_argument("--device-map", choices=("auto", "cpu"), default="auto")
     parser.add_argument("--special-tokens", type=Path, required=True, help="Exact dataset-generated inventory used in SFT; preserve its order")
     parser.add_argument("--check-only", action="store_true", help="Check inputs, tokens and shapes without loading full weights")
+    parser.add_argument("--require-action-rows", action="store_true",
+                        help="Require a marked row-trained checkpoint and verify its frozen rows against the HF base")
     args = parser.parse_args(argv)
     staging = None
     try:
@@ -272,9 +331,11 @@ def main(argv=None):
         if version not in {"3.12.1", "4.1.3"}:
             print("[merge] NOTE: this recipe was source-audited for ms-swift 3.12.1 and 4.1.3.", flush=True)
         print("[merge] Checking local HF base, adapter tensors and protocol tokens...", flush=True)
-        expected = preflight(args.base, args.adapter, args.special_tokens)
+        expected = preflight(args.base, args.adapter, args.special_tokens, require_action_rows=args.require_action_rows)
         print(json.dumps({"input_checks_passed": True, "protocol_token_ids": expected["protocol_token_ids"],
                           "vocab_size": expected["expected_vocab_size"],
+                          "frozen_base_rows_verified": bool(expected["action_rows"]),
+                          "action_rows_changed_from_base": expected["action_rows_changed_from_base"],
                           "training_base_recorded": expected["training_base_recorded"]}, ensure_ascii=False), flush=True)
         if args.check_only:
             print("[merge] Check-only complete; no model was merged or written.", flush=True)

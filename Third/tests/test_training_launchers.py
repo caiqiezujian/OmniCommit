@@ -29,7 +29,8 @@ def find_bash():
     ("train_sft.sh", "--max_epochs", "--save_interval"),
     ("train_sft_swift4.sh", "--num_train_epochs", "--save_steps"),
 ])
-def test_third_launch_from_isolated_deployment(tmp_path, launcher, epochs, save):
+@pytest.mark.parametrize("vocab_update", [None, "full"])
+def test_third_launch_from_isolated_deployment(tmp_path, launcher, epochs, save, vocab_update):
     bash = find_bash()
     work = tmp_path / "Third"
     scripts = work / "SFT-Scripts"
@@ -49,9 +50,11 @@ def test_third_launch_from_isolated_deployment(tmp_path, launcher, epochs, save)
         mock.write_bytes(b'''#!/usr/bin/env bash
 if [[ "$1" == *check_sft.py ]]; then
     printf '%s\n' "$@" > checker.argv
+    printf '%s\n' "${OMNICOMMIT_ACTION_ROWS-unset}" > checker.mode
 else
     printf '%s\n' "$@" > trainer.argv
     printf '%s\n' "$CUDA_VISIBLE_DEVICES" > trainer.gpus
+    printf '%s\n' "${OMNICOMMIT_ACTION_ROWS-unset}" "${OMNICOMMIT_ACTION_TOKENS_FILE-unset}" > trainer.mode
 fi
 ''')
         mock.chmod(0o755)
@@ -62,8 +65,10 @@ fi
     run = subprocess.run(
         [bash, "-c", 'export PATH="$PWD/mock-bin:$PATH"; exec bash "$@"', "test",
          f"SFT-Scripts/{launcher}", "model", dataset, "outputs", "--gpu-ids", GPU_IDS,
+         *(["--vocab-update", vocab_update] if vocab_update else []),
          *(arg for pair in options.items() for arg in pair)],
         cwd=work, capture_output=True, text=True, timeout=30,
+        env={**os.environ, "OMNICOMMIT_ACTION_ROWS": "stale", "OMNICOMMIT_ACTION_TOKENS_FILE": "stale"},
     )
     assert run.returncode == 0, run.stdout + run.stderr
     check = (work / "checker.argv").read_text().splitlines()
@@ -80,3 +85,7 @@ fi
     assert actual["--template"] == "omnicommit_third_qwen3_omni"
     assert actual["--external_plugins"].endswith("/Third/SFT-Scripts/omnicommit_third_sft_plugin.py")
     assert (work / "trainer.gpus").read_text().strip() == GPU_IDS
+    assert (work / "checker.mode").read_text().strip() == "unset"
+    assert (work / "trainer.mode").read_text().splitlines() == (
+        ["unset", "unset"] if vocab_update == "full" else ["1", tokens])
+    assert "--vocab-update" not in train

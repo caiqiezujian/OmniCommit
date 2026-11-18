@@ -3,7 +3,7 @@
 set -euo pipefail
 
 if (( $# < 3 )); then
-  echo "Usage: bash train_sft_swift4.sh HF_MODEL TRAIN_JSONL OUTPUT_DIR [--gpu-ids IDS] [--tokens-file FILE] [native megatron sft options...]" >&2
+  echo "Usage: bash train_sft_swift4.sh HF_MODEL TRAIN_JSONL OUTPUT_DIR [--gpu-ids IDS] [--tokens-file FILE] [--vocab-update action-rows|full] [native megatron sft options...]" >&2
   exit 2
 fi
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,9 +17,15 @@ shift 3
 GPU_LIST="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 TOKENS_FILE="${DATASET}.tokens.txt"
 EPOCH_ARGS=(--num_train_epochs 1)
+VOCAB_UPDATE=action-rows
 EXTRA_ARGS=()
 while (( $# )); do
   case "$1" in
+    --vocab-update)
+      case "${2:-}" in
+        action-rows|full) VOCAB_UPDATE="$2"; shift 2 ;;
+        *) echo "--vocab-update requires action-rows or full" >&2; exit 2 ;;
+      esac ;;
     --gpu-ids|--tokens-file)
       if (( $# < 2 )); then echo "Missing value for $1" >&2; exit 2; fi
       if [[ "$1" == "--gpu-ids" ]]; then GPU_LIST="$2"; else TOKENS_FILE="$2"; fi
@@ -49,7 +55,13 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 unset OMNICOMMIT_SFT_ATTENTION_COMPAT OMNICOMMIT_PACKED_NO_FLASH
 
 echo "[train] template=$template | checker=$checker | plugin=$plugin"
+unset OMNICOMMIT_ACTION_ROWS OMNICOMMIT_ACTION_TOKENS_FILE
 python3 "$checker" "$DATASET" --rows 2 --tokens-file "$TOKENS_FILE" --framework
+if [[ "$VOCAB_UPDATE" == "action-rows" ]]; then
+  export OMNICOMMIT_ACTION_ROWS=1
+  export OMNICOMMIT_ACTION_TOKENS_FILE="$TOKENS_FILE"
+fi
+echo "[train] vocab-update=$VOCAB_UPDATE"
 echo "[train] HF model=$HF_MODEL | GPUs=$GPU_LIST | output=$OUTPUT_DIR"
 exec megatron sft \
   --model "$HF_MODEL" --dataset "$DATASET" --output_dir "$OUTPUT_DIR" --add_version false \

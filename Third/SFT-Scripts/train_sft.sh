@@ -3,7 +3,7 @@
 set -euo pipefail
 
 if (( $# < 3 )); then
-  echo "Usage: bash train_sft.sh MCORE_MODEL TRAIN_JSONL OUTPUT_DIR [--gpu-ids 0,1,2,3,4,5,6,7] [--packed-no-flash | --packed-sdpa | --compat-old-driver] [--tokens-file FILE] [native Megatron options...]" >&2
+  echo "Usage: bash train_sft.sh MCORE_MODEL TRAIN_JSONL OUTPUT_DIR [--gpu-ids 0,1,2,3,4,5,6,7] [--packed-no-flash | --packed-sdpa | --compat-old-driver] [--tokens-file FILE] [--vocab-update action-rows|full] [native Megatron options...]" >&2
   exit 2
 fi
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,9 +17,15 @@ shift 3
 GPU_LIST="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 ATTENTION_MODE=""
 TOKENS_PATH="${DATASET_PATH}.tokens.txt"
+VOCAB_UPDATE=action-rows
 EXTRA_ARGS=()
 while (( $# )); do
   case "$1" in
+    --vocab-update)
+      case "${2:-}" in
+        action-rows|full) VOCAB_UPDATE="$2"; shift 2 ;;
+        *) echo "--vocab-update requires action-rows or full" >&2; exit 2 ;;
+      esac ;;
     --gpu-ids)
       if (( $# < 2 )); then echo "--gpu-ids requires a value" >&2; exit 2; fi
       GPU_LIST="$2"; shift 2 ;;
@@ -90,7 +96,13 @@ elif [[ "$ATTENTION_MODE" == "--packed-no-flash" || "$ATTENTION_MODE" == "--comp
 fi
 
 echo "[train] template=$template | checker=$checker | plugin=$plugin"
+unset OMNICOMMIT_ACTION_ROWS OMNICOMMIT_ACTION_TOKENS_FILE
 python3 "$checker" "$DATASET_PATH" --rows 2 --tokens-file "$TOKENS_PATH" --framework
+if [[ "$VOCAB_UPDATE" == "action-rows" ]]; then
+  export OMNICOMMIT_ACTION_ROWS=1
+  export OMNICOMMIT_ACTION_TOKENS_FILE="$TOKENS_PATH"
+fi
+echo "[train] vocab-update=$VOCAB_UPDATE"
 echo "[train] MCore model=$MODEL_PATH | GPUs=$GPU_LIST | output=$OUTPUT_PATH"
 OMNICOMMIT_PACKED_NO_FLASH="$PACKED_NO_FLASH" python3 -m torch.distributed.run \
   --nproc_per_node "$GPU_COUNT" --nnodes 1 --master_port "${MASTER_PORT:-29571}" \
