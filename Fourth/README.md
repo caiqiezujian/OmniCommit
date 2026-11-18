@@ -1,0 +1,157 @@
+# Fourth · 动作 token 行微调
+
+Fourth 沿用 Third 的音频、训练 JSONL、动作协议和 SWIFT 模板。已有 Third 的显式训练集和同名 `.tokens.txt` 时，直接从第 2 节开始。默认只更新输入和输出词表中的动作 token 行，同时训练 Thinker LoRA。
+
+两版的训练输出应放在各自的目录。Fourth 可读取原数据路径；合并时使用该训练集的 token 清单。导出的模型沿用 Third 的协议标识，可交给 Fourth 或已有的 Third 服务。Web 与 HTTP 的默认端口也相同，同时运行两版时用 `--port` 指定不同端口。
+
+Fourth 每轮接收一块新音频。默认 `explicit` 模式把 assistant 的两种回复训练为 `<|DIRECT|>新增原文` 和独立的 `<|WAIT|>`。同一轮可以提交两种语言的正文，相邻轮次也可以连续提交。语种或说话人变化时仍按文字的时间戳提交。音频结束后 user 发送 `<end_of_audio>`，assistant 回复 `<|WAIT|>`。
+
+部署时将整个 `Fourth/` 目录复制到服务器，在该目录运行以下命令。数据构建、训练预检、MCore/HF 训练、LoRA 合并和 Web 服务都从本目录加载项目代码。模型、训练框架和数据按服务器原有路径使用。原始语种、说话人和时间戳保存在源数据里。最终训练 JSONL 中的 `audios` 引用原录音区间，训练容器须能读取引用中的音频绝对路径。
+
+~~~bash
+cd /data/yb/Code/OmniCommit/Fourth
+~~~
+
+## 1. 生成训练数据
+
+**已有 Second 或旧 Third 纯正文 SFT 时，直接转换现成的训练文件。** 脚本根据每行的 system 指令识别输入协议，按原位置给有正文的轮次加上动作 token。转换保留每个音频引用、原有 WAIT、逐轮正文和接续空格，运行时无需读取原 WAV 或重跑 CTC。
+
+~~~bash
+python Data-Scripts/from_second_sft.py \
+  /data/yb/Code/OmniCommit/datasets/second_run_001/train.800ms.jsonl \
+  --protocol explicit \
+  --output /data/yb/Code/OmniCommit/datasets/fourth_explicit_001/train.800ms.jsonl
+~~~
+
+显式模式的 `.tokens.txt` 按 `<|WAIT|>`、`<|DIRECT|>` 的顺序各写一行。若要生成纯正文对照组，对同一个输入指定 `--protocol plain` 和独立的输出路径。两条构建命令都支持该选项。`.rejected.jsonl` 记录转换时跳过的原始行号和原因。
+
+**已有逐段时间戳时，可以从原始标注重铸。** 数据构建可以单独部署完整的 `Fourth/` 目录，其中 `Data-Scripts/` 放命令入口，`fourth_asr/` 放时间戳解析、标签重铸和音频引用代码。在服务器的 `Fourth/` 下运行以下命令即可生成 1 秒训练集。输入中记录的原始音频需要在该服务器可读。
+
+~~~bash
+python -m pip install -r requirements-data.txt
+python Data-Scripts/build_sft.py \
+  /data/yb/Code/OmniCommit/datasets/timestamped.jsonl \
+  --protocol explicit --chunk-ms 1000 --release-on semantic-unit \
+  --output-dir /data/yb/Code/OmniCommit/datasets/fourth_recast_1000ms_001
+~~~
+
+输入每行含一个原始音频路径、带归属的完整 assistant 参考转录、`output.segments[].source_text`，以及逐段对应的 `timestamps[].start_ms/end_ms`。时间相对于该录音起点，单位毫秒。也可以直接读取已有的 `combined.jsonl`。每条有效录音在 `train.1000ms.jsonl` 中生成一行。构建摘要在 `summary.json`，无效记录的行号及错误在 `rejected.jsonl`。
+
+默认等完整语义段到期再提交。若输入确有更细的、覆盖正文的 `timestamps[].spans[]`，可用 `--release-on timed-span` 采用子段终点。只有切换时刻或另存的字符数组时，先将对齐结果整理为这个输入格式。原蒸馏段中的 `action` 不决定新一轮的 WAIT。用 `--chunk-ms 1000` 可生成 1 秒网格。与已有 800 ms Second 模型做对照时，使用相同的源录音、提交粒度及训练配方。
+
+例如，某个 800 ms 边界前已经说完中文句尾和独立对齐的英文 `Let's`，学生目标可以是：
+
+~~~text
+用户音频一       <|DIRECT|>我把时间
+用户音频二       <|DIRECT|>发给你了。Let's
+用户音频三       <|DIRECT|> meet tomorrow.
+<end_of_audio>   <|WAIT|>
+~~~
+
+第三轮原文是 `" meet tomorrow."`，开头的空格与前一轮的英文单词相接。如果整个 `Let's meet tomorrow.` 只有一个提交终点，整句会在后面的同一轮出现。
+
+## 2. 检查并训练
+
+`SFT-Scripts/train_sft.sh` 和 `SFT-Scripts/train_sft_swift4.sh` 分别启动 MCore 和 HF 配方。两者的训练脚本、预检、虚拟音频读取和 SWIFT 插件都随 Fourth 一起部署。预检前，日志会打印 `template=omnicommit_third_qwen3_omni` 和 Fourth 检查器、插件的实际路径。
+
+MCore 示例使用 1 秒数据，其余示例展示 800 毫秒数据。按实际实验填写训练 JSONL、合并时使用的同名 `.tokens.txt` 和服务的 `--chunk-ms`。在训练服务器上可先检查前两条真实音频，去掉 `--rows 2 --decode` 可进行全量结构预检。
+
+~~~bash
+python SFT-Scripts/check_sft.py \
+  /data/yb/Code/OmniCommit/datasets/fourth_explicit_001/train.800ms.jsonl \
+  --rows 2 --decode
+~~~
+
+Fourth 的两个训练入口默认使用 `--vocab-update action-rows`。显式模式会从本次训练的 tokenizer 读取 `<|WAIT|>`、`<|DIRECT|>` 的 ID。词嵌入表和输出表分别为这两个 ID 学习两行修正量，普通词的行固定。Thinker 的 LoRA 仍参与训练，音频编码器和对齐层继续冻结。动作和转录正文都参与原有的全词表预测损失，所以模型听到英文时仍要学会输出相应的英文单词。
+
+**MCore 训练**使用已转换的 MCore 基座。下面沿用 1 秒训练集、八卡、4096 packing、micro batch 2、global batch 128，训练一个 epoch，每 1000 步保存一次。对照实验可将 `--vocab-update` 改为 `full`，并另设一个输出目录。
+
+~~~bash
+bash SFT-Scripts/train_sft.sh \
+  /data/yb/models/qwen3_omni_mcore_3.12.1 \
+  /data/yb/Code/OmniCommit/Third/datasets/data_10000h/train.1000ms.jsonl \
+  /data/yb/Code/OmniCommit/output/fourth-1S-pack4096-g128-actionrows \
+  --gpu-ids 0,1,2,3,4,5,6,7 --attention_backend flash \
+  --vocab-update action-rows --packing true --padding_free true \
+  --max_length 4096 --packing_length 4096 --micro_batch_size 2 --global_batch_size 128 \
+  --max_epochs 1 --split_dataset_ratio 0 --save_interval 1000
+~~~
+
+**ms-swift 4.1.3 / Megatron** 使用原始 Hugging Face 基座，下面沿用 Second 的八卡配方。这是另一个训练入口，同一次实验选择对应环境的一个即可。
+
+~~~bash
+bash SFT-Scripts/train_sft_swift4.sh \
+  /data/models/qwen3_omni_original_hf \
+  /data/yb/Code/OmniCommit/datasets/fourth_explicit_001/train.800ms.jsonl \
+  /data/yb/Code/OmniCommit/outputs/fourth-explicit-swift4-sft-001 \
+  --gpu-ids 0,1,2,3,4,5,6,7 --save_steps 1000
+~~~
+
+动作行模式适用于这两个配方的 TP=1、PP=1、CP=1 和输入输出词表独立的 Thinker。原有的专家并行和数据并行可以照常使用。启动后查看日志中的 `[action-rows]`，这一行给出实际 token ID、词表可训练参数量 `vocabulary_trainable` 和本进程模型的可训练参数量。显式模式下，前者等于四行向量的参数量。纯正文模式只训练 WAIT 的输入和输出两行。训练模板为 `omnicommit_third_qwen3_omni`。可在 SWIFT 环境用实际处理器检查序列长度及 assistant 监督位置。
+
+~~~bash
+python SFT-Scripts/audit_encoded_lengths.py \
+  /data/yb/Code/OmniCommit/datasets/fourth_explicit_001/train.800ms.jsonl \
+  --model /data/models/qwen3_omni_original_hf --rows 2 --max-length 8192 \
+  --report /data/yb/Code/OmniCommit/datasets/fourth_explicit_001/encoded-audit.json
+~~~
+
+## 3. 合并 checkpoint
+
+传入原始 HF 基座、实际含 `adapter_config.json` 和适配器权重的 checkpoint、导出目录，以及此次训练的 token 清单。显式模型合并时校验 WAIT 和 DIRECT 的 ID，以及两个 token 在词嵌入和输出层的训练权重，写出 v4 协议清单。旧纯正文模型沿用 v3。要启用强制 DIRECT 解码，需要用显式数据训练并合并的新权重。
+
+动作行 checkpoint 仍保存两张完整的词表矩阵，方便沿用 SWIFT 的标准 LoRA 合并和原有 Web 服务。训练时节省的是普通词行的梯度及优化器状态。合并时使用 `--require-action-rows` 会核对 checkpoint 中的 `omnicommit_action_rows.json`、各动作的 ID、普通词行相对于原始 HF 基座的值，以及合并后的两张表。使用 `--vocab-update full` 训练的对照组按原方式合并，省略此参数。
+
+~~~bash
+bash SFT-Scripts/merge_lora.sh \
+  /data/models/qwen3_omni_original_hf \
+  /data/yb/Code/OmniCommit/output/fourth-1S-pack4096-g128-actionrows/checkpoint-1000 \
+  /data/yb/Code/OmniCommit/models/fourth-actionrows-merged \
+  --special-tokens /data/yb/Code/OmniCommit/Third/datasets/data_10000h/train.1000ms.jsonl.tokens.txt \
+  --require-action-rows --gpu-ids 0
+~~~
+
+## 4. 启动内网 Web 转录
+
+在推理环境中使用上一步导出的 HF 模型。默认后端沿用 FLEX 的 vLLM 0.11.1，`--backend hf` 可切换到 Transformers。服务读取本目录内的网页与推理代码。启动时的 `--chunk-ms` 决定当前服务的步长，按训练数据填写。
+
+~~~bash
+python -m pip install -r requirements-web.txt
+CUDA_VISIBLE_DEVICES=0 bash start_server.sh \
+  /data/yb/Code/OmniCommit/models/fourth-actionrows-merged \
+  --chunk-ms 1000 --port 18891
+~~~
+
+在浏览器打开 `http://服务器内网IP:18891`。可在服务器执行 `curl http://127.0.0.1:18891/health` 检查 Fourth 服务的就绪状态。网页支持麦克风、浏览器共享的系统声音和音视频文件。浏览器远程采音通常需要 HTTPS，localhost 可以直接使用。直接提供 HTTPS 时可传 `--ssl-certfile` 和 `--ssl-keyfile`。系统声音取决于浏览器能否共享所选来源的音频轨道。服务器读取音视频文件需要 `ffmpeg`。服务面向内网，无需访问令牌。
+
+选择「音视频文件」后可填写转录起点和终点。例如，起点填 `58.25`、终点填 `1:36`，模型就从空历史开始，只接收原文件第 58.25 至 96 秒的音频。起点留空从文件开头开始，终点留空一直处理到文件末尾。勾选「跟随播放器进度」会从起点播放；取消勾选会直接逐块识别同一区间。文件仍会完整上传并解码。
+
+在「音频来源」中设置本场的**窗口长度**和**每次丢弃长度**，默认分别为 60 秒和 50 秒。麦克风、电脑声音和文件都使用这两个值。可以在下一场改值，使用同一个模型重新转录同一条音频。`--window-seconds` 和 `--discard-seconds` 可修改网页初始值。
+
+默认 vLLM 部署为至少 120 秒的窗口预留音频输入槽位，`--max-window-seconds` 可以调整这个上限。`/health` 的 `max_window_seconds` 给出本进程接受的窗口上限。每次请求还须容纳对话历史、音频 token 和生成预算，实际可用时长取决于步长、转录长度及 `--max-context-tokens`。
+
+例如，服务以 `--chunk-ms 1000` 启动，窗口设为 60 秒，每次丢弃 50 秒。第 60 轮仍送入 0～60 秒，第 61 轮送入 50～61 秒，第 62 轮送入 50～62 秒，第 111 轮送入 100～111 秒。丢弃位置落在一个历史音频块内部时，按完整块裁剪。页面显示本轮窗口，日志中的 `window_start_seconds`、`end_seconds` 和 `discarded_seconds` 记录实际区间和丢弃量。连续 WAIT 也执行同样的裁剪，尚未识别的旧语音一旦越过左边界就退出模型上下文。
+
+每轮提交的新增正文在页面中单独占一行，TXT 导出在相邻提交之间换行。例如，连续提交 `Hello`、` again.`，它们各占一行；中间出现 WAIT 时正文区不插入空行。补识别成功的当轮只显示最终提交一次。JSONL 保留模型原始输出、动作和恢复记录。`/health` 中的 `action_protocol` 显示 `explicit` 或 `plain`，`gap_recovery` 显示恢复开关。
+
+部署窗口设置需要更新整个 `Fourth/` 并重启 Fourth 进程，因为每轮音频的裁剪由后端执行。启动后访问首页或同一服务的 `/web/meeting-v2/index.html`。默认策略下，`/health` 会返回 `"context_policy": "window"` 及两个窗口参数。
+
+### 连续有声 WAIT 的恢复
+
+平时由模型选择动作。对显式模型，服务在 CPU 使用 WebRTC VAD 统计尚未提交的轮次中有多少秒人声。默认累计 2.4 秒人声后，服务用同一台 GPU 上的同一个 Omni 单独重听这一段，解码从当前 assistant 的 `<|DIRECT|>` 之后开始。恢复窗口默认最多 6.4 秒，可带最近最多 0.8 秒的跨界音频。三个时长分别用 `--recovery-voiced-seconds`、`--recovery-window-seconds` 和 `--recovery-overlap-seconds` 设置。静音和结束事件均不触发补识别。
+
+一次连续 WAIT 最多触发一次局部解码，直到再次提交正文。恢复成功时，最终提交进入下一轮的对话历史。调试时查看 `primary_text`、`recovery`、`text` 和 `display_text`，分别核对被替换的原始 WAIT、候选及处理结果、最终协议回复和页面正文。空正文、纯标点、已提交内容的重复等不能触发提交。窗口装不下待处理语音时记录 `window_exceeded` 并保留 WAIT。VAD 只提供人声证据，强制前缀本身无法验证新正文的语义正确性。
+
+在同一份显式模型和同一段测试音频上，用默认配置和 `--no-recovery` 分别启动服务，可比较切换后的漏词、重复词和恢复耗时。旧纯正文模型自动走常规解码。局部补识别只能使用主窗口中仍保留的音频。
+
+### 长音频中单轮输出截断
+
+vLLM 的 `finish_reason="length"` 表示这轮解码碰到了 token 长度上限。Fourth 默认给每轮预留 512 个新 token，总上下文默认 4352 个 token，输入仍可使用 3840 个 token。网页和 HTTP 的启动命令均接受 `--max-new-tokens` 和 `--max-context-tokens`。正常的 60 秒音频窗口裁剪另行记录在 `discarded_seconds`。诊断该问题时，在网页导出的 JSONL 中查找 `truncation`，其中 `primary.generated_tokens`、`primary.prompt_tokens` 和两个配置上限对应实际失败的请求。
+
+主解码截断后，若能缩短历史并保留末尾所有 WAIT 轮，服务会对同一块音频最多重试一次。成功时展示完整回复，记录 `status="recovered"`；默认窗口策略从这次成功的上下文继续。没有合适的重试历史或重试再次截断时，页面标出一个待复核区间，记录 `status="gap"`，下一块从空历史继续。区间覆盖最近一次出字后的待处理音频以及出错块，可能包括静音，并非逐字对齐的漏词范围。截断片段不会进入正文。对于上传文件，可以按标出的原文件起止时间单独回听或重新转录。
+
+如果仅看到 `recovery.status="truncated"`，达到上限的是有声 WAIT 的可选补识别。该轮保留模型主解码给出的 WAIT，后续音频正常进入同一会议。
+
+## 5. 给其他系统调用的会议转录 API
+
+调用方逐包发送会议 ID 和 Base64 音频，服务完成转录后同步返回 HTTP 200 和 `{"src":"本包新增正文"}`。没有新增文字时 `src` 为空字符串。同一会议依次发包，多场会议支持 vLLM 合批。HTTP 默认端口为 18892，默认模型步长为 1 秒。部署和调用示例见 [会议转录 HTTP API](HTTP_API.md)。

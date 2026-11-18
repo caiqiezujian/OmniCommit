@@ -11,12 +11,15 @@ OmniCommit 使用 Qwen3-Omni 对多语言、多说话人的增量音频进行原
 | 第一版 · WAIT / DIRECT | [SFT-Scripts/train_sft.sh](SFT-Scripts/train_sft.sh) | [SFT-Scripts/train_sft_swift4.sh](SFT-Scripts/train_sft_swift4.sh) |
 | 第二版 · WAIT / 正文 | [Second/SFT-Scripts/train_sft.sh](Second/SFT-Scripts/train_sft.sh) | [Second/SFT-Scripts/train_sft_swift4.sh](Second/SFT-Scripts/train_sft_swift4.sh) |
 | 第三版 · WAIT / DIRECT + 原文 | [Third/SFT-Scripts/train_sft.sh](Third/SFT-Scripts/train_sft.sh) | [Third/SFT-Scripts/train_sft_swift4.sh](Third/SFT-Scripts/train_sft_swift4.sh) |
+| 第四版 · Third 协议，词表只训练动作行 | [Fourth/SFT-Scripts/train_sft.sh](Fourth/SFT-Scripts/train_sft.sh) | [Fourth/SFT-Scripts/train_sft_swift4.sh](Fourth/SFT-Scripts/train_sft_swift4.sh) |
 
 各入口都用 Megatron 训练，三个位置参数依次是对应格式的**基座目录、训练 JSONL、输出目录**。3.12.1 默认每 3000 步保存，使用 `--save_interval` 调整。4.1.3 默认每 1000 步保存，使用 `--save_steps` 调整。
 
 第一版使用仓库根目录的 `start_server.sh`。第二版使用 `Second/SFT-Scripts/merge_lora.sh` 导出模型，并用 `Second/start_server.sh` 启动支持跨轮正文续写的会议网页，默认端口 18890。数据与模型路径按服务器实际挂载填写。[第一版训练手册](SFT-Scripts/README.md) · [第二版数据、训练、导出和服务](Second/README.md)
 
 第三版可以直接转换已有的 Second 训练集，也能从逐段时间戳重铸。数据构建和网页默认使用 800 ms 的音频块，网页默认端口为 18891。[Third 数据、训练、导出和 Web 命令](Third/README.md)
+
+Fourth 直接读取 Third 的训练 JSONL 和同名 `.tokens.txt`。Thinker 继续训练 LoRA，输入与输出词表默认只更新 `<|WAIT|>` 和 `<|DIRECT|>` 两个 token 的行。训练、合并、网页和 HTTP 服务都可以从 `Fourth/` 独立运行。[Fourth 的 1 秒训练和部署命令](Fourth/README.md)
 
 ## 第一版的输入与数据构建
 
@@ -208,4 +211,4 @@ bash start_server.sh /data/yb/Code/OmniCommit/outputs/merged
 - [会议 Web 服务](docs/web_meeting_service_zh.md) 与 [流式状态说明](docs/streaming_runtime.md)：运行和限制。
 - [方法与验证边界](docs/method.md)、[FLEX 对应关系](docs/FLEX_ADAPTATION.md)：研究路线和实现差异。
 
-在数据开发环境中，从仓库根目录执行 `python -m pytest -q`、`python -m pytest -q Second/tests` 和 `python -m pytest -q Third/tests` 检查各协议，再用 `node tests/test_web_ui_contract.mjs` 检查共用网页交互。真实听音质量、GPU 训练和长会议表现需要在部署环境验收。
+在数据开发环境中，从仓库根目录执行 `python -m pytest -q`、`python -m pytest -q Second/tests` 和 `python -m pytest -q Third/tests` 检查各协议。安装 PyTorch 和 safetensors 后，执行 `python -m pytest -q Fourth/tests` 检查动作行训练和导出。共用网页交互可用 `node tests/test_web_ui_contract.mjs` 检查。真实听音质量、GPU 训练和长会议表现需要在部署环境验收。

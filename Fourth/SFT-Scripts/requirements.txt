@@ -1,0 +1,4 @@
+# CPU audio preparation and training-data audits.
+-r ../requirements-data.txt
+numpy>=1.23,<3
+scipy>=1.9,<2

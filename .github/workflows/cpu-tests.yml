@@ -18,11 +18,18 @@ jobs:
           cp -a Third "$RUNNER_TEMP/Third"
           cd "$RUNNER_TEMP/Third"
           python -m pytest -q tests
+      - name: Fourth standalone training, export and serving
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install safetensors peft==0.15.2 transformers==4.52.4 -r Fourth/requirements-web.txt
+          cp -a Fourth "$RUNNER_TEMP/Fourth"
+          cd "$RUNNER_TEMP/Fourth"
+          python -m pytest -q tests
       - name: Meeting page and transcript export
         run: node tests/test_web_ui_contract.mjs
       - name: Check training, export and server launchers
         run: |
-          find SFT-Scripts Second/SFT-Scripts Third/SFT-Scripts -name '*.sh' -print0 | xargs -0 -n 1 bash -n
+          find SFT-Scripts Second/SFT-Scripts Third/SFT-Scripts Fourth -name '*.sh' -print0 | xargs -0 -n 1 bash -n
           bash -n start_server.sh
           bash -n Second/start_server.sh
           bash -n Third/start_server.sh
