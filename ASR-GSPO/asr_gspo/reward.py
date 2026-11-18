@@ -1,0 +1,313 @@
+"""Reference-based trajectory rewards for the explicit Third streaming protocol."""
+from __future__ import annotations
+
+from bisect import bisect_left
+from collections import Counter
+from dataclasses import dataclass
+from math import ceil, isclose
+import unicodedata
+
+from third_asr.protocol import WAIT, get_protocol
+
+
+PROTOCOL = get_protocol("explicit")
+SWITCH_HEAD = 3
+DELAY_SCALE_SECONDS = 4.0
+
+
+@dataclass(frozen=True)
+class Unit:
+    value: str
+    start: int
+    end: int
+
+
+def _character_script(c):
+    n = ord(c)
+    return (0x3400 <= n <= 0x9fff or 0xf900 <= n <= 0xfaff or 0x20000 <= n <= 0x323af
+            or 0x3040 <= n <= 0x30ff or 0x31f0 <= n <= 0x31ff or 0xff66 <= n <= 0xff9d
+            or 0xac00 <= n <= 0xd7a3 or 0xe01 <= n <= 0xe5b)
+
+
+def _units(text, characters=False):
+    """Tokenize both sides identically and retain original Python offsets for timing."""
+    result = []
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if not c.isalnum():
+            i += 1
+            continue
+        start = i
+        i += 1
+        single = characters or (_character_script(c) and not c.isdecimal())
+        while i < len(text):
+            following = text[i]
+            if unicodedata.category(following).startswith("M"):
+                i += 1
+            elif not single and following.isalnum() and (not _character_script(following) or following.isdecimal()):
+                i += 1
+            else:
+                break
+        form = unicodedata.normalize("NFKC", text[start:i]).casefold()
+        form = "".join(str(unicodedata.decimal(ch)) if ch.isdecimal() else ch for ch in form)
+        result.append(Unit(form, start, i))
+    return result
+
+
+def _edits(ref, hyp, commit_times, onsets, offsets, duration):
+    """Minimize edits, then maximize matches. Time only breaks remaining ties.
+
+    For repeated words prefer fewer pre-onset matches, then smaller acoustic
+    time differences. Remaining ties map to earlier occurrences. Each integer
+    weight dominates all lower-priority terms combined over the entire path.
+    """
+    m = len(hyp)
+    max_matches = min(len(ref), m)
+    max_ms = ceil(duration * 1000)
+    early_weight = max_matches * max_ms + 1
+    match_weight = max_matches * (early_weight + max_ms) + 1
+    edit_weight = max_matches * match_weight + 1
+    hyp_ms = [round(t * 1000) for t in commit_times]
+    previous = [j * edit_weight for j in range(m + 1)]
+    path = [bytearray([2]) * (m + 1)]
+    for i, unit in enumerate(ref, 1):
+        directions = bytearray(m + 1)
+        directions[0] = 1
+        current = [i * edit_weight] + [0] * m
+        onset = round(1000 * onsets[i - 1]) if i - 1 in onsets else None
+        target = round(1000 * offsets[i - 1]) if i - 1 in offsets else onset
+        for j, guess in enumerate(hyp, 1):
+            if unit.value == guess.value:
+                observed = hyp_ms[j - 1]
+                diag = previous[j - 1] - match_weight
+                if onset is not None and observed < onset:
+                    diag += early_weight
+                if target is not None:
+                    diag += abs(observed - target)
+            else:
+                diag = previous[j - 1] + edit_weight
+            delete = previous[j] + edit_weight
+            insert = current[j - 1] + edit_weight
+            score = min(diag, delete, insert)
+            current[j] = score
+            if score == delete:
+                directions[j] = 1
+            elif score == insert:
+                directions[j] = 2
+        path.append(directions)
+        previous = current
+    operations = []
+    i, j = len(ref), m
+    while i or j:
+        direction = path[i][j]
+        if direction == 0:
+            i -= 1
+            j -= 1
+            operations.append(("match" if ref[i].value == hyp[j].value else "sub", i, j))
+        elif direction == 1:
+            i -= 1
+            operations.append(("del", i, None))
+        else:
+            j -= 1
+            # Attach insertions in a gap to its following reference unit, or last at EOF.
+            operations.append(("ins", min(i, len(ref) - 1), j))
+    return operations[::-1]
+
+
+def _changed_spans(spans, reference_text):
+    """Use language changes only; suppress repeated tags and speaker-only transitions."""
+    if not spans:
+        return []
+    if "".join(s["text"] for s in spans) != reference_text:
+        raise ValueError("reference spans do not reconstruct reference_text")
+    runs = []
+    start = 0
+    for s in spans:
+        end = start + len(s["text"])
+        lang = s.get("lang")
+        if end != start:
+            if runs and runs[-1][0] == lang:
+                runs[-1] = (lang, runs[-1][1], end)
+            else:
+                runs.append((lang, start, end))
+        start = end
+    return [(lo, hi) for previous, (lang, lo, hi) in zip(runs, runs[1:])
+            if lang and previous[0] and "und" not in (lang, previous[0])]
+
+
+def _switches(changes, ref):
+    windows = []
+    starts = [unit.start for unit in ref]
+    for lo, hi in changes:
+        first, stop = bisect_left(starts, lo), bisect_left(starts, hi)
+        if first < stop:
+            windows.append((first, min(first + SWITCH_HEAD, stop), stop - first <= SWITCH_HEAD))
+    return windows
+
+
+def _anchors(task, ref):
+    """Only exact outer endpoints supply timing, never interpolate inside a coarse span."""
+    text = task["reference_text"]
+    starts = {unit.start: n for n, unit in enumerate(ref)}
+    ends = {unit.end: n for n, unit in enumerate(ref)}
+    onsets, offsets = {}, {}
+    duration_ms = task["duration_seconds"] * 1000
+    # A switch anchors the earliest possible speech of the new span. Without
+    # word-level timing, it cannot tell us when a word in that span completed.
+    switches = task.get("switches") or []
+    unit_starts = list(starts)
+    for index, switch in enumerate(switches):
+        lo, begin = switch["char_start"], switch["time_ms"]
+        hi = switches[index + 1]["char_start"] if index + 1 < len(switches) else len(text)
+        if not (0 <= lo < hi <= len(text) and 0 <= begin <= duration_ms + .001):
+            raise ValueError("invalid switch onset or offsets")
+        for n in range(bisect_left(unit_starts, lo), bisect_left(unit_starts, hi)):
+            onsets[n] = begin / 1000
+    for anchor in task.get("alignment") or []:
+        lo, hi = anchor["char_start"], anchor["char_end"]
+        if not (0 <= lo < hi <= len(text)) or anchor["text"] != text[lo:hi]:
+            raise ValueError("alignment offsets do not match reference")
+        begin, end = anchor.get("start_ms"), anchor.get("end_ms")
+        if (any(t is not None and not 0 <= t <= duration_ms + .001 for t in (begin, end))
+                or (begin is not None and end is not None and begin >= end)):
+            raise ValueError("alignment times outside audio")
+        parts = _units(text[lo:hi])
+        if not parts:
+            continue
+        first, last = starts.get(lo + parts[0].start), ends.get(lo + parts[-1].end)
+        if first is not None and begin is not None:
+            onsets[first] = max(onsets.get(first, 0.), begin / 1000)
+        if last is not None and end is not None:
+            offsets[last] = end / 1000
+    return onsets, offsets
+
+
+def _parse_turns(task, turns):
+    chunks = task["chunks"]
+    if len(turns) != len(chunks) + 1:
+        return "incomplete_trajectory", [], [], []
+    pieces, char_ends, times = [], [], []
+    length = 0
+    for i, turn in enumerate(turns):
+        eof = i == len(chunks)
+        clock = task["duration_seconds"] if eof else chunks[i]["end_seconds"]
+        if turn.get("kind") != ("eof" if eof else "audio") or not isclose(
+                turn["audio_end_seconds"], clock, abs_tol=1e-6, rel_tol=0):
+            raise ValueError("trajectory observations disagree with task audio schedule")
+        if turn.get("finish_reason") not in (None, "stop", "eos"):
+            return "truncated_or_invalid_finish", [], [], []
+        try:
+            delta = PROTOCOL.parse_reply(turn.get("response"))
+        except ValueError:
+            return "invalid_action", [], [], []
+        if eof and turn["response"] != WAIT:
+            return "text_at_eof", [], [], []
+        if delta:
+            length += len(delta)
+            pieces.append(delta)
+            char_ends.append(length)
+            times.append(clock)
+    return None, pieces, char_ends, times
+
+
+def score_trajectory(task, turns, mode="quality_latency"):
+    """Score one candidate independently, before the trainer's group comparison."""
+    if mode not in ("quality", "quality_latency"):
+        raise ValueError("expected quality or quality_latency reward mode")
+    reason, pieces, char_ends, commit_times = _parse_turns(task, turns)
+    if reason:
+        return {"valid": False, "reason": reason, "reward": -3.0}
+    text = task["reference_text"]
+    ref = _units(text)
+    changes = _changed_spans(task.get("spans"), text)
+    starts = [unit.start for unit in ref]
+    # Some synthesized spans have no separator (e.g. <en>Hello<de>Guten).
+    # Choose the scoring granularity from the reference alone and apply it to
+    # both sides, so omission/addition of a space cannot hide the switch head.
+    characters = False
+    for start, _ in changes:
+        previous = bisect_left(starts, start) - 1
+        if previous >= 0 and start < ref[previous].end:
+            characters = True
+            ref = _units(text, characters=True)
+            break
+    hyp = _units("".join(pieces), characters=characters)
+    onsets, offsets = _anchors(task, ref)
+    emitted_at = [commit_times[bisect_left(char_ends, unit.end)] for unit in hyp]
+    timed = mode == "quality_latency"
+    operations = _edits(ref, hyp, emitted_at, onsets if timed else {}, offsets if timed else {},
+                        task["duration_seconds"])
+    costs = [0] * len(ref)
+    deleted = set()
+    matches = {}
+    subs = inserts = 0
+    for op, i, j in operations:
+        if op == "match":
+            matches[i] = emitted_at[j]
+        else:
+            if i >= 0:
+                costs[i] += 1
+            if op == "del":
+                deleted.add(i)
+            elif op == "sub":
+                subs += 1
+            else:
+                inserts += 1
+    errors = len(deleted) + subs + inserts
+    error_rate = errors / max(1, len(ref))
+    quality = 1 - min(2., error_rate)
+    if not ref and not text.strip() and pieces:
+        # Even punctuation-only DIRECTs are hallucinations in an annotated silent clip.
+        quality = -1.
+    windows = _switches(changes, ref)
+    short_count = short_dels = 0
+    local_errors = []
+    for lo, hi, short in windows:
+        local_errors.append(min(2., sum(costs[lo:hi]) / (hi - lo)))
+        if short:
+            short_count += 1
+            short_dels += all(i in deleted for i in range(lo, hi))
+    switch_error = sum(local_errors) / max(1, len(local_errors))
+    grid = [c["end_seconds"] for c in task["chunks"]]
+    delays = []
+    switch_head = {i for lo, hi, _ in windows for i in range(lo, hi)}
+    switch_delays = []
+    early = {i for i in matches if i in onsets and matches[i] + 1e-6 < onsets[i]}
+    missing_or_early = 0
+    for i, end in offsets.items():
+        if i not in matches or i in early:
+            missing_or_early += 1
+            continue
+        eligible = grid[bisect_left(grid, end - 1e-6)]
+        delay = max(0., matches[i] - eligible)
+        delays.append(delay)
+        if i in switch_head:
+            switch_delays.append(delay)
+    delays.sort()
+    # Missing timed words receive the maximum timing cost, so skipping a late
+    # word cannot improve the timing component. Raw latency metrics use matches only.
+    # A soft cost distinguishes long stalls even above eight or thirty seconds.
+    delay_costs = [d / (DELAY_SCALE_SECONDS + d) for d in delays] + [1.] * missing_or_early
+    timing_cost = (sum(delay_costs) / len(delay_costs)) if delay_costs else 0.
+    reward = quality - .40 * switch_error - .20 * short_dels / max(1, short_count)
+    if mode == "quality_latency":
+        reward -= .15 * timing_cost + .10 * len(early) / max(1, len(onsets))
+    if ref and not matches:
+        # No coverage: emitting unrelated words must never beat an all-WAIT
+        # trajectory just because DIRECT contained something.
+        reward = -2.5 - .20 * min(1., len(hyp) / len(ref))
+    return {
+        "valid": True, "reason": None, "reward": reward, "quality": quality,
+        "unit_mode": "character_cross_boundary" if characters else "mixed",
+        "reference_units": len(ref), "matched_units": len(matches), "errors": errors,
+        "substitutions": subs, "deletions": len(deleted), "insertions": inserts,
+        "error_rate": error_rate, "switch_segments": len(windows), "switch_error_rate": switch_error,
+        "short_switch_segments": short_count, "short_switch_deletions": short_dels,
+        "timed_units": len(offsets), "timed_matches": sum(i in matches for i in offsets),
+        "delay_samples": len(delays), "early_units": len(early), "timing_cost": timing_cost,
+        "extra_wait_ms_histogram": dict(Counter(round(d * 1000) for d in delays)),
+        "switch_extra_wait_ms_histogram": dict(Counter(round(d * 1000) for d in switch_delays)),
+        "mean_extra_wait_seconds": sum(delays) / len(delays) if delays else None,
+        "delay_p95_seconds": delays[ceil(.95 * len(delays)) - 1] if delays else None,
+    }
