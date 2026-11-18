@@ -24,6 +24,7 @@ $("playback").onchange = refreshSource;
 $("file").onchange = () => {
   if (mediaURL) URL.revokeObjectURL(mediaURL);
   const file = $("file").files[0];
+  $("fileStart").value = $("fileEnd").value = "";
   mediaURL = file ? URL.createObjectURL(file) : null;
   if (mediaURL) player.src = mediaURL;
   else player.removeAttribute("src");
@@ -186,18 +187,54 @@ async function streamLive(state, channel, ready) {
   if (count) showResult(await channel.request({type: "end"}));
 }
 
+function fileRangeOptions() {
+  const range = {};
+  for (const [id, key] of [["fileStart", "file_start_seconds"], ["fileEnd", "file_end_seconds"]]) {
+    const value = $(id).value.trim();
+    if (!value) continue;
+    const seconds = value.split(":").reduce((total, part) => total * 60 + Number(part), 0);
+    if (!/^(?:\d+(?:\.\d+)?|\d+:[0-5]\d(?::[0-5]\d)?(?:\.\d+)?)$/.test(value) || !Number.isFinite(seconds)) {
+      throw Error("转录时间请输入非负秒数、分:秒或时:分:秒。");
+    }
+    range[key] = seconds;
+  }
+  if (range.file_end_seconds <= (range.file_start_seconds ?? 0)) throw Error("转录终点必须晚于起点。");
+  return range;
+}
+
+function waitForPlayer(event, trigger) {
+  return new Promise((resolve, reject) => {
+    const finish = error => {
+      clearTimeout(timer);
+      player.removeEventListener(event, done);
+      player.removeEventListener("error", failed);
+      if (error) reject(error);
+      else resolve();
+    };
+    const done = () => finish();
+    const failed = () => finish(Error("播放器无法定位到转录起点，请检查文件或取消勾选跟随播放器。"));
+    const timer = setTimeout(failed, 10000);
+    player.addEventListener(event, done);
+    player.addEventListener("error", failed);
+    try { trigger?.(); } catch (error) { finish(error); }
+  });
+}
+
 async function streamFile(state, channel, ready, upload) {
   const follow = $("playback").checked;
-  const end = upload.duration_seconds;
-  let release = 0, heard = 0, turn = 1;
+  const start = ready.file_start_seconds, end = ready.file_end_seconds;
+  const startFrame = Math.round(start * upload.sample_rate);
+  let release = start, heard = start, turn = 1;
+  state.fileHeard = start;
   if (follow) {
     if (player.error) throw Error("浏览器无法播放此文件；取消勾选跟随播放器可逐块识别。");
-    if (player.currentTime !== 0) {
-      await new Promise(resolve => {
-        player.addEventListener("seeked", resolve, {once: true});
-        player.currentTime = 0;
-      });
+    player.pause();
+    if (player.readyState < 1) await waitForPlayer("loadedmetadata");
+    if (player.currentTime !== start || player.seeking) {
+      await waitForPlayer("seeked", () => { player.currentTime = start; });
     }
+    if (Math.abs(player.currentTime - start) > 0.1) throw Error("播放器未能定位到转录起点。");
+    state.fileEnd = end;
     state.fileStarted = true;
     try { await player.play(); } catch { status("请点击播放器开始；转录将跟随播放。"); }
   }
@@ -206,10 +243,12 @@ async function streamFile(state, channel, ready, upload) {
     if (state.fileError) throw state.fileError;
     if (channel.error) throw channel.error;
     const nextFrame = Math.ceil(turn * Math.round(1000 * ready.chunk_seconds) * upload.sample_rate / 1000);
-    const played = follow ? (player.ended ? end : player.currentTime) : nextFrame / upload.sample_rate;
+    if (follow && player.ended && player.currentTime + 0.1 < end) throw Error("播放已提前结束，请取消跟随播放器后重试。");
+    const played = follow ? (player.ended ? end : player.currentTime) : (startFrame + nextFrame) / upload.sample_rate;
     const target = state.stopping ? state.finalRelease : played;
     release = Math.max(release, Math.min(target, end));
     const final = state.stopping || release >= end;
+    if (follow && final && !player.paused) player.pause();
     $("queued").textContent = Math.max(0, release - heard).toFixed(1) + " s";
     if (!final && release - heard + 1 / upload.sample_rate < ready.chunk_seconds) {
       await sleep(60);
@@ -239,6 +278,9 @@ function stop() {
   status("正在提交最后的音频…");
 }
 $("stop").onclick = stop;
+player.addEventListener("timeupdate", () => {
+  if (running?.fileStarted && player.currentTime >= running.fileEnd && !player.paused) player.pause();
+});
 player.addEventListener("seeking", () => {
   if (running?.kind === "file" && running.fileStarted && !running.stopping) {
     running.fileError = new Error("播放位置已改变，请重新开始转录。");
@@ -276,12 +318,14 @@ $("start").onclick = async () => {
   const state = running = {kind: selected(), queue: new CaptureQueue(), fileHeard: 0, stopping: false};
   $("start").disabled = $("settings").disabled = true;
   try {
-    let upload;
+    let upload, range = {};
     status("准备音频…");
     if (state.kind === "file") {
       if (!health.file_input) throw Error("服务器需要 FFmpeg 才能读取音视频文件。");
       const file = $("file").files[0];
       if (!file) throw Error("请选择音视频文件。");
+      range = fileRangeOptions();
+      player.pause();
       const response = await fetch("/api/media", {method: "POST", body: file});
       upload = await response.json();
       if (!response.ok) throw Error(upload.error || "文件上传失败");
@@ -297,9 +341,18 @@ $("start").onclick = async () => {
     await channel.open;
     const ready = await channel.request({
       type: "start", sample_rate: 16000, source_kind: state.kind, media_id: upload?.media_id,
-      ...windowOptions
+      ...windowOptions, ...range
     });
     if (ready.type !== "ready" || ready.protocol !== "third") throw Error("服务未加载 Third 协议");
+    if (upload) {
+      const start = ready.file_start_seconds, end = ready.file_end_seconds;
+      const tolerance = 1 / upload.sample_rate;
+      if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start ||
+          Math.abs(start - (range.file_start_seconds ?? 0)) > tolerance ||
+          Math.abs(end - (range.file_end_seconds ?? upload.duration_seconds)) > tolerance) {
+        throw Error("服务端未确认所选文件区间，请核对 Third 服务版本并重新开始。");
+      }
+    }
     if (health.context_policy === "window" && (ready.window_seconds !== windowOptions.window_seconds
         || ready.discard_seconds !== windowOptions.discard_seconds)) {
       throw Error("服务端未确认所选窗口，请核对 Third 服务版本并重新开始。");
@@ -330,10 +383,10 @@ $("start").onclick = async () => {
 
 fetch("/health", {cache: "no-store"}).then(r => r.json()).then(info => {
   if (!info.ready || info.protocol !== "third") throw Error("Third 服务尚未就绪");
-  if (!$("windowSettings") || !$("gapNotice")) {
+  if (!$("windowSettings") || !$("gapNotice") || !$("fileStart") || !$("fileEnd")) {
     // Older HTML may still load this script through its unversioned URL.
-    if (location.search === "?ui=gaps1") throw Error("服务仍返回旧版页面，请确认 Third 已更新并刷新。");
-    location.replace("/?ui=gaps1");
+    if (location.search === "?ui=range1") throw Error("服务仍返回旧版页面，请确认 Third 已更新并刷新。");
+    location.replace("/?ui=range1");
     return;
   }
   const hasWindow = info.context_policy === "window";

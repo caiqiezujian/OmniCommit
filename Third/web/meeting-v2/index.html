@@ -8,7 +8,7 @@
   <link rel="stylesheet" href="/web/meeting-v2/style.css?v=window1">
   <script defer src="/web/meeting-v2/log-archive.js"></script>
   <script defer src="/web/meeting-v2/turn-log.js?v=gaps1"></script>
-  <script type="module" src="/web/meeting-v2/app.js?v=gaps1"></script>
+  <script type="module" src="/web/meeting-v2/app.js?v=range1"></script>
 </head>
 <body>
   <header><strong>OmniCommit Third</strong><span>多语种流式转录</span></header>
@@ -29,9 +29,14 @@
           </div>
           <div id="fileOptions" hidden>
             <label>选择本地文件 <input id="file" type="file" accept="audio/*,video/*"></label>
+            <div class="window-settings" role="group" aria-label="文件转录区间">
+              <label>转录起点<input id="fileStart" type="text" placeholder="文件开头" aria-describedby="fileRangeHelp"></label>
+              <label>转录终点<input id="fileEnd" type="text" placeholder="文件结尾" aria-describedby="fileRangeHelp"></label>
+            </div>
+            <p class="hint" id="fileRangeHelp">可填秒数（58.25）、分:秒（1:36）或时:分:秒。两端留空转录整个文件。</p>
             <video id="player" controls playsinline hidden></video>
             <label><input id="playback" type="checkbox" checked> 跟随播放器进度</label>
-            <p class="hint">取消勾选即可连续逐块识别整个文件。</p>
+            <p class="hint">取消勾选即可连续逐块识别所选区间。</p>
           </div>
         </fieldset>
         <div class="buttons">
