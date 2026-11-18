@@ -2,6 +2,8 @@
 
 输入是原始录音和完整的原语言转录。模型从你们已经训练好的 **Third explicit 合并 HF 权重** 出发，每轮听到一块新音频，自己决定提交哪些正文或继续等。训练器对同一条录音在线采样一组完整转录，再比较识别质量、切换处漏词和出字时间。参考文本、语种和时间戳只交给评分器。
 
+[看一条真实格式的记录如何从原始 JSONL 变成训练任务、逐轮输出和奖励日志](DATA_FORMAT.md)
+
 代码位于 OmniCommit 的 `ASR-GSPO/`，复用同仓库 `Third/` 的音频读取、动作协议和部署校验。训练服务器需要这一整个 OmniCommit checkout。Python/CUDA 环境沿用 FLEX-GSPO 的 **ms-swift 提交 `f15bb91439d756d4a366b51956d72d1f088b7af6`、mcore-bridge 1.6.3 和配套的 Megatron/vLLM**。已有该环境即可使用。数据准备依赖 Python、soundfile，非 16 kHz 波形的实际读取还需要 scipy；本地评分支持 CPU。
 
 ## 1. 准备任务
