@@ -8,7 +8,7 @@ import pytest
 FOURTH = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(FOURTH))
 from fourth_asr.runtime.streaming import GenerationTruncated, SAMPLE_RATE
-from fourth_asr.protocol import DIRECT, WAIT
+from fourth_asr.protocol import DIRECT, SPK_CHANGE, WAIT
 from fourth_asr.recovery import SpeechActivity, novel_continuation
 from fourth_asr.service_session import FourthStreamOptions, FourthStreamSession
 
@@ -47,7 +47,7 @@ def block(value, seconds=.8):
 
 def make_session(replies, recoveries, **opts):
     backend = Backend(replies, recoveries)
-    options = FourthStreamOptions(protocol="explicit", **opts)
+    options = FourthStreamOptions(**{"protocol": "explicit", "chunk_seconds": .8, **opts})
     return FourthStreamSession(backend, options, activity=Activity()), backend
 
 
@@ -165,3 +165,18 @@ def test_overlap_is_only_removed_with_acoustic_and_lexical_evidence():
     assert novel_continuation("End now. Guten Morgen!", "End now.", has_overlap=True) == (" Guten Morgen!", None)
     assert novel_continuation("End now. Guten Morgen!", "End now.", has_overlap=False)[0] == ""
     assert novel_continuation("now, maybe", "End now.", has_overlap=True)[0] == ""
+
+
+def test_speaker_recovery_preserves_only_markers_after_overlap_and_keeps_raw_history():
+    old = "Hello there."
+    change = SPK_CHANGE + "好的。"
+    recovered = DIRECT + old + change
+    session, backend = make_session([DIRECT + old, WAIT, WAIT], [recovered],
+                                    protocol="speaker", recovery_voiced_seconds=.8)
+    session.step(block(.1))
+    result = session.step(block(.3))
+    assert result["primary_text"] == WAIT and result["recovery"]["raw_text"] == recovered
+    assert (result["text"], result["display_text"]) == (DIRECT + change, "好的。")
+    assert result["transcript_parts"] == [{"text": "好的。", "speaker_change": True}]
+    session.step(end_of_audio=True)
+    assert backend.history[-2] == DIRECT + change

@@ -184,7 +184,7 @@ def main(argv=None):
             health, _, _ = probe.request("GET", "/health")
         finally:
             probe.close()
-        if health.get("service") != "third_http" or not health.get("ready"):
+        if health.get("service") != "fourth_http" or not health.get("ready"):
             raise ValueError("URL must point to a ready Fourth HTTP ASR service")
         model_chunk_ms = round(health["chunk_seconds"] * 1000)
         chunk_ms = args.chunk_ms or model_chunk_ms

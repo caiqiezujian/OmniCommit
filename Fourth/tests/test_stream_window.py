@@ -19,10 +19,10 @@ class Recorder(ReplayBackend):
         return super().generate(messages, audios)
 
 
-@pytest.mark.parametrize("protocol", ["plain", "explicit"])
+@pytest.mark.parametrize("protocol", ["plain", "explicit", "speaker"])
 def test_window_crossings_keep_exact_turns_even_after_a_minute_of_wait(protocol):
     replies = [WAIT] * 112
-    replies[53] = (DIRECT if protocol == "explicit" else "") + "Guten Morgen."
+    replies[53] = ("" if protocol == "plain" else DIRECT) + "Guten Morgen."
     backend = Recorder(replies)
     session = FourthStreamSession(backend, FourthStreamOptions(protocol=protocol, chunk_seconds=1, enable_recovery=False))
     for end in range(1, 112):
@@ -38,7 +38,7 @@ def test_window_crossings_keep_exact_turns_even_after_a_minute_of_wait(protocol)
 
 
 def test_nondivisible_discard_and_partial_tail_use_real_audio_duration():
-    opts = FourthStreamOptions(chunk_seconds=.7, window_seconds=2.2, discard_seconds=1)
+    opts = FourthStreamOptions(chunk_seconds=.7, window_seconds=2.2, discard_seconds=1, enable_recovery=False)
     session = FourthStreamSession(Recorder(repeat(WAIT)), opts)
     pcm = np.zeros(11200, dtype=np.float32)
     for _ in range(3):

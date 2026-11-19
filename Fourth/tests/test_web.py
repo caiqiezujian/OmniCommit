@@ -14,7 +14,7 @@ sys.path.insert(0, str(FOURTH))
 
 from fourth_asr.runtime.media import MediaCursor
 from fourth_asr.runtime.streaming import ContextBudgetError, GenerationTruncated, ReplayBackend
-from fourth_asr.protocol import EOS, WAIT, system_prompt
+from fourth_asr.protocol import EOS, WAIT, get_protocol
 from fourth_asr.service_backend import read_export_protocol, validate_manifest
 from fourth_asr.service_session import FourthStreamOptions, FourthStreamSession
 from fourth_asr.service_web import create_app
@@ -30,12 +30,12 @@ class Recorder(ReplayBackend):
 def client_for(backend):
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
-    return TestClient(create_app(lambda: backend, FourthStreamOptions()))
+    return TestClient(create_app(lambda: backend, FourthStreamOptions(protocol="plain", chunk_seconds=.8)))
 
 
 def start(ws, kind, **kwargs):
     ws.send_json({"type": "start", "sample_rate": 16000, "source_kind": kind, **kwargs})
-    assert ws.receive_json()["protocol"] == "third"
+    assert ws.receive_json()["protocol"] == "fourth"
 
 
 @pytest.mark.parametrize("kind", ["microphone", "system"])
@@ -58,7 +58,7 @@ def test_web_incremental_text_and_eos(kind):
             assert backend.lengths[-1] == 8000
             ws.send_json({"type": "end"})
             assert ws.receive_json()["text"] == WAIT
-            assert backend.messages[0]["content"] == system_prompt("normalized")
+            assert backend.messages[0]["content"] == get_protocol("plain").system_prompt("normalized")
             assert [m["content"] for m in backend.messages[1:]] == [
                 "<audio>", "中文。Let's", "<audio>", " meet.", "<audio>", WAIT, EOS]
 
@@ -107,7 +107,7 @@ def test_file_range_uses_negotiated_window_relative_to_range_start():
         audio.setparams((1, 2, 16000, 0, "NONE", ""))
         audio.writeframes(bytes(10 * 16000 * 2))
     from fastapi.testclient import TestClient
-    with TestClient(create_app(ReplayBackend, FourthStreamOptions(chunk_seconds=1))) as client:
+    with TestClient(create_app(ReplayBackend, FourthStreamOptions(protocol="plain", chunk_seconds=1))) as client:
         upload = client.post("/api/media", content=wav.getvalue()).json()
         with client.websocket_connect("/stream") as ws:
             ws.send_json(dict(type="start", sample_rate=16000, source_kind="file", media_id=upload["media_id"],
@@ -137,7 +137,7 @@ def test_file_gap_keeps_websocket_open_and_reports_whole_source_interval():
         audio.setparams((1, 2, 16000, 0, "NONE", ""))
         audio.writeframes(bytes(8 * 16000 * 2))
     from fastapi.testclient import TestClient
-    with TestClient(create_app(Capped, FourthStreamOptions(chunk_seconds=1))) as client:
+    with TestClient(create_app(Capped, FourthStreamOptions(protocol="plain", chunk_seconds=1))) as client:
         upload = client.post("/api/media", content=wav.getvalue()).json()
         with client.websocket_connect("/stream") as ws:
             start(ws, "file", media_id=upload["media_id"], file_start_seconds=4, file_end_seconds=8)
@@ -155,7 +155,7 @@ def test_file_gap_keeps_websocket_open_and_reports_whole_source_interval():
 
 
 def test_silence_compaction_and_voiced_pending_guard():
-    opts = FourthStreamOptions(context_policy="rolling", recent_seconds=.8, max_context_seconds=2.4, max_pending_seconds=2.4)
+    opts = FourthStreamOptions(protocol="plain", chunk_seconds=.8, context_policy="rolling", recent_seconds=.8, max_context_seconds=2.4, max_pending_seconds=2.4)
     session = FourthStreamSession(ReplayBackend(), opts)
     for _ in range(2250):  # 30 minutes of digital silence
         event = session.step(np.zeros(12800, dtype=np.float32))

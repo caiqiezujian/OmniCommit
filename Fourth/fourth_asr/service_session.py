@@ -7,16 +7,16 @@ import math
 import numpy as np
 
 from .runtime.streaming import StreamOptions, StreamSession
-from .protocol import WAIT, get_protocol
+from .protocol import SPK_CHANGE, WAIT, get_protocol
 from .recovery import VoicedWaitRecovery
 
 
 @dataclass
 class FourthStreamOptions(StreamOptions):
-    chunk_seconds: float = .8
+    chunk_seconds: float = 1.
     context_policy: str = "window"
     number_format: str = "normalized"
-    protocol: str = "plain"
+    protocol: str = "speaker"
     enable_recovery: bool = True
     recovery_voiced_seconds: float = 2.4
     recovery_overlap_seconds: float = .8
@@ -43,7 +43,7 @@ class FourthStreamSession(StreamSession):
         self.committed_tail = ""
         self.quiet_waits = set()
         self.quiet_evicted_seconds = 0.
-        if self.options.protocol == "explicit" and self.options.enable_recovery:
+        if self.protocol.prefix and self.options.enable_recovery:
             self.recovery = VoicedWaitRecovery(self.options, activity)
 
     def _context_system_prompt(self):
@@ -53,8 +53,14 @@ class FourthStreamSession(StreamSession):
         text = self.protocol.parse_reply(reply)
         if end_of_audio and text:
             raise ValueError("Fourth expects standalone WAIT at end_of_audio")
+        parts = []
+        heard_speaker = self.last_text_end > 0
+        for i, part in enumerate(text.split(SPK_CHANGE)):
+            if part:
+                parts.append({"text": part, "speaker_change": i > 0 and heard_speaker})
+                heard_speaker = heard_speaker or bool(part.strip())
         return {"action": "DIRECT" if text else "WAIT", "segments": [],
-                "text": reply, "display_text": text}
+                "text": reply, "display_text": text.replace(SPK_CHANGE, ""), "transcript_parts": parts}
 
     def step(self, audio=None, *, end_of_audio=False, final_chunk=False):
         self.quiet_evicted_seconds = 0.
@@ -72,7 +78,9 @@ class FourthStreamSession(StreamSession):
                 result["realtime_factor"] = result["generation_seconds"] / (
                     result["end_seconds"] - result["start_seconds"])
         if result["action"] == "DIRECT":
-            self.committed_tail = (self.committed_tail + result["display_text"])[-2048:]
+            # A speaker boundary separates words for recovery overlap detection.
+            marked = result["text"].removeprefix(self.protocol.prefix)
+            self.committed_tail = (self.committed_tail + marked.replace(SPK_CHANGE, " "))[-2048:]
             self.last_text_end = result["end_seconds"]
         if self.quiet_evicted_seconds:
             result["vad_quiet_evicted_seconds"] = self.quiet_evicted_seconds

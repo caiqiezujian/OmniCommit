@@ -3,7 +3,7 @@
 // Keep the displayed range independent from the append-only event history.
 const LOG_PAGE_SIZE = 50;
 
-function logHistory(protocol = 'third') {
+function logHistory(protocol = 'fourth') {
   return {protocol, all: [], model: [], WAIT: [], DIRECT: [], gaps: [], waitRun: 0, waitSeconds: 0, lastDirect: null, error: null};
 }
 
@@ -84,7 +84,7 @@ class MeetingTurnLog {
   constructor(get, download) {
     this.get = get;
     this.download = download;
-    this.protocol = 'third';
+    this.protocol = 'fourth';
     this.current = logHistory(this.protocol);
     this.view = this.current;
     this.currentId = null;

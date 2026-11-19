@@ -10,10 +10,6 @@ sys.path.insert(0, str(script_dir.parent))
 from fourth_asr.chunk_refs import PREFIX
 from fourth_asr.training_audio import SAMPLE_RATE, materialize_chunk_refs
 
-if os.environ.get("OMNICOMMIT_ACTION_ROWS") == "1":
-    from fourth_asr.mcore_action_rows import install_action_rows
-    install_action_rows()
-
 if os.environ.get("OMNICOMMIT_SFT_ATTENTION_COMPAT") == "1":
     from omnicommit_attention_compat import install_attention_compat, install_swift_loader_compat
     install_attention_compat()
@@ -55,6 +51,6 @@ class OmniCommitQwen3OmniTemplate(Qwen3OmniTemplate):
 
 
 meta = deepcopy(TEMPLATE_MAPPING["qwen3_omni"])
-meta.template_type = "omnicommit_third_qwen3_omni"
+meta.template_type = "omnicommit_fourth_qwen3_omni"
 meta.template_cls = OmniCommitQwen3OmniTemplate
 register_template(meta)

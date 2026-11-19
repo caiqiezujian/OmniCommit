@@ -12,7 +12,7 @@ import pytest
 
 FOURTH = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(FOURTH))
-from fourth_asr.protocol import DIRECT, EOS, WAIT, get_protocol
+from fourth_asr.protocol import DIRECT, EOS, SPK_CHANGE, WAIT, get_protocol
 from fourth_asr.service_backend import build_backend, detect_model_protocol, read_export_protocol, validate_manifest
 from fourth_asr.sft_checks import read_tokens, validate_row
 from fourth_asr.chunk_refs import encode_chunk_ref
@@ -87,7 +87,7 @@ def test_training_sidecar_matches_every_turn_and_its_loss(mode, tmp_path):
             check(row, encoded, protocol_ids)
 
 
-@pytest.mark.parametrize("mode,version", [("plain", 3), ("explicit", 4)])
+@pytest.mark.parametrize("mode,version", [("plain", 3), ("explicit", 4), ("speaker", 5)])
 def test_export_manifest_selects_serving_protocol(mode, version, tmp_path):
     profile = get_protocol(mode)
     sidecar = tmp_path / "tokens.txt"
@@ -128,3 +128,48 @@ def test_only_explicit_recovery_reserves_long_audio_items(mode, enabled, reserve
     options = build_backend(args)
     assert options["manifest_validator"] is validate_manifest
     assert options.get("max_audio_item_seconds") == reserved
+
+
+def test_three_token_speaker_protocol_preserves_wait_state_and_exact_assistant_loss(tmp_path):
+    profile = get_protocol("speaker")
+    assert profile.tokens == (WAIT, DIRECT, SPK_CHANGE)
+    speaker = None
+    replies = []
+    for spans in [
+        [("zh", "spk1", "开始。")], [],
+        [("en", "spk1", " OK."), ("en", "spk2", " Yes."), ("zh", "spk1", "好。")],
+        [("zh", "spk2", "再见。")],
+    ]:
+        reply, speaker = profile.render_reply(spans, speaker)
+        replies.append(reply)
+    assert replies == [DIRECT + "开始。", WAIT, DIRECT + " OK." + SPK_CHANGE + " Yes." + SPK_CHANGE + "好。",
+                       DIRECT + SPK_CHANGE + "再见。"]
+    source = tmp_path / "a.wav"
+    row = row_for(source, replies, "speaker")
+    events = [{"turn": 2, "kind": "switch_deferred"}, {"turn": 3, "kind": "speaker_change"},
+              {"turn": 4, "kind": "speaker_change"}, {"turn": 4, "kind": "audio_end"}]
+    row["recast"] = {"source_audio": str(source), "chunk_ms": 800, "merged_units": 0, "events": events}
+    assert validate_row(row) == set(profile.tokens)
+    ids = dict(zip(profile.tokens, [21, 22, 23]))
+    encoded = {"labels": [-100, 22, 81, 21, 22, 82, 23, 83, 23, 84, 22, 23, 85, 21],
+               "input_features": np.zeros((4, 1)), "feature_attention_mask": np.zeros((4, 1))}
+    check = runpy.run_path(str(FOURTH / "SFT-Scripts/audit_encoded_lengths.py"))["check_encoded_protocol"]
+    check(row, encoded, ids)
+    encoded["labels"][6] = -100
+    with pytest.raises(ValueError, match="Supervised protocol tokens"):
+        check(row, encoded, ids)
+    events.append({"turn": 4, "kind": "switch_deferred"})
+    with pytest.raises(ValueError, match="beyond the final"):
+        validate_row(row)
+    events.pop()
+    del events[1]
+    with pytest.raises(ValueError, match="speaker_change events"):
+        validate_row(row)
+
+
+@pytest.mark.parametrize("reply", [DIRECT + SPK_CHANGE, DIRECT + "one" + SPK_CHANGE + "  ",
+                                   DIRECT + SPK_CHANGE + SPK_CHANGE + "two", DIRECT + SPK_CHANGE + "<spk2>two",
+                                   DIRECT + SPK_CHANGE + "one", DIRECT + " " + SPK_CHANGE + "one"])
+def test_malformed_or_initial_change_is_rejected(tmp_path, reply):
+    with pytest.raises(ValueError, match="audio turn 1"):
+        validate_row(row_for(tmp_path / "a.wav", [reply], "speaker"))

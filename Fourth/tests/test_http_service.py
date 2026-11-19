@@ -45,7 +45,7 @@ def request_records(caplog, monkeypatch):
 
 
 def app(backend, chunk_seconds=.5, **settings):
-    return create_app(lambda: backend, FourthStreamOptions(chunk_seconds=chunk_seconds), **settings)
+    return create_app(lambda: backend, FourthStreamOptions(protocol="plain", chunk_seconds=chunk_seconds), **settings)
 
 
 def audio(client, key, count=STEP, value=0):
@@ -74,6 +74,20 @@ def test_integer_second_json_packets_only_return_new_transcript():
             data = base64.b64encode(bytes(seconds * 16000 * 4)).decode("ascii")
             assert_src(client.post(path + "/chunks", json={"data": data}), text)
         assert_src(client.post(path + "/end"), "")
+
+
+def test_speaker_http_src_and_detailed_history():
+    raw = "<|DIRECT|><|SPK_CHANGE|>能。<|SPK_CHANGE|>好。"
+    backend = ReplayBackend(["<|DIRECT|>能听到吗？", raw, WAIT])
+    options = FourthStreamOptions(enable_recovery=False)
+    with TestClient(create_app(lambda: backend, options)) as client:
+        assert client.get("/health").json()["action_protocol"] == "speaker"
+        assert_src(audio(client, "s", count=32000), "能听到吗？能。好。")
+        row = client.get(BASE + "s/result").json()["turns"][1]
+        assert row["text"] == raw
+        assert row["transcript_parts"] == [{"text": "能。", "speaker_change": True},
+                                           {"text": "好。", "speaker_change": True}]
+        assert_src(client.post(BASE + "s/end"), "")
 
 
 def test_json_float32_is_lossless_across_json_wav_and_pcm_packets():

@@ -21,7 +21,6 @@ import time
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from fourth_asr.action_rows_manifest import read_action_rows_manifest
 from fourth_asr.service_backend import read_export_protocol
 
 VOCAB_KEYS = ("thinker.model.embed_tokens.weight", "thinker.lm_head.weight")
@@ -130,49 +129,28 @@ def protocol_ids(tokenizer, tokens):
     return ids
 
 
-def compare_vocab_rows(reference, actual, target, *, skip_ids=(), rows_per_read=2048):
-    """Compare every requested row in bounded slices, including the final partial slice."""
+def compare_vocab_rows(reference, actual, target, *, rows_per_read=2048):
+    """Check every trained row after export's dtype conversion, using bounded CPU slices."""
     import torch
     from safetensors import safe_open
 
-    row_count = reference["shape"][0]
-    if actual["shape"][0] < row_count or actual["shape"][1:] != reference["shape"][1:]:
+    if actual["shape"] != reference["shape"]:
         raise ValueError(f"Vocabulary shape mismatch for {target}")
-    skips = sorted({row for row in skip_ids if 0 <= row < row_count})
+    row_count = reference["shape"][0]
     with safe_open(reference["file"], framework="pt", device="cpu") as src, \
             safe_open(actual["file"], framework="pt", device="cpu") as dst:
         original = src.get_slice(reference["key"])
         result = dst.get_slice(actual["key"])
-        first = 0
-        for stop in [*skips, row_count]:
-            for start in range(first, stop, rows_per_read):
-                end = min(stop, start + rows_per_read)
-                values = result[start:end]
-                if not torch.equal(original[start:end].to(values.dtype), values):
-                    raise ValueError(f"Vocabulary rows differ for {target} in [{start}, {end})")
-            first = stop + 1
+        for start in range(0, row_count, rows_per_read):
+            end = min(start + rows_per_read, row_count)
+            values = result[start:end]
+            if not values.is_floating_point() or not torch.isfinite(values).all():
+                raise ValueError(f"Invalid vocabulary weights for {target} in [{start}, {end})")
+            if not torch.equal(original[start:end].to(values.dtype), values):
+                raise ValueError(f"Vocabulary rows differ for {target} in [{start}, {end})")
 
 
-def action_rows_changed(reference, saved, token_ids):
-    """Report missing source rows as None when training expanded the base vocabulary."""
-    import torch
-    from safetensors import safe_open
-
-    changes = {}
-    with safe_open(reference["file"], framework="pt", device="cpu") as src, \
-            safe_open(saved["file"], framework="pt", device="cpu") as dst:
-        original = src.get_slice(reference["key"])
-        trained = dst.get_slice(saved["key"])
-        for token, index in token_ids.items():
-            value = trained[index:index + 1]
-            if not torch.isfinite(value).all():
-                raise ValueError(f"Nonfinite trained row for {token} in {saved['key']}")
-            changes[token] = (not torch.equal(original[index:index + 1].to(value.dtype), value)
-                              if index < reference["shape"][0] else None)
-    return changes
-
-
-def preflight(base, adapter, tokens_file, *, require_action_rows=False):
+def preflight(base, adapter, tokens_file):
     with diagnostic_stage("Import transformers.AutoTokenizer (may initialize PyTorch)"):
         from transformers import AutoTokenizer
 
@@ -197,7 +175,18 @@ def preflight(base, adapter, tokens_file, *, require_action_rows=False):
     with diagnostic_stage("Reconstruct and validate the full training token inventory"):
         tokenizer.add_special_tokens({"additional_special_tokens": tokens})
         ids = protocol_ids(tokenizer, tokens)
-        action_rows = read_action_rows_manifest(adapter, ids, required=require_action_rows)
+        # Older Fourth checkpoints also contain both dense tables. If their token-ID
+        # sidecar is available it must identify the same tokenizer rows.
+        legacy_manifest = adapter / "omnicommit_action_rows.json"
+        if legacy_manifest.is_file():
+            legacy = read_json(legacy_manifest)
+            if legacy.get("schema_version") != 1 or legacy.get("token_ids") != ids:
+                raise ValueError("Legacy checkpoint token IDs disagree with the training inventory")
+        vocabulary = tokenizer.get_vocab()
+        if any((adapter / name).is_file() for name in ("tokenizer.json", "vocab.json")):
+            training_tokenizer = AutoTokenizer.from_pretrained(str(adapter), local_files_only=True, trust_remote_code=False)
+            if training_tokenizer.get_vocab() != vocabulary or protocol_ids(training_tokenizer, tokens) != ids:
+                raise ValueError("Checkpoint tokenizer differs from the base plus training tokens")
     base_weights = weight_inventory(base, "model")
     adapter_weights = weight_inventory(adapter, "adapter_model")
     if not any("lora_A" in key for key in adapter_weights) or not any("lora_B" in key for key in adapter_weights):
@@ -206,7 +195,6 @@ def preflight(base, adapter, tokens_file, *, require_action_rows=False):
     if expected_vocab < len(tokenizer):
         expected_vocab = ((len(tokenizer) + 127) // 128) * 128
     modules = {}
-    changed = {}
     for target in VOCAB_KEYS:
         if target not in base_weights:
             raise ValueError(f"Original base is missing {target}")
@@ -219,16 +207,10 @@ def preflight(base, adapter, tokens_file, *, require_action_rows=False):
         if max(ids.values()) >= shape[0]:
             raise ValueError(f"Protocol IDs do not fit saved module {key}")
         modules[target] = {"key": key, **adapter_weights[key]}
-        if action_rows:
-            with diagnostic_stage(f"Compare frozen base vocabulary with saved adapter: {target}"):
-                base_tensor = {"key": target, **base_weights[target]}
-                compare_vocab_rows(base_tensor, modules[target], target, skip_ids=ids.values())
-                changed[target] = action_rows_changed(base_tensor, modules[target], ids)
     return {"tokens": tokens, "manifest_metadata": manifest_metadata,
             "protocol_token_ids": ids, "tokenizer_length": len(tokenizer),
             "expected_vocab_size": expected_vocab, "saved_modules": modules,
-            "action_rows": action_rows,
-            "action_rows_changed_from_base": changed,
+            "vocabulary": vocabulary,
             "base_tensor_shapes": {key: value["shape"] for key, value in base_weights.items()},
             "training_base_recorded": training_args.get("model"),
             "training_args_tokens_verified": True}
@@ -236,18 +218,18 @@ def preflight(base, adapter, tokens_file, *, require_action_rows=False):
 
 def verify_export(output, expected):
     with diagnostic_stage("Import export verification dependencies"):
-        import torch
-        from safetensors import safe_open
         from transformers import AutoProcessor, AutoTokenizer
 
     with diagnostic_stage(f"Load exported tokenizer: {output}"):
         tokenizer = AutoTokenizer.from_pretrained(str(output), local_files_only=True, trust_remote_code=False)
-    if protocol_ids(tokenizer, expected["tokens"]) != expected["protocol_token_ids"] or len(tokenizer) != expected["tokenizer_length"]:
+    if (protocol_ids(tokenizer, expected["tokens"]) != expected["protocol_token_ids"]
+            or tokenizer.get_vocab() != expected["vocabulary"]):
         raise ValueError("Exported tokenizer differs from the expected training protocol tokenizer")
     with diagnostic_stage(f"Load exported processor: {output}"):
         processor = AutoProcessor.from_pretrained(str(output), local_files_only=True, trust_remote_code=False)
-    if protocol_ids(processor.tokenizer, expected["tokens"]) != expected["protocol_token_ids"]:
-        raise ValueError("Exported processor tokenizer protocol mismatch")
+    if (protocol_ids(processor.tokenizer, expected["tokens"]) != expected["protocol_token_ids"]
+            or processor.tokenizer.get_vocab() != expected["vocabulary"]):
+        raise ValueError("Exported processor tokenizer vocabulary mismatch")
     config = read_json(output / "config.json")
     if config.get("model_type") != "qwen3_omni_moe":
         raise ValueError("Unexpected exported model_type")
@@ -267,23 +249,12 @@ def verify_export(output, expected):
     checked = []
     for target, saved in expected["saved_modules"].items():
         exported = inventory[target]
-        with diagnostic_stage(f"Compare trained protocol rows: {target}"):
-            with safe_open(saved["file"], framework="pt", device="cpu") as src, \
-                    safe_open(exported["file"], framework="pt", device="cpu") as dst:
-                for token_id in expected["protocol_token_ids"].values():
-                    actual = dst.get_slice(target)[token_id:token_id + 1]
-                    reference = src.get_slice(saved["key"])[token_id:token_id + 1].to(actual.dtype)
-                    if not torch.isfinite(actual).all() or not torch.equal(reference, actual):
-                        raise ValueError(f"Saved protocol row was not preserved: {target}, token_id={token_id}")
+        with diagnostic_stage(f"Compare all trained input/output vocabulary rows: {target}"):
+            compare_vocab_rows(saved, {"key": target, **exported}, target)
         checked.append(target)
-        if expected.get("action_rows"):
-            with diagnostic_stage(f"Verify entire vocabulary in merged model: {target}"):
-                compare_vocab_rows(saved, {"key": target, **exported}, target)
     return {"protocol_token_ids": expected["protocol_token_ids"], "tokenizer_length": len(tokenizer),
             "vocab_size": expected["expected_vocab_size"], "tensor_count": len(inventory),
-            "trained_protocol_rows_preserved_in": checked, "processor_load_verified": True,
-            "frozen_base_rows_verified": bool(expected.get("action_rows")),
-            "action_rows_changed_from_base": expected["action_rows_changed_from_base"],
+            "full_vocabulary_verified_in": checked, "processor_load_verified": True,
             "inference_verified": False}
 
 
@@ -308,8 +279,6 @@ def main(argv=None):
     parser.add_argument("--device-map", choices=("auto", "cpu"), default="auto")
     parser.add_argument("--special-tokens", type=Path, required=True, help="Exact dataset-generated inventory used in SFT; preserve its order")
     parser.add_argument("--check-only", action="store_true", help="Check inputs, tokens and shapes without loading full weights")
-    parser.add_argument("--require-action-rows", action="store_true",
-                        help="Require a marked row-trained checkpoint and verify its frozen rows against the HF base")
     args = parser.parse_args(argv)
     staging = None
     try:
@@ -331,11 +300,9 @@ def main(argv=None):
         if version not in {"3.12.1", "4.1.3"}:
             print("[merge] NOTE: this recipe was source-audited for ms-swift 3.12.1 and 4.1.3.", flush=True)
         print("[merge] Checking local HF base, adapter tensors and protocol tokens...", flush=True)
-        expected = preflight(args.base, args.adapter, args.special_tokens, require_action_rows=args.require_action_rows)
+        expected = preflight(args.base, args.adapter, args.special_tokens)
         print(json.dumps({"input_checks_passed": True, "protocol_token_ids": expected["protocol_token_ids"],
                           "vocab_size": expected["expected_vocab_size"],
-                          "frozen_base_rows_verified": bool(expected["action_rows"]),
-                          "action_rows_changed_from_base": expected["action_rows_changed_from_base"],
                           "training_base_recorded": expected["training_base_recorded"]}, ensure_ascii=False), flush=True)
         if args.check_only:
             print("[merge] Check-only complete; no model was merged or written.", flush=True)
@@ -350,7 +317,7 @@ def main(argv=None):
         for key in ("RANK", "LOCAL_RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE", "NPROC_PER_NODE", "NNODES"):
             child_env.pop(key, None)
         subprocess.run(command, env=child_env, check=True)
-        print("[merge] Export finished; verifying saved full weights and trained protocol rows...", flush=True)
+        print("[merge] Export finished; verifying the full trained input and output vocabulary tables...", flush=True)
         verified = verify_export(staging, expected)
         report = {"created_utc": datetime.now(timezone.utc).isoformat(), "base": str(args.base),
                   "adapter": str(args.adapter), "output": str(args.output), "ms_swift": version,

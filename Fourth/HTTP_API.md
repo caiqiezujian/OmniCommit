@@ -1,6 +1,8 @@
 # Fourth 会议转录 HTTP 接口
 
-每次发送一包音频，服务处理完就返回 **HTTP 200** 和一个字符串字段 `src`。它只包含本包新提交的转录。调用方按顺序把每次的 `src` 追加到会议记录，空字符串可以直接略过。
+每次发送一包音频，服务处理完就返回 **HTTP 200** 和一个字符串字段 `src`。调用方按顺序把每包新提交的纯正文追加到会议记录，空字符串可以直接略过。
+
+Fourth 在模型历史和逐轮日志的 `text` 中保留 `<|SPK_CHANGE|>`。需要换人位置的 HTTP 客户端可在当前请求完成后、发送下一包之前读取 `GET /v1/meetings/{meeting_id}/result`，其中 `turns[].transcript_parts` 给出每段的 `text` 和布尔值 `speaker_change`。WebSocket 的 `result` 事件也包含 `transcript_parts`，网页据此在换人处另起一段。
 
 ## 上传音频
 
@@ -52,13 +54,13 @@ curl -fsS -X POST http://127.0.0.1:18892/v1/meetings/demo-001/end
 
 ## 部署
 
-在现有 Fourth 的 vLLM 0.11.1 推理环境中启动。将模型路径换成实际合并的 Fourth HF 模型目录，选择一张显存足够的 GPU。
+在现有 Fourth 的 vLLM 0.11.1 推理环境中，选择一张显存足够的 GPU。将模型路径换成此次训练合并出的完整 HF 模型目录，网页和 HTTP 都从该目录读取模型权重与 tokenizer。`--protocol speaker` 在加载权重前核对导出清单，健康检查中的 `action_protocol` 应为 `speaker`。
 
 ~~~bash
 cd /data/yb/Code/OmniCommit
 CUDA_VISIBLE_DEVICES=0 bash Fourth/start_http.sh \
-  /data/yb/Code/OmniCommit/models/fourth-actionrows-merged \
-  --port 18892 --chunk-ms 1000
+  /data/yb/Code/OmniCommit/models/fourth-speaker-full-merged \
+  --protocol speaker --port 18892 --chunk-ms 1000
 ~~~
 
 ~~~bash
@@ -80,7 +82,7 @@ if response.status_code == 409:
     print(response.headers.get("X-Request-ID"), response.text)
 ~~~
 
-服务默认将请求日志按 JSONL 追加到仓库下的 `Fourth/logs/http-requests.jsonl`。可在启动命令中加 `--request-log /data/logs/third-http.jsonl` 指定位置。启动时会打印实际路径，目录无法写入时改写到标准错误。每条记录使用 UTC 时间，文件达到 20 MiB 后轮转，最多保留 5 个历史文件。日志中的转录统计使用字符数，会议音频和转录正文留在原有的数据通路中。
+服务默认将请求日志按 JSONL 追加到仓库下的 `Fourth/logs/http-requests.jsonl`。可在启动命令中加 `--request-log /data/logs/fourth-http.jsonl` 指定位置。启动时会打印实际路径，目录无法写入时改写到标准错误。每条记录使用 UTC 时间，文件达到 20 MiB 后轮转，最多保留 5 个历史文件。日志中的转录统计使用字符数，会议音频和转录正文留在原有的数据通路中。
 
 在仓库根目录执行以下命令，按会议或请求查询。较早的记录也可能在同目录的 `.1` 至 `.5` 文件中。
 
@@ -102,8 +104,8 @@ jq -c --arg r '替换为请求ID' \
 ~~~bash
 cd /data/yb/Code/OmniCommit
 CUDA_VISIBLE_DEVICES=0 bash Fourth/start_http.sh \
-  /data/yb/Code/OmniCommit/models/fourth-actionrows-merged \
-  --port 18892 --chunk-ms 1000 \
+  /data/yb/Code/OmniCommit/models/fourth-speaker-full-merged \
+  --protocol speaker --port 18892 --chunk-ms 1000 \
   --debug-dir /data/yb/Code/OmniCommit/Fourth/logs/http-debug
 ~~~
 

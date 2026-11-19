@@ -44,6 +44,7 @@ video { display: block; width: 100%; max-height: 300px; background: #111; border
 .metric { background: #f4f7fc; padding: 10px 16px; border-radius: 8px; font-size: 13px; }
 .transcript { height: 460px; overflow: auto; border: 1px solid #e8edf4; border-radius: 10px; padding: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .segment { padding: 10px 8px; border-bottom: 1px solid #edf1f6; }
+.speaker-change::before { content: "换人"; display: inline-block; margin-right: .65em; font-size: .8em; color: #355a78; }
 details { margin-top: 16px; }
 summary { cursor: pointer; }
 pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 250px; overflow: auto; font-size: 12px; }

@@ -289,7 +289,7 @@ def create_app(backend_factory, options, *, max_meetings=16, max_in_flight=8,
         nonlocal backend, executor
         backend = await asyncio.to_thread(backend_factory)
         executor = ThreadPoolExecutor(max_workers=min(max_meetings, max_in_flight),
-                                      thread_name_prefix="third-meeting")
+                                      thread_name_prefix="fourth-meeting")
         cleaner = asyncio.create_task(cleanup_loop())
         try:
             yield
@@ -313,7 +313,7 @@ def create_app(backend_factory, options, *, max_meetings=16, max_in_flight=8,
 
     @app.get("/health")
     async def health():
-        return {"ready": backend is not None, "service": "third_http",
+        return {"ready": backend is not None, "service": "fourth_http",
                 "backend": getattr(backend, "backend_name", type(backend).__name__),
                 "max_new_tokens": getattr(backend, "max_new_tokens", None),
                 "max_context_tokens": getattr(backend, "max_context_tokens", None),

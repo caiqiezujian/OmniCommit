@@ -4,6 +4,7 @@ const selected = () => document.querySelector("input[name=source]:checked").valu
 const player = $("player");
 let health, running, mediaURL;
 let transcript = [];
+let currentParagraph = null;
 let gapCount = 0;
 const turnLog = new MeetingTurnLog($, download);
 
@@ -39,8 +40,8 @@ function download(name, type, value) {
   a.click();
   setTimeout(() => URL.revokeObjectURL(url), 3000);
 }
-$("saveText").onclick = () => download("third.txt", "text/plain;charset=utf-8", transcript.join("\n"));
-$("saveLog").onclick = () => download("third.jsonl", "application/x-ndjson", turnLog.current.model.map(e => JSON.stringify(e) + "\n").join(""));
+$("saveText").onclick = () => download("fourth.txt", "text/plain;charset=utf-8", transcript.join(""));
+$("saveLog").onclick = () => download("fourth.jsonl", "application/x-ndjson", turnLog.current.model.map(e => JSON.stringify(e) + "\n").join(""));
 
 function showResult(result) {
   if (result.type !== "result") return;
@@ -50,18 +51,25 @@ function showResult(result) {
     gapCount++;
     $("gapNotice").textContent = "本场有 " + gapCount + " 条转录缺口记录。最近一次：" + message + "。";
     $("gapNotice").hidden = false;
+    if (transcript.length) transcript.push("\n");
     transcript.push("[" + message + "]");
+    currentParagraph = null;
     $("saveText").disabled = false;
   }
   if (result.action === "DIRECT") {
-    const text = result.display_text;
     const box = $("words");
     const follow = box.scrollHeight - box.scrollTop - box.clientHeight < 32;
-    const row = document.createElement("div");
-    row.className = "segment";
-    row.textContent = text;
-    box.append(row);
-    transcript.push(text);
+    for (const part of result.transcript_parts || [{text: result.display_text}]) {
+      if (!currentParagraph || part.speaker_change) {
+        if (transcript.length) transcript.push("\n");
+        currentParagraph = document.createElement("div");
+        currentParagraph.className = part.speaker_change ? "segment speaker-change" : "segment";
+        if (part.speaker_change) currentParagraph.setAttribute("aria-label", "换人");
+        box.append(currentParagraph);
+      }
+      currentParagraph.append(document.createTextNode(part.text));
+      transcript.push(part.text);
+    }
     if (follow) box.scrollTop = box.scrollHeight;
     $("saveText").disabled = false;
   }
@@ -156,12 +164,12 @@ async function openCapture(state) {
   state.context = new AudioContext({sampleRate: 16000});
   await state.context.suspend();
   if (state.context.sampleRate !== 16000) throw Error("浏览器未提供所需的 16 kHz 采样率。");
-  await state.context.audioWorklet.addModule("/web/meeting-v2/capture.js");
+  await state.context.audioWorklet.addModule("/web/meeting-v2/capture.js?v=speaker1");
 }
 
 async function streamLive(state, channel, ready) {
   const ac = state.context;
-  const node = state.node = new AudioWorkletNode(ac, "third-capture", {
+  const node = state.node = new AudioWorkletNode(ac, "fourth-capture", {
     processorOptions: {samples: Math.round(16000 * ready.chunk_seconds)}
   });
   node.port.onmessage = e => {
@@ -332,7 +340,7 @@ $("start").onclick = async () => {
     } else await openCapture(state);
     let logStarted = false;
     const channel = state.channel = new Channel(error => state.queue.fail(error), row => {
-      if (row.type === "ready" && row.protocol === "third") {
+      if (row.type === "ready" && row.protocol === "fourth") {
         turnLog.start(state.kind, state.kind === "file" ? $("file").files[0].name : "");
         logStarted = true;
       }
@@ -343,7 +351,7 @@ $("start").onclick = async () => {
       type: "start", sample_rate: 16000, source_kind: state.kind, media_id: upload?.media_id,
       ...windowOptions, ...range
     });
-    if (ready.type !== "ready" || ready.protocol !== "third") throw Error("服务未加载 Third 协议");
+    if (ready.type !== "ready" || ready.protocol !== "fourth") throw Error("服务未加载 Fourth 协议");
     if (upload) {
       const start = ready.file_start_seconds, end = ready.file_end_seconds;
       const tolerance = 1 / upload.sample_rate;
@@ -358,6 +366,7 @@ $("start").onclick = async () => {
       throw Error("服务端未确认所选窗口，请核对 Fourth 服务版本并重新开始。");
     }
     transcript = [];
+    currentParagraph = null;
     gapCount = 0;
     $("gapNotice").hidden = true;
     $("words").replaceChildren();
@@ -382,11 +391,11 @@ $("start").onclick = async () => {
 };
 
 fetch("/health", {cache: "no-store"}).then(r => r.json()).then(info => {
-  if (!info.ready || info.protocol !== "third") throw Error("Fourth 服务尚未就绪");
+  if (!info.ready || info.protocol !== "fourth") throw Error("Fourth 服务尚未就绪");
   if (!$("windowSettings") || !$("gapNotice") || !$("fileStart") || !$("fileEnd")) {
     // Older HTML may still load this script through its unversioned URL.
-    if (location.search === "?ui=range1") throw Error("服务仍返回旧版页面，请确认 Fourth 已更新并刷新。");
-    location.replace("/?ui=range1");
+    if (location.search === "?ui=speaker1") throw Error("服务仍返回旧版页面，请确认 Fourth 已更新并刷新。");
+    location.replace("/?ui=speaker1");
     return;
   }
   const hasWindow = info.context_policy === "window";
@@ -402,7 +411,7 @@ fetch("/health", {cache: "no-store"}).then(r => r.json()).then(info => {
     $("windowSeconds").disabled = $("discardSeconds").disabled = false;
   }
   health = info;
-  $("health").textContent = [info.backend, info.action_protocol === "explicit" ? "显式动作" : "纯正文",
+  $("health").textContent = [info.backend, info.action_protocol === "speaker" ? "说话人切换" : info.action_protocol === "explicit" ? "显式动作" : "纯正文",
     info.gap_recovery ? "有声等待补识别已开启" : "补识别已关闭",
     ...(hasWindow ? [] : ["当前策略 " + (info.context_policy || "未知") + "，此会话不支持自选窗口"])].join(" · ");
   $("step").textContent = Math.round(info.chunk_seconds * 1000) + " ms";

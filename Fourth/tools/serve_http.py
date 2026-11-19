@@ -27,7 +27,7 @@ def main(argv=None):
     parser.add_argument("--chunk-ms", type=int, default=1000, help="Model audio step in milliseconds (default: 1000)")
     parser.add_argument("--window-seconds", type=float, default=FourthStreamOptions.window_seconds)
     parser.add_argument("--discard-seconds", type=float, default=FourthStreamOptions.discard_seconds)
-    parser.add_argument("--protocol", choices=("auto", "plain", "explicit"), default="auto")
+    parser.add_argument("--protocol", choices=("auto", "speaker", "plain", "explicit"), default="auto")
     parser.add_argument("--recovery", action=argparse.BooleanOptionalAction, default=False,
                         help="Run the optional second decode on voiced WAITs of explicit checkpoints")
     parser.add_argument("--max-meetings", type=int, default=16,
@@ -68,8 +68,8 @@ def main(argv=None):
                 parser.error(f"Checkpoint uses {trained!r}, incompatible with --protocol {args.protocol}")
             args.protocol = trained
         elif args.protocol == "auto":
-            args.protocol = "explicit"
-        args.enable_recovery = args.protocol == "explicit" and args.recovery
+            args.protocol = "speaker"
+        args.enable_recovery = args.protocol in ("speaker", "explicit") and args.recovery
         options = runtime_options(args, FourthStreamOptions)
         if args.enable_recovery:
             from fourth_asr.recovery import check_recovery_dependencies

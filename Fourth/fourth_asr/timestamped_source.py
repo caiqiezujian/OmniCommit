@@ -21,6 +21,13 @@ class Unit:
     start_ms: float
     end_ms: float
     spans: tuple[tuple[str, str, str], ...]
+    # Only populated from validated child annotations, never interpolated.
+    children: tuple[Unit, ...] = ()
+    phrase_end: bool = False
+
+    @property
+    def text(self):
+        return "".join(text for _, _, text in self.spans)
 
 
 def _characters(text, initial=(None, None)):
@@ -63,7 +70,8 @@ def _characters(text, initial=(None, None)):
     return chars
 
 
-def _reference(record):
+def reference_text(record):
+    """Return the marked reference, retaining repeated semantic headers."""
     messages = record.get("messages")
     if not isinstance(messages, list):
         raise ValueError("missing messages array")
@@ -73,15 +81,22 @@ def _reference(record):
     content = answers[0]["content"]
     original = answers[0].get("content_original")
     if original == content:
-        return _characters(content)
+        return content
     clean = HEADER_TIME.sub("", content)
     if original is not None and clean != original:
         raise ValueError("content_original disagrees with the marked transcript")
-    return _characters(clean)
+    return clean
 
 
 def _finite_number(value):
     return type(value) is int or (type(value) is float and math.isfinite(value))
+
+
+def reference_spans(record):
+    """Ordered reference states and exact transcript, independent of release units."""
+    chars = _characters(reference_text(record))
+    return tuple((lang, speaker, "".join(ch for _, _, ch in group))
+                 for (lang, speaker), group in groupby(chars, key=lambda c: c[:2]))
 
 
 def _interval(item, lower, upper, context):
@@ -131,7 +146,8 @@ def _checked_spans(spans, chars, begin, end, context):
         if not isinstance(span, dict):
             raise ValueError(f"{context} has an invalid timed span")
         bounds = _interval(span, begin, end, f"{context} span")
-        if bounds[0] < previous[0] or bounds[1] < previous[1]:
+        # A short interjection may end before the speaker it overlaps.
+        if bounds[0] < previous[0]:
             raise ValueError(f"{context} spans are out of chronological order")
         previous = bounds
         raw = span.get("text_plain", span.get("text"))
@@ -159,7 +175,7 @@ def parse_record(record, duration_ms, *, release_on="semantic-unit"):
     audios = record.get("audios")
     if not isinstance(audios, list) or len(audios) != 1 or not isinstance(audios[0], str) or not audios[0].strip():
         raise ValueError("exactly one source audio path is required")
-    reference = _reference(record)
+    reference = _characters(reference_text(record))
     annotation = record.get("output")
     if isinstance(annotation, str):
         annotation = json.loads(annotation)
@@ -191,7 +207,7 @@ def parse_record(record, duration_ms, *, release_on="semantic-unit"):
         chars = reference[offset:offset + len(plain)]
         _check_text(raw, chars, context)
         begin, end = _interval(timestamp, 0, duration_ms, context)
-        if begin < previous[0] or end < previous[1]:
+        if begin < previous[0]:
             raise ValueError(f"{context} is out of chronological order")
         _check_metadata(timestamp, chars, f"{context} timestamp")
         parts = []
@@ -201,10 +217,10 @@ def parse_record(record, duration_ms, *, release_on="semantic-unit"):
         if release_on == "semantic-unit" or not parts or any(not p.spans[0][2].strip() for p in parts):
             spans = tuple((language, speaker, "".join(ch for _, _, ch in group))
                           for (language, speaker), group in groupby(chars, key=lambda c: c[:2]))
-            parts = [Unit(begin, end, spans)]
-        # Parents and their children can each look monotonic while two children
-        # on opposite sides of an overlapping parent boundary run backwards.
-        if units and (parts[0].start_ms < units[-1].start_ms or parts[0].end_ms < units[-1].end_ms):
+            parts = [Unit(begin, end, spans, tuple(parts))]
+        # End times can regress for genuine overlap. Transcript order and
+        # monotonically increasing onsets still define a serial reference.
+        if units and parts[0].start_ms < units[-1].start_ms:
             raise ValueError(f"{context} release intervals are out of chronological order across segments")
         units.extend(parts)
         offset += len(plain)

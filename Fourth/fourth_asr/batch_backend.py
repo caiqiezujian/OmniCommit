@@ -26,7 +26,7 @@ class BatchBackend:
         self._largest_batch = 0
         ready = Future()
         self._thread = threading.Thread(target=self._run, args=(backend_factory, ready),
-                                        name="third-http-model", daemon=True)
+                                        name="fourth-http-model", daemon=True)
         self._thread.start()
         ready.result()
 

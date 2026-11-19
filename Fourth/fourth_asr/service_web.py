@@ -42,7 +42,7 @@ def annotate_file_result(row, cursor, source_start, source_end):
 def create_app(backend_factory, options, *, max_sessions=1, auto_reference_factory=None,
                max_window_seconds=None):
     if auto_reference_factory is not None:
-        raise ValueError("Fourth transcribes plain text; speaker references are unsupported")
+        raise ValueError("Fourth reports speaker changes without identity references")
     from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
     from fastapi.responses import FileResponse, JSONResponse
     from fastapi.staticfiles import StaticFiles
@@ -54,7 +54,7 @@ def create_app(backend_factory, options, *, max_sessions=1, auto_reference_facto
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="omnicommit-model")
     active = set()
     backend = None
-    recovery = options.protocol == "explicit" and options.enable_recovery
+    recovery = options.protocol in ("explicit", "speaker") and options.enable_recovery
     protocol_settings = {"action_protocol": options.protocol, "gap_recovery": recovery,
                          "gap_asr": "omni" if recovery else "disabled",
                          "recovery_voiced_seconds": options.recovery_voiced_seconds}
@@ -103,7 +103,7 @@ def create_app(backend_factory, options, *, max_sessions=1, auto_reference_facto
 
     @app.get("/health")
     async def health():
-        return JSONResponse({"ready": backend is not None, "protocol": "third", "active_sessions": len(active),
+        return JSONResponse({"ready": backend is not None, "protocol": "fourth", "active_sessions": len(active),
                 "max_sessions": max_sessions, "chunk_seconds": options.chunk_seconds,
                 "context_policy": options.context_policy,
                 "backend": type(backend).__name__ if backend else None,
@@ -193,7 +193,7 @@ def create_app(backend_factory, options, *, max_sessions=1, auto_reference_facto
             session = FourthStreamSession(backend, selected)
             active.add(session)
             admitted = True
-            await websocket.send_json({"type": "ready", "protocol": "third",
+            await websocket.send_json({"type": "ready", "protocol": "fourth",
                 "chunk_seconds": options.chunk_seconds,
                 **({"file_start_seconds": cursor.start_seconds, "file_end_seconds": cursor.end_seconds}
                    if cursor is not None else {}),
@@ -259,7 +259,7 @@ def create_app(backend_factory, options, *, max_sessions=1, auto_reference_facto
                         try:
                             op = event.get("op")
                             if op != "commit" or options.context_policy == "window":
-                                raise ValueError(f"Unsupported control for third: {op}")
+                                raise ValueError(f"Unsupported control for fourth: {op}")
                             session.verify_commit(event["through_seconds"], verified=event.get("verified", False))
                             snapshot = {"segments": [], "speakers": [], "aliases": {}, "reference_evidence": {}}
                         except Exception as exc:

@@ -12,6 +12,7 @@ class MeetingLogArchive {
   open() {
     if (this.connection) return this.connection;
     this.connection = new Promise((resolve, reject) => {
+      // Earlier Fourth releases used this database name. Preserve saved meeting logs.
       const request = indexedDB.open('omnicommit-third-meeting-logs', 1);
       let blocked = false;
       request.onupgradeneeded = () => {

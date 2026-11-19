@@ -37,7 +37,7 @@ def test_real_http_meetings_and_slo_counts(tmp_path, capsys, failure, wire_forma
 
         def do_GET(self):
             if self.path == "/health":
-                self.send_json(200, dict(ready=True, service="third_http", chunk_seconds=.01))
+                self.send_json(200, dict(ready=True, service="fourth_http", chunk_seconds=.01))
             else:
                 polls.append(self.path)
                 self.send_json(404, dict(error="unexpected path"))

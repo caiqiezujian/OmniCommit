@@ -75,7 +75,7 @@ def test_recast_then_decode_third_training_row(deployed, tmp_path, registry, qwe
     assert result["checked_rows"] == 1 and result["decoded"] and result["framework_checked"]
     row = json.loads(train.read_text(encoding="utf-8"))
     assert [msg["content"] for msg in row["messages"] if msg["role"] == "assistant"] == [
-        "<|WAIT|>", "<|DIRECT|>你好。Hello.", "<|WAIT|>",
+        "<|WAIT|>", "<|DIRECT|>你好。<|SPK_CHANGE|>Hello.", "<|WAIT|>",
     ]
 
 
@@ -99,7 +99,7 @@ def test_web_from_standalone_cli(deployed, tmp_path):
 
         def visit(app, **kwargs):
             with TestClient(app) as client:
-                assert client.get("/health").json()["action_protocol"] == "explicit"
+                assert client.get("/health").json()["action_protocol"] == "speaker"
                 page = client.get("/")
                 assert page.status_code == 200
                 assert "no-store" in page.headers["cache-control"]
@@ -124,7 +124,7 @@ def test_web_from_standalone_cli(deployed, tmp_path):
                 assert f'location.replace("{canonical}")' in legacy_app.text
                 with client.websocket_connect("/stream") as ws:
                     ws.send_json({"type": "start", "sample_rate": 16000, "source_kind": "microphone"})
-                    assert ws.receive_json()["protocol"] == "third"
+                    assert ws.receive_json()["protocol"] == "fourth"
                     ws.send_bytes(bytes(32000))
                     assert ws.receive_json()["text"] == "<|DIRECT|>Hello."
                     ws.send_json({"type": "end"})

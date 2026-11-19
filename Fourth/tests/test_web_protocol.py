@@ -10,13 +10,13 @@ import pytest
 FOURTH = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(FOURTH))
 from fourth_asr.runtime.streaming import ReplayBackend
-from fourth_asr.protocol import DIRECT, WAIT, get_protocol
+from fourth_asr.protocol import DIRECT, SPK_CHANGE, WAIT, get_protocol
 from fourth_asr.service_backend import read_export_protocol
 from fourth_asr.service_session import FourthStreamOptions
 from fourth_asr.service_web import create_app
 
 
-@pytest.mark.parametrize("mode", ["explicit", "plain"])
+@pytest.mark.parametrize("mode", ["explicit", "plain", "speaker"])
 def test_cli_selects_checkpoint_protocol_before_model_load(tmp_path, monkeypatch, mode):
     inventory = tmp_path / "tokens.txt"
     inventory.write_text("\n".join(get_protocol(mode).tokens), encoding="utf8")
@@ -28,10 +28,10 @@ def test_cli_selects_checkpoint_protocol_before_model_load(tmp_path, monkeypatch
     monkeypatch.setattr("fourth_asr.recovery.check_recovery_dependencies", lambda: None)
     main(["--model", str(tmp_path)])
     assert captured[0].protocol == mode
-    assert captured[0].enable_recovery == (mode == "explicit")
+    assert captured[0].enable_recovery == (mode != "plain")
     main(["--model", str(tmp_path), "--no-recovery"])
     assert not captured[1].enable_recovery
-    other = "plain" if mode == "explicit" else "explicit"
+    other = "explicit" if mode == "plain" else "plain"
     with pytest.raises(SystemExit):
         main(["--model", str(tmp_path), "--protocol", other])
 
@@ -47,7 +47,7 @@ def test_websocket_silence_then_voiced_wait_recovery():
     tone = np.rint(tone * 32768).astype("<i2").tobytes()
     # Script primary replies for each packet, the shadow candidate, then EOS.
     backend = ReplayBackend([DIRECT + "你好。", WAIT, WAIT, WAIT, WAIT, DIRECT + " Guten Morgen.", WAIT])
-    app = create_app(lambda: backend, FourthStreamOptions(protocol="explicit"))
+    app = create_app(lambda: backend, FourthStreamOptions(protocol="explicit", chunk_seconds=.8, enable_recovery=True))
     with TestClient(app) as client:
         health = client.get("/health").json()
         assert health["action_protocol"] == "explicit" and health["gap_recovery"]
@@ -68,6 +68,25 @@ def test_websocket_silence_then_voiced_wait_recovery():
             assert final["text"] == WAIT and final["display_text"] == "" and "recovery" not in final
 
 
+def test_websocket_speaker_crossings_across_wait_and_within_one_reply():
+    from fastapi.testclient import TestClient
+    raw = DIRECT + SPK_CHANGE + "Yes." + SPK_CHANGE + "继续。"
+    backend = ReplayBackend([DIRECT + "问题？", WAIT, raw, WAIT])
+    options = FourthStreamOptions(enable_recovery=False)
+    with TestClient(create_app(lambda: backend, options)) as client, client.websocket_connect("/stream") as ws:
+        ws.send_json({"type": "start", "sample_rate": 16000})
+        ready = ws.receive_json()
+        assert (ready["protocol"], ready["action_protocol"], ready["chunk_seconds"]) == ("fourth", "speaker", 1)
+        for _ in range(3):
+            ws.send_bytes(bytes(32000))
+            row = ws.receive_json()
+        assert row["text"] == raw and row["display_text"] == "Yes.继续。"
+        assert row["transcript_parts"] == [{"text": "Yes.", "speaker_change": True},
+                                           {"text": "继续。", "speaker_change": True}]
+        ws.send_json({"type": "end"})
+        assert ws.receive_json()["transcript_parts"] == []
+
+
 def test_vllm_reserves_slots_for_page_choices(monkeypatch):
     main = runpy.run_path(str(FOURTH / "tools/serve_web.py"))["main"]
     monkeypatch.setitem(main.__globals__, "detect_model_protocol", lambda model: "plain")
@@ -80,14 +99,14 @@ def test_vllm_reserves_slots_for_page_choices(monkeypatch):
     main(["--model", "checkpoint"])
     main(["--model", "checkpoint", "--window-seconds", "75", "--discard-seconds", "45",
           "--max-window-seconds", "150", "--chunk-ms", "1000"])
-    assert calls == [(60, 50, 120, 150), (75, 45, 150, 150)]
+    assert calls == [(60, 50, 120, 120), (75, 45, 150, 150)]
     with pytest.raises(SystemExit):
         main(["--model", "checkpoint", "--max-window-seconds", "20"])
 
 
 def test_sessions_negotiate_independent_windows_and_apply_them_during_wait():
     from fastapi.testclient import TestClient
-    app = create_app(ReplayBackend, FourthStreamOptions(chunk_seconds=1), max_sessions=2)
+    app = create_app(ReplayBackend, FourthStreamOptions(enable_recovery=False, chunk_seconds=1), max_sessions=2)
     with TestClient(app) as client, client.websocket_connect("/stream") as mic, client.websocket_connect("/stream") as system:
         defaults = client.get("/health")
         assert defaults.headers["cache-control"] == "no-store"
@@ -113,7 +132,7 @@ def test_reject_invalid_or_over_capacity_window_before_decoding(window, discard)
     from fastapi.testclient import TestClient
     backend = ReplayBackend([])
     backend.max_audio_turns = 4
-    opts = FourthStreamOptions(chunk_seconds=1, window_seconds=4, discard_seconds=3)
+    opts = FourthStreamOptions(enable_recovery=False, chunk_seconds=1, window_seconds=4, discard_seconds=3)
     with TestClient(create_app(lambda: backend, opts)) as client, client.websocket_connect("/stream") as ws:
         assert client.get("/health").json()["max_window_seconds"] == 4
         ws.send_json(dict(type="start", sample_rate=16000, window_seconds=window, discard_seconds=discard))

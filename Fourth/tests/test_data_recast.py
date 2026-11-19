@@ -11,11 +11,11 @@ import pytest
 FOURTH = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(FOURTH))
 from fourth_asr.chunk_refs import decode_chunk_ref
-from fourth_asr.protocol import DIRECT, EOS, WAIT, get_protocol, parse_reply
+from fourth_asr.protocol import DIRECT, EOS, SPK_CHANGE, WAIT, get_protocol, parse_reply
 
 
-@pytest.mark.parametrize("mode", ["explicit", "plain"])
-def test_standalone_third_build_on_one_second_grid(tmp_path, mode):
+@pytest.mark.parametrize("mode", ["speaker", "explicit"])
+def test_standalone_fourth_build_on_one_second_grid(tmp_path, mode):
     # Deploy only Fourth, allowing both its location and its folder name to change.
     deployment = tmp_path / "standalone-asr"
     shutil.copytree(FOURTH / "Data-Scripts", deployment / "Data-Scripts")
@@ -40,20 +40,23 @@ def test_standalone_third_build_on_one_second_grid(tmp_path, mode):
     assert run.returncode == 0, run.stderr.decode(errors="replace")
     out = work / "output"
     train = json.loads((out / "train.1000ms.jsonl").read_text(encoding="utf-8"))
-    prefix = DIRECT if mode == "explicit" else ""
     assert len(train["audios"]) == 3
     turns = train["messages"]
     assert [m["content"] for m in turns if m["role"] == "assistant"] == [
-        WAIT, prefix + "好。See you", prefix + " tomorrow.", WAIT,
+        WAIT, DIRECT + "好。", DIRECT + SPK_CHANGE + "See you tomorrow.", WAIT,
     ]
     assert turns[-2] == {"role": "user", "content": EOS}
     tokens = (out / "train.1000ms.jsonl.tokens.txt").read_text().splitlines()
-    assert tokens == ([WAIT, DIRECT] if mode == "explicit" else [WAIT])
+    assert tokens == [WAIT, DIRECT, SPK_CHANGE]
+    assert (out / "token.txt").read_bytes() == (out / "train.1000ms.jsonl.tokens.txt").read_bytes()
+    assert train["recast"]["events"] == [{"turn": 2, "kind": "switch_deferred"},
+                                         {"turn": 3, "kind": "speaker_change"},
+                                         {"turn": 3, "kind": "audio_end"}]
+    assert train["recast"]["source_audio"] == str((work / "talk.wav").resolve())
 
 
 @pytest.mark.parametrize("mode", ["semantic-unit", "timed-span"])
-@pytest.mark.parametrize("protocol_name", ["plain", "explicit"])
-def test_third_preserves_intervals_and_text(tmp_path, mode, protocol_name):
+def test_fourth_preserves_intervals_and_text(tmp_path, mode):
     path = tmp_path / "switch.wav"
     with wave.open(str(path), "wb") as wav:
         wav.setparams((1, 2, 16000, 0, "NONE", ""))
@@ -74,7 +77,7 @@ def test_third_preserves_intervals_and_text(tmp_path, mode, protocol_name):
     source.write_text("invalid\n" + json.dumps(record) + "\n", encoding="utf-8")
     out = tmp_path / "training"
     cmd = [sys.executable, str(FOURTH / "Data-Scripts" / "build_sft.py"), str(source),
-           "--output-dir", str(out), "--release-on", mode, "--protocol", protocol_name]
+           "--output-dir", str(out), "--release-on", mode, "--chunk-ms", "800"]
     subprocess.run(cmd, check=True, capture_output=True)
     summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
     assert (summary["kept"], summary["rejected"], summary["chunk_ms"]) == (1, 1, [800])
@@ -84,14 +87,12 @@ def test_third_preserves_intervals_and_text(tmp_path, mode, protocol_name):
     assert all(Path(ref["path"]) == path for ref in refs)
     assert [ref["input_seconds"] for ref in refs] == pytest.approx([.8, .8, .76])
     prompts = row["messages"]
-    protocol = get_protocol(protocol_name)
+    protocol = get_protocol("speaker")
     assert prompts[0]["content"] == protocol.system_prompt("normalized")
-    assert summary["protocol"] == protocol_name
+    assert summary["protocol"] == "speaker"
     assert prompts[-2:] == [{"role": "user", "content": EOS}, {"role": "assistant", "content": WAIT}]
     replies = [m["content"] for m in prompts if m["role"] == "assistant"]
-    expected = ([WAIT, "发给你了。Let's"] if mode == "semantic-unit" else ["发给你了。", "Let's"])
-    assert replies == [text if text == WAIT or protocol_name == "plain" else DIRECT + text
-                       for text in [*expected, " meet tomorrow.", WAIT]]
+    assert replies == [DIRECT + "发给你了。", DIRECT + SPK_CHANGE + "Let's", DIRECT + " meet tomorrow.", WAIT]
     assert (out / "train.800ms.jsonl.tokens.txt").read_text().splitlines() == list(protocol.tokens)
 
 

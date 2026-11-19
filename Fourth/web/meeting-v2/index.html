@@ -3,12 +3,12 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="omnicommit-ui" content="third-meeting-v2">
+  <meta name="omnicommit-ui" content="fourth-meeting-v2">
   <title>OmniCommit Fourth · 实时会议转录</title>
-  <link rel="stylesheet" href="/web/meeting-v2/style.css?v=window1">
-  <script defer src="/web/meeting-v2/log-archive.js"></script>
-  <script defer src="/web/meeting-v2/turn-log.js?v=gaps1"></script>
-  <script type="module" src="/web/meeting-v2/app.js?v=range1"></script>
+  <link rel="stylesheet" href="/web/meeting-v2/style.css?v=speaker1">
+  <script defer src="/web/meeting-v2/log-archive.js?v=speaker1"></script>
+  <script defer src="/web/meeting-v2/turn-log.js?v=speaker1"></script>
+  <script type="module" src="/web/meeting-v2/app.js?v=speaker1"></script>
 </head>
 <body>
   <header><strong>OmniCommit Fourth</strong><span>多语种流式转录</span></header>
@@ -59,7 +59,7 @@
           <button id="saveText" disabled>导出 TXT</button>
           <button id="saveLog" disabled>导出 JSONL</button>
         </div>
-        <p class="hint">每轮提交的正文另起一行。等待和补识别记录可在逐轮日志里查看。</p>
+        <p class="hint">连续提交的正文接在同一段，换人时另起一段。原始模型输出可在逐轮日志里查看。</p>
         <p id="gapNotice" class="error" role="status" hidden></p>
         <div id="words" class="transcript" aria-label="已提交的转录正文" aria-live="polite"></div>
         <details id="logPanel" open>

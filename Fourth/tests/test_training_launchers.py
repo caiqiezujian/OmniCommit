@@ -29,8 +29,8 @@ def find_bash():
     ("train_sft.sh", "--max_epochs", "--save_interval"),
     ("train_sft_swift4.sh", "--num_train_epochs", "--save_steps"),
 ])
-@pytest.mark.parametrize("vocab_update", [None, "full"])
-def test_third_launch_from_isolated_deployment(tmp_path, launcher, epochs, save, vocab_update):
+@pytest.mark.parametrize("vocab_args", [[], ["--vocab-update", "full"], ["--vocab-update=full"]])
+def test_full_vocab_launch_from_isolated_deployment(tmp_path, launcher, epochs, save, vocab_args):
     bash = find_bash()
     work = tmp_path / "Fourth"
     scripts = work / "SFT-Scripts"
@@ -42,7 +42,7 @@ def test_third_launch_from_isolated_deployment(tmp_path, launcher, epochs, save,
     (work / "model").mkdir()
     (work / "model" / "config.json").write_text("{}", encoding="utf-8")
     (work / dataset).write_text("{}\n", encoding="utf-8")
-    (work / tokens).write_text("<|WAIT|>\n<|DIRECT|>\n", encoding="utf-8")
+    (work / tokens).write_text("<|WAIT|>\n<|DIRECT|>\n<|SPK_CHANGE|>\n", encoding="utf-8")
     mock_bin = work / "mock-bin"
     mock_bin.mkdir()
     for name in ("python3", "megatron"):
@@ -50,11 +50,9 @@ def test_third_launch_from_isolated_deployment(tmp_path, launcher, epochs, save,
         mock.write_bytes(b'''#!/usr/bin/env bash
 if [[ "$1" == *check_sft.py ]]; then
     printf '%s\n' "$@" > checker.argv
-    printf '%s\n' "${OMNICOMMIT_ACTION_ROWS-unset}" > checker.mode
 else
     printf '%s\n' "$@" > trainer.argv
     printf '%s\n' "$CUDA_VISIBLE_DEVICES" > trainer.gpus
-    printf '%s\n' "${OMNICOMMIT_ACTION_ROWS-unset}" "${OMNICOMMIT_ACTION_TOKENS_FILE-unset}" > trainer.mode
 fi
 ''')
         mock.chmod(0o755)
@@ -65,10 +63,9 @@ fi
     run = subprocess.run(
         [bash, "-c", 'export PATH="$PWD/mock-bin:$PATH"; exec bash "$@"', "test",
          f"SFT-Scripts/{launcher}", "model", dataset, "outputs", "--gpu-ids", GPU_IDS,
-         *(["--vocab-update", vocab_update] if vocab_update else []),
+         *vocab_args,
          *(arg for pair in options.items() for arg in pair)],
         cwd=work, capture_output=True, text=True, timeout=30,
-        env={**os.environ, "OMNICOMMIT_ACTION_ROWS": "stale", "OMNICOMMIT_ACTION_TOKENS_FILE": "stale"},
     )
     assert run.returncode == 0, run.stdout + run.stderr
     check = (work / "checker.argv").read_text().splitlines()
@@ -82,10 +79,23 @@ fi
         assert actual[key] == value
     assert actual["--dataset"] == dataset
     assert actual["--new_special_tokens"] == tokens
-    assert actual["--template"] == "omnicommit_third_qwen3_omni"
+    assert actual["--template"] == "omnicommit_fourth_qwen3_omni"
     assert actual["--external_plugins"].endswith("/Fourth/SFT-Scripts/omnicommit_fourth_sft_plugin.py")
+    modules = train.index("--modules_to_save") + 1
+    assert train[modules:modules + 2] == ["word_embeddings", "output_layer"]
+    assert actual["--tuner_type" if "swift4" in launcher else "--train_type"] == "lora"
+    assert actual["--freeze_vit"] == actual["--freeze_aligner"] == "true"
+    assert "[train] vocab-update=full" in run.stdout
     assert (work / "trainer.gpus").read_text().strip() == GPU_IDS
-    assert (work / "checker.mode").read_text().strip() == "unset"
-    assert (work / "trainer.mode").read_text().splitlines() == (
-        ["unset", "unset"] if vocab_update == "full" else ["1", tokens])
-    assert "--vocab-update" not in train
+    assert all(not arg.startswith("--vocab-update") for arg in train)
+
+
+@pytest.mark.parametrize("launcher", ["train_sft.sh", "train_sft_swift4.sh"])
+def test_retired_action_rows_flag_does_not_start_a_different_experiment(launcher):
+    process = subprocess.run(
+        [find_bash(), f"SFT-Scripts/{launcher}", "model", "data.jsonl", "output",
+         "--vocab-update", "action-rows"],
+        cwd=FOURTH, capture_output=True, text=True, timeout=30,
+    )
+    assert process.returncode == 2
+    assert "Fourth trains both full vocabulary tables" in process.stderr

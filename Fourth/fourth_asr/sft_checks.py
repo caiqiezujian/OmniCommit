@@ -6,7 +6,7 @@ import sys
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from .chunk_refs import decode_chunk_ref
-from .protocol import DIRECT, EOS, WAIT, get_protocol, protocol_for_tokens
+from .protocol import DIRECT, EOS, PROTOCOLS, SPK_CHANGE, WAIT, protocol_for_tokens
 from .training_audio import SAMPLE_RATE, chunk_wav_bytes
 
 
@@ -24,21 +24,51 @@ def _content(message, role):
     return content
 
 
+def _check_recast(meta, path, turns, switch_turns):
+    if not isinstance(meta, dict) or meta.get("source_audio") != path:
+        raise ValueError("recast.source_audio must match the virtual audio references")
+    for name, minimum in (("chunk_ms", 1), ("merged_units", 0)):
+        if type(meta.get(name)) is not int or meta[name] < minimum:
+            raise ValueError(f"Invalid recast.{name}")
+    events = meta.get("events")
+    if not isinstance(events, list) or not events:
+        raise ValueError("recast.events must include the final audio_end event")
+    previous_turn = 0
+    by_kind = {"speaker_change": set(), "switch_deferred": set(), "punctuation_deferred": set(), "audio_end": set()}
+    for event in events:
+        if not isinstance(event, dict):
+            raise ValueError("Invalid recast.events entry")
+        turn, kind = event.get("turn"), event.get("kind")
+        if (type(turn) is not int or not 1 <= turn <= turns or turn < previous_turn
+                or not isinstance(kind, str) or kind not in by_kind or turn in by_kind[kind]):
+            raise ValueError("recast.events requires unique known events in audio turn order")
+        previous_turn = turn
+        by_kind[kind].add(turn)
+    if by_kind["audio_end"] != {turns}:
+        raise ValueError("recast.events must contain exactly one audio_end on the last audio turn")
+    if turns in by_kind["switch_deferred"] or turns in by_kind["punctuation_deferred"]:
+        raise ValueError("recast.events cannot defer text beyond the final audio turn")
+    if by_kind["speaker_change"] != set(switch_turns):
+        raise ValueError("recast speaker_change events differ from the assistant replies")
+
+
 def validate_row(row, token_inventory=None, decode=False):
     """Validate one recording from fresh state and return the special tokens it uses."""
-    explicit = token_inventory is not None and DIRECT in token_inventory
-    profile = get_protocol("explicit" if explicit else "plain")
-    if token_inventory is not None and set(token_inventory) != set(profile.tokens):
-        raise ValueError("Unexpected Fourth token inventory")
-
-    if not isinstance(row, dict) or set(row) != {"audios", "messages"}:
-        raise ValueError("Expected a compact Fourth row with audios and messages")
+    if not isinstance(row, dict) or not {"audios", "messages"} <= row.keys() <= {"audios", "messages", "recast"}:
+        raise ValueError("Expected a Fourth row with audios and messages and optional recast metadata")
     refs, messages = row["audios"], row["messages"]
     if not isinstance(refs, list) or not refs:
         raise ValueError("audios must be a nonempty array of virtual references")
     if not isinstance(messages, list) or len(messages) != 1 + 2 * (len(refs) + 1):
         raise ValueError("Expected system, one message pair per audio, and an EOS pair")
-    if _content(messages[0], "system") not in (profile.system_prompt("verbatim"), profile.system_prompt("normalized")):
+    instruction = _content(messages[0], "system")
+    profiles = PROTOCOLS.values()
+    if token_inventory is not None:
+        profiles = [p for p in profiles if set(p.tokens) == set(token_inventory)]
+        if not profiles:
+            raise ValueError("Unexpected Fourth token inventory")
+    profile = next((p for p in profiles if instruction in (p.system_prompt(), p.system_prompt("normalized"))), None)
+    if profile is None:
         raise ValueError("Unexpected Fourth system instruction")
     if _content(messages[-2], "user") != EOS or _content(messages[-1], "assistant") != WAIT:
         raise ValueError("Expected final text-only end_of_audio followed by standalone WAIT")
@@ -50,6 +80,7 @@ def validate_row(row, token_inventory=None, decode=False):
         import soundfile as sf
         source_info = sf.info(source_path)
     tokens, has_text, previous_end = {WAIT}, False, 0
+    switch_turns = []
     for i, ref in enumerate(refs):
         try:
             segment = decode_chunk_ref(ref)
@@ -60,8 +91,13 @@ def validate_row(row, token_inventory=None, decode=False):
                 raise ValueError("Expected one live audio placeholder")
             text = profile.parse_reply(_content(messages[2 + 2*i], "assistant"))
             if text:
+                if SPK_CHANGE in text:
+                    if not has_text and text.lstrip().startswith(SPK_CHANGE):
+                        raise ValueError("The initial speaker must not have a change marker")
+                    switch_turns.append(i + 1)
+                    tokens.add(SPK_CHANGE)
                 has_text = True
-                if explicit:
+                if profile.prefix:
                     tokens.add(DIRECT)
             if decode:
                 with sf.SoundFile(io.BytesIO(chunk_wav_bytes(ref))) as chunk:
@@ -72,6 +108,8 @@ def validate_row(row, token_inventory=None, decode=False):
             raise ValueError(f"audio turn {i+1}: {exc}") from exc
     if not has_text:
         raise ValueError("Recording contains no transcribed speech")
+    if "recast" in row:
+        _check_recast(row["recast"], source_path, len(refs), switch_turns)
     if decode and round(previous_end * source_info.samplerate) != source_info.frames:
         raise ValueError("Final audio interval ends before or beyond the source recording end")
     if token_inventory is not None and not tokens.issubset(token_inventory):
@@ -109,7 +147,7 @@ def main(argv=None):
             raise ValueError("Dataset contains no records")
         if args.framework:
             from importlib import import_module
-            template_name = "omnicommit_third_qwen3_omni"
+            template_name = "omnicommit_fourth_qwen3_omni"
             if template_name not in import_module("omnicommit_fourth_sft_plugin").TEMPLATE_MAPPING:
                 raise ValueError(f"Training template was not registered: {template_name}")
     except Exception as exc:

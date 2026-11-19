@@ -5,7 +5,7 @@ import unicodedata
 import numpy as np
 
 from .runtime.streaming import GenerationTruncated, SAMPLE_RATE
-from .protocol import DIRECT
+from .protocol import DIRECT, SPK_CHANGE
 
 
 def check_recovery_dependencies():
@@ -50,7 +50,9 @@ def _lexemes(text):
     """Return comparable words/characters and their end offsets in the original."""
     out = []
     start = None
-    for i, char in enumerate(text + " "):
+    # Keep offsets into the marked string when trimming lexical overlap.
+    lexical_text = text.replace(SPK_CHANGE, " " * len(SPK_CHANGE))
+    for i, char in enumerate(lexical_text + " "):
         code = ord(char)
         cjk = (0x3400 <= code <= 0x9FFF or 0x3040 <= code <= 0x30FF
                or 0x20000 <= code <= 0x2FA1F)
@@ -201,8 +203,7 @@ class VoicedWaitRecovery:
                 stats.update(status="rejected", reason=reason)
                 return
             committed = DIRECT + continuation
-            result.update(text=committed, display_text=continuation, action="DIRECT",
-                          primary_text=turn.reply)
+            result.update(session._model_reply(committed, end_of_audio=False), primary_text=turn.reply)
             turn.reply = committed
             stats["status"] = "accepted"
             # The shadow transcript gives no precise word-level consumption

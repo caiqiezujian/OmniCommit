@@ -34,4 +34,4 @@ class FourthCapture extends AudioWorkletProcessor {
     return true;
   }
 }
-registerProcessor("third-capture", FourthCapture);
+registerProcessor("fourth-capture", FourthCapture);

@@ -2,10 +2,14 @@
 import json
 from pathlib import Path
 
-from .protocol import DIRECT, EOS, WAIT, protocol_for_tokens
+from .protocol import DIRECT, EOS, SPK_CHANGE, WAIT, protocol_for_tokens
 
 
 def _metadata(name):
+    if name == "speaker":
+        return {"schema_version": 5, "protocol": {
+            "name": "omnicommit_fourth_speaker", "wait": WAIT, "direct": DIRECT,
+            "speaker_change": SPK_CHANGE, "end_of_audio": EOS}}
     if name == "explicit":
         return {"schema_version": 4, "protocol": {
             "name": "omnicommit_third_explicit", "wait": WAIT, "direct": DIRECT, "end_of_audio": EOS}}
@@ -46,6 +50,6 @@ def validate_manifest(tokenizer, manifest):
 def build_backend(args):
     from .runtime.stream_cli import build_backend as load_backend
     options = {}
-    if getattr(args, "protocol", None) == "explicit" and getattr(args, "enable_recovery", False):
+    if getattr(args, "protocol", None) in ("speaker", "explicit") and getattr(args, "enable_recovery", False):
         options["max_audio_item_seconds"] = args.recovery_window_seconds
     return load_backend(args, manifest_validator=validate_manifest, **options)

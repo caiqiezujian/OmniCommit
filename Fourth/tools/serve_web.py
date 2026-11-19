@@ -19,12 +19,12 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     add_runtime_arguments(parser)
     add_web_arguments(parser)
-    parser.add_argument("--chunk-ms", type=int, default=800, help="Audio step used during SFT")
+    parser.add_argument("--chunk-ms", type=int, default=1000, help="Audio step used during SFT")
     parser.add_argument("--window-seconds", type=float, help="Default live audio window, including the new chunk (60 s)")
     parser.add_argument("--discard-seconds", type=float, help="Oldest live audio to discard on overflow (50 s)")
     parser.add_argument("--max-window-seconds", type=float,
                         help="Largest selectable window; vLLM reserves audio slots for at least 120 s by default")
-    parser.add_argument("--protocol", choices=["auto", "explicit", "plain"], default="auto",
+    parser.add_argument("--protocol", choices=["auto", "speaker", "explicit", "plain"], default="auto",
                         help="Auto-detect the trained action format from the merged checkpoint")
     parser.add_argument("--recovery", dest="enable_recovery", action=argparse.BooleanOptionalAction,
                         default=True, help="Retry sustained voiced WAITs on explicit checkpoints")
@@ -56,8 +56,8 @@ def main(argv=None):
                 parser.error(f"Checkpoint uses {trained!r}, incompatible with --protocol {args.protocol}")
             args.protocol = trained
         elif args.protocol == "auto":
-            args.protocol = "explicit"
-        args.enable_recovery = args.protocol == "explicit" and args.enable_recovery
+            args.protocol = "speaker"
+        args.enable_recovery = args.protocol in ("speaker", "explicit") and args.enable_recovery
         options = runtime_options(args, FourthStreamOptions)
         if args.enable_recovery:
             from fourth_asr.recovery import check_recovery_dependencies

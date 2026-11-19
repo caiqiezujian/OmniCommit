@@ -51,7 +51,7 @@ async function transcribe({start = '', end = '', follow = false, duration = 4} =
         limit = msg.file_end_seconds ?? duration;
         row = heard < 0 || limit > duration || heard >= limit
           ? {type: 'error', error: 'Invalid file bounds'}
-          : {type: 'ready', protocol: 'third', chunk_seconds: 1, file_start_seconds: heard, file_end_seconds: limit};
+          : {type: 'ready', protocol: 'fourth', chunk_seconds: 1, file_start_seconds: heard, file_end_seconds: limit};
       } else if (msg.type === 'file_next' && sent.length < 10) {
         heard = Math.min(heard + 1, msg.release_seconds, limit);
         row = {type: 'result', action: 'WAIT', end_seconds: heard, source_end_seconds: heard,
@@ -71,7 +71,7 @@ async function transcribe({start = '', end = '', follow = false, duration = 4} =
     MeetingTurnLog: class { start() {} append() {} },
     WebSocket: Socket, setTimeout, clearTimeout,
     fetch: async path => {
-      if (path === '/health') return {ok: true, json: async () => ({ready: true, protocol: 'third', chunk_seconds: 1, file_input: true})};
+      if (path === '/health') return {ok: true, json: async () => ({ready: true, protocol: 'fourth', chunk_seconds: 1, file_input: true})};
       uploads++;
       return {ok: true, json: async () => ({media_id: 'upload', duration_seconds: duration, sample_rate: 16000, samples: duration * 16000})};
     },

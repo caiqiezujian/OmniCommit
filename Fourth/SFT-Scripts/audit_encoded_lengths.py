@@ -45,7 +45,7 @@ def protocol_ids(tokenizer, tokens):
 
 def load_template(model_dir, tokens, *, packing):
     importlib.import_module("omnicommit_fourth_sft_plugin")
-    template_name = "omnicommit_third_qwen3_omni"
+    template_name = "omnicommit_fourth_qwen3_omni"
     major = int(importlib.metadata.version("ms-swift").split(".")[0])
     options = dict(max_length=None, truncation_strategy="raise", loss_scale="default")
     if major == 4:
