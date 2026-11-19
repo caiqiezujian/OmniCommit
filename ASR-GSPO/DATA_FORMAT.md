@@ -99,7 +99,7 @@
 <end_of_audio>            <|WAIT|>
 ```
 
-第一轮可同时提交两种语言。第二轮等待不会追加正文。最后是文本结束事件，不增加音频。把三轮音频里的新增正文串起来是 `好了。OK. Next.`。训练默认对同一录音在线采样 8 条候选，分别评分；磁盘里的训练任务仍然只有那一行。
+第一轮可同时提交两种语言。第二轮等待不会追加正文。最后是文本结束事件，不增加音频。把三轮音频里的新增正文串起来是 `好了。OK. Next.`。磁盘里每条录音保存一行训练任务。[四卡训练命令](四卡GSPO训练指南.md)显式设置 `--group-size 4`，训练时为这行任务在线生成 4 条完整候选轨迹，并分别评分。省略该参数时启动器默认生成 8 条。
 
 ## 5. 训练日志和评测文件
 
@@ -126,9 +126,9 @@
 |---|---:|---:|
 | 首轮提交“好了。OK.”，末块提交“ Next.” | 1.000 | 1.000 |
 | 首轮只出“好了。”，把 OK 和 Next 都放到末块 | 1.000 | 0.989 |
-| 首轮出“好了。”，末块出“ Next.”，漏掉 OK | 0.550 | 0.513 |
+| 首轮出“好了。”，末块出“ Next.”，漏掉 OK | 0.100 | 0.063 |
 
-单独运行 `evaluate.py` 时，每行结果的外层字段为 `id`、`bucket`、`mode`、`turns`、`score`，奖励在 `score.reward`。同目录的 `*.summary.json` 汇总全体及各类样本的指标。
+单独运行 `evaluate.py` 时，每行结果的外层字段为 `id`、`bucket`、`mode`、`turns`、`score`，奖励在 `score.reward`。要检查切换片段，查看 `switch_content_error` 和 `switch_content_fully_missed`；要检查断句，查看 `punctuation_scorable`、`extra_internal_periods` 和 `missing_sentence_stops`。同目录的 `*.summary.json` 汇总全体及各类样本的指标。
 
 在服务器查看第一条真实任务，可以从 `ASR-GSPO/` 执行：
 

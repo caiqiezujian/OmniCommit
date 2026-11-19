@@ -9,6 +9,8 @@ import unicodedata
 
 from third_asr.protocol import WAIT, get_protocol
 
+from .sentence_boundaries import sentence_boundary_errors
+from .switch_quality import disjoint_script_metrics, switch_quality_metrics
 
 PROTOCOL = get_protocol("explicit")
 SWITCH_HEAD = 3
@@ -232,7 +234,8 @@ def score_trajectory(task, turns, mode="quality_latency"):
             characters = True
             ref = _units(text, characters=True)
             break
-    hyp = _units("".join(pieces), characters=characters)
+    hypothesis = "".join(pieces)
+    hyp = _units(hypothesis, characters=characters)
     onsets, offsets = _anchors(task, ref)
     emitted_at = [commit_times[bisect_left(char_ends, unit.end)] for unit in hyp]
     timed = mode == "quality_latency"
@@ -290,13 +293,30 @@ def score_trajectory(task, turns, mode="quality_latency"):
     # A soft cost distinguishes long stalls even above eight or thirty seconds.
     delay_costs = [d / (DELAY_SCALE_SECONDS + d) for d in delays] + [1.] * missing_or_early
     timing_cost = (sum(delay_costs) / len(delay_costs)) if delay_costs else 0.
+    switch_content = switch_quality_metrics(ref, hyp, changes, operations)
+    scripts = disjoint_script_metrics(ref, hyp, operations)
+    boundaries = sentence_boundary_errors(text, hypothesis, ref, hyp, operations)
+    extra = boundaries["extra_internal_periods"]
+    # First extra full stop costs 0.20; repeated fragmentation costs progressively
+    # more, with a cap below the cost of losing a complete switched phrase.
+    punctuation_penalty = .60 * extra / (2 + extra)
+    punctuation_penalty += .12 * boundaries["missing_sentence_stops"] / max(1, boundaries["reference_sentence_stops"])
+    runs = scripts["script_mismatch_runs"]
+    # A translated switch can trigger both detectors for the same words.
+    language_penalty = .90 * max(switch_content["switch_content_error"], runs / (1 + runs))
     reward = quality - .40 * switch_error - .20 * short_dels / max(1, short_count)
+    reward -= language_penalty + punctuation_penalty
     if mode == "quality_latency":
         reward -= .15 * timing_cost + .10 * len(early) / max(1, len(onsets))
     if ref and not matches:
         # No coverage: emitting unrelated words must never beat an all-WAIT
         # trajectory just because DIRECT contained something.
         reward = -2.5 - .20 * min(1., len(hyp) / len(ref))
+    elif reward < -2.0:
+        # Preserve ordering among poor partial transcripts while keeping them
+        # above an all-WAIT response (-2.5) and a protocol violation (-3).
+        excess = -2.0 - reward
+        reward = -2.0 - .5 * excess / (.5 + excess)
     return {
         "valid": True, "reason": None, "reward": reward, "quality": quality,
         "unit_mode": "character_cross_boundary" if characters else "mixed",
@@ -304,6 +324,8 @@ def score_trajectory(task, turns, mode="quality_latency"):
         "substitutions": subs, "deletions": len(deleted), "insertions": inserts,
         "error_rate": error_rate, "switch_segments": len(windows), "switch_error_rate": switch_error,
         "short_switch_segments": short_count, "short_switch_deletions": short_dels,
+        **switch_content, **scripts, **boundaries,
+        "language_penalty": language_penalty, "punctuation_penalty": punctuation_penalty,
         "timed_units": len(offsets), "timed_matches": sum(i in matches for i in offsets),
         "delay_samples": len(delays), "early_units": len(early), "timing_cost": timing_cost,
         "extra_wait_ms_histogram": dict(Counter(round(d * 1000) for d in delays)),

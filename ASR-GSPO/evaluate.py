@@ -119,7 +119,16 @@ def summarize(group, waits, switch_waits):
             "valid_reference_units": group["reference_units"],
             "switches": group["switch_segments"],
             "mean_valid_switch_head_error": ratio("switch_errors_sum", "switch_segments"),
+            "switch_content_spans": group["switch_content_spans"],
+            "switch_content_fully_missed": group["switch_content_fully_missed"],
+            "script_mismatch_runs": group["script_mismatch_runs"],
+            "mean_switch_content_error_on_scored_trajectories": ratio("switch_content_error_sum", "switch_scored_trajectories"),
             "short_switch_deletions": group["short_switch_deletions"],
+            "punctuation_scored_trajectories": group["punctuation_scorable"],
+            "scored_internal_gaps": group["scored_internal_gaps"],
+            "extra_internal_periods": group["extra_internal_periods"],
+            "reference_sentence_stops": group["reference_sentence_stops"],
+            "missing_sentence_stops": group["missing_sentence_stops"],
             "short_switch_segments": group["short_switch_segments"], "timed_matches": group["timed_matches"],
             "timed_units": group["timed_units"], "early_units": group["early_units"],
             "p95_extra_wait_seconds": percentile(waits, .95),
@@ -154,8 +163,13 @@ def evaluate(args):
                     switch_waits[key].update(result["switch_extra_wait_ms_histogram"])
                     group.update({name: result[name] for name in (
                         "errors", "reference_units", "short_switch_deletions", "short_switch_segments",
-                        "switch_segments", "timed_units", "timed_matches", "early_units")})
+                        "switch_segments", "timed_units", "timed_matches", "early_units",
+                        "switch_content_spans", "switch_content_fully_missed", "script_mismatch_runs", "punctuation_scorable",
+                        "scored_internal_gaps", "extra_internal_periods", "reference_sentence_stops",
+                        "missing_sentence_stops")})
                     group["switch_errors_sum"] += result["switch_error_rate"] * result["switch_segments"]
+                    if result["switch_content_spans"]:
+                        group.update(switch_scored_trajectories=1, switch_content_error_sum=result["switch_content_error"])
                     if result["mean_extra_wait_seconds"] is not None:
                         group.update(sum_delay=result["mean_extra_wait_seconds"] * result["delay_samples"],
                                      delay_weight=result["delay_samples"])

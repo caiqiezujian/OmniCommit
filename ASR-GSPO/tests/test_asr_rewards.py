@@ -139,3 +139,52 @@ def test_repeated_reference_words_and_ambiguous_edit_paths():
     transposed = task([("en", "budget first")])
     result = score_trajectory(transposed, turns(transposed, {2: "first budget"}))
     assert result["errors"] == 2 and result["matched_units"] == 1
+
+
+@pytest.mark.parametrize("mode", ["quality", "quality_latency"])
+def test_language_switch_and_false_stop_affect_actual_rollout_reward(mode):
+    t = task([("zh", "关于这个项目我想再说一下，这次预算是 "),
+              ("en", "fifteen dollars"), ("zh", "，明天确认。")])
+    opening = "关于这个项目我想再说一下，这次预算是 "
+
+    def score(emissions):
+        return score_trajectory(t, turns(t, emissions), mode)["reward"]
+
+    correct = score({1: opening, 3: "fifteen dollars", 4: "，明天确认。"})
+    assert correct == score({4: t["reference_text"]}) == 1
+    assert correct - score({1: opening, 3: "十五美元", 4: "，明天确认。"}) >= .7
+    assert correct - score({1: opening, 4: "，明天确认。"}) >= .7
+    assert score({1: opening, 3: "fifteen dollars", 4: "，明天。确认。"}) < correct
+
+
+def test_short_directs_without_punctuation_are_not_fragmented_sentences():
+    t = task([("zh", "我知道你有点问题。后来我们解决了。")])
+
+    def score(parts):
+        return score_trajectory(t, turns(t, dict(enumerate(parts, 1))), "quality")
+
+    correct = score(["我知道", "你有点问题。", "后来我们解决了。"])
+    false_break = score(["我知道。", "你有点问题。", "后来我们解决了。"])
+    two_false_breaks = score(["我知道。", "你有点。", "问题。后来我们解决了。"])
+    no_stops = score(["我知道你有点问题后来我们解决了"])
+    assert correct["reward"] == 1
+    assert two_false_breaks["reward"] < false_break["reward"] < correct["reward"]
+    assert false_break["errors"] == two_false_breaks["errors"] == 0
+    assert no_stops["reward"] < correct["reward"]
+
+
+def test_wrong_script_inside_a_monolingual_sentence_and_valid_loanword():
+    t = task([("zh", "我们用 Excel 记录这次预算，下午再核对。")])
+    correct = score_trajectory(t, turns(t, {2: t["reference_text"]}), "quality")
+    foreign = score_trajectory(t, turns(t, {2: "我们用 Excel 记录这次budget，下午再核对。"}), "quality")
+    assert correct["reward"] == 1 and correct["script_mismatch_runs"] == 0
+    assert foreign["switch_segments"] == 0 and foreign["script_mismatch_runs"] == 1
+    assert correct["reward"] - foreign["reward"] >= .35
+
+
+def test_combined_penalties_do_not_rank_abstaining_above_a_partial_transcript():
+    t = task([("en", "one "), ("zh", "这是我们刚刚通过的新预算。")])
+    bad = score_trajectory(t, turns(t, {2: "one " + "incorrect " * 30}), "quality")
+    empty = score_trajectory(t, turns(t, {}), "quality")
+    invalid = score_trajectory(t, [], "quality")
+    assert invalid["reward"] < empty["reward"] < bad["reward"] < 0

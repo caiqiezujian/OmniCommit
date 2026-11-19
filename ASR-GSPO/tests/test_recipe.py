@@ -65,6 +65,9 @@ def test_full_recording_to_rollout_scores(tmp_path):
     assert scores[0]["reward"] > scores[1]["reward"] > scores[2]["reward"]
     assert summary["all"]["switches"] == 3
     assert summary["all"]["short_switch_deletions"] == 1
+    assert summary["all"]["switch_content_spans"] == 3
+    assert summary["all"]["switch_content_fully_missed"] == 1
+    assert summary["all"]["extra_internal_periods"] == 0
     assert summary["all"]["p95_extra_wait_seconds"] == 2.
     assert summary["all"]["p95_switch_head_extra_wait_seconds"] == 1.
 
