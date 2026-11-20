@@ -156,11 +156,21 @@ class CaptureQueue {
 }
 
 async function openCapture(state) {
-  if (!window.isSecureContext || !navigator.mediaDevices) throw Error("采音需要 HTTPS 或 localhost。");
-  state.stream = state.kind === "system"
-    ? await navigator.mediaDevices.getDisplayMedia({video: true, audio: true})
-    : await navigator.mediaDevices.getUserMedia({audio: true});
-  if (!state.stream.getAudioTracks().length) throw Error("未收到声音轨道。共享电脑声音时须勾选共享音频。");
+  if (!window.isSecureContext) throw Error("采音需要 HTTPS 或 localhost。");
+  const devices = navigator.mediaDevices;
+  if (state.kind === "system") {
+    if (typeof devices?.getDisplayMedia !== "function") {
+      throw Error("当前浏览器未提供屏幕共享，请用支持共享音频的桌面浏览器打开会议页。");
+    }
+    state.stream = await devices.getDisplayMedia({video: true, audio: true, systemAudio: "include"});
+    if (!state.stream.getAudioTracks().length) {
+      throw Error("未收到电脑声音。请重新选择提供音频选项的标签页或屏幕，勾选“共享音频”。");
+    }
+  } else {
+    if (typeof devices?.getUserMedia !== "function") throw Error("当前浏览器未提供麦克风采集。");
+    state.stream = await devices.getUserMedia({audio: true});
+    if (!state.stream.getAudioTracks().length) throw Error("未收到麦克风声音。");
+  }
   state.context = new AudioContext({sampleRate: 16000});
   await state.context.suspend();
   if (state.context.sampleRate !== 16000) throw Error("浏览器未提供所需的 16 kHz 采样率。");

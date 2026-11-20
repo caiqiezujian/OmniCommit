@@ -113,7 +113,11 @@ CUDA_VISIBLE_DEVICES=0 bash start_server.sh \
   --chunk-ms 800 --port 18891
 ~~~
 
-在浏览器打开 `http://服务器内网IP:18891`。可在服务器执行 `curl http://127.0.0.1:18891/health` 检查 Third 服务的就绪状态。网页支持麦克风、浏览器共享的系统声音和音视频文件。浏览器远程采音通常需要 HTTPS，localhost 可以直接使用。直接提供 HTTPS 时可传 `--ssl-certfile` 和 `--ssl-keyfile`。系统声音取决于浏览器能否共享所选来源的音频轨道。服务器读取音视频文件需要 `ffmpeg`。服务面向内网，无需访问令牌。
+以上命令启动 HTTP。浏览器打开 `http://服务器内网IP:18891`，可在服务器执行 `curl http://127.0.0.1:18891/health` 检查就绪状态。服务器读取音视频文件需要 `ffmpeg`。服务面向内网，无需访问令牌。
+
+**从内网电脑采集系统声音或麦克风**时，在启动命令末尾追加 `--https-host 10.185.1.71 --cert-dir /data/yb/Code/OmniCommit/certs`。将 IP 换成浏览器实际访问的 IP 或域名。服务器需要 OpenSSL 1.1.1 或更高版本。首次启动后，将公开证书 `root-ca.crt` 从该证书目录复制到访问网页的 Windows 电脑，在文件所在目录执行 `certutil -user -addstore Root .\root-ca.crt`。私钥留在服务器。如果电脑已经信任同一访问地址的 FLEX 证书，可以直接追加 `--ssl-certfile /实际FLEX证书目录/server.crt --ssl-keyfile /实际FLEX证书目录/server.key` 来复用它。
+
+重新打开浏览器，访问 `https://10.185.1.71:18891`，选择「电脑声音」并点击「开始转录」。在共享弹窗中选正在播放声音的标签页或系统支持的屏幕来源，勾选共享音频。音频通过同一端口的 WSS 传输。[Chrome 共享音频说明](https://developer.chrome.com/docs/web-platform/screen-sharing-controls#the_systemaudio_option)
 
 选择「音视频文件」后可填写转录起点和终点。例如，起点填 `58.25`、终点填 `1:36`，模型就从空历史开始，只接收原文件第 58.25 至 96 秒的音频。起点留空从文件开头开始，终点留空一直处理到文件末尾。勾选「跟随播放器进度」会从起点播放；取消勾选会直接逐块识别同一区间。文件仍会完整上传并解码。
 

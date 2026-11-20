@@ -149,9 +149,16 @@ bash SFT-Scripts/merge_lora.sh \
 python -m pip install -r requirements-web.txt
 CUDA_VISIBLE_DEVICES=0 bash start_server.sh \
   /data/yb/Code/OmniCommit/models/fourth-speaker-full-merged \
-  --protocol speaker --chunk-ms 1000 --port 18891
+  --protocol speaker --chunk-ms 1000 --port 18891 \
+  --https-host 10.185.1.71 --cert-dir /data/yb/Code/OmniCommit/certs
 ~~~
 
-浏览器打开 `http://服务器内网IP:18891`。页面提供麦克风、系统声音和音视频文件输入、文件起止时间选择及会议上下文窗口设置。新协议在健康检查中显示 `action_protocol=speaker`。网页按换人标记分段显示，同一人后续提交继续接在已有正文后。标记表示发言人变化，无法判断这一位是否曾经发过言。通过 `--window-seconds`、`--discard-seconds` 配置滚动上下文，`--no-recovery` 可关闭有声 WAIT 的局部重听。推荐和训练使用相同步长。
+将示例中的 `10.185.1.71` 换成访问者实际使用的内网 IP 或域名，再打开对应的 `https://10.185.1.71:18891`。首次启动需要服务器安装 OpenSSL 1.1.1 或更高版本。将生成的 `/data/yb/Code/OmniCommit/certs/root-ca.crt` 复制到访问网页的 Windows 电脑，在该文件所在目录执行 `certutil -user -addstore Root .\root-ca.crt`，重新打开浏览器。私钥留在服务器。此后使用同一个证书目录即可复用信任。
+
+如果这台电脑已信任 FLEX，并且服务器访问地址在原证书内，可把最后一行参数换成 `--ssl-certfile /实际FLEX证书目录/server.crt --ssl-keyfile /实际FLEX证书目录/server.key`。服务器可用 `curl --cacert /实际证书目录/root-ca.crt https://10.185.1.71:18891/health` 验证证书和服务状态。
+
+网页中选择「电脑声音」并点击「开始转录」，在浏览器弹窗选中正在播放的标签页或系统支持的屏幕来源，勾选共享音频。声音来自访问网页的电脑，通过同一端口的 WSS 发送。网页也支持麦克风、音视频文件、文件起止时间和会议上下文窗口设置。[Chrome 共享音频说明](https://developer.chrome.com/docs/web-platform/screen-sharing-controls#the_systemaudio_option)
+
+新协议在健康检查中显示 `action_protocol=speaker`。网页按换人标记分段显示，同一人后续提交继续接在已有正文后。标记表示发言人变化，无法判断这一位是否曾经发过言。通过 `--window-seconds`、`--discard-seconds` 配置滚动上下文，`--no-recovery` 可关闭有声 WAIT 的局部重听。推荐和训练使用相同步长。
 
 提供给其他程序的 HTTP 接口仍返回 `{"src":"本包新增正文"}`。服务命令、日志和调用方式见 [HTTP API](HTTP_API.md)。

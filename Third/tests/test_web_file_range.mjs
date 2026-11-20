@@ -7,7 +7,8 @@ const web = new URL('../web/meeting-v2/', import.meta.url);
 const html = readFileSync(new URL('index.html', web), 'utf8');
 const script = readFileSync(new URL('app.js', web), 'utf8');
 
-async function transcribe({start = '', end = '', follow = false, duration = 4} = {}) {
+async function transcribe({start = '', end = '', follow = false, duration = 4,
+                           source = 'file', mediaDevices, secure = true} = {}) {
   const fields = new Map();
   for (const [, id] of html.matchAll(/\bid="([^"]+)"/g)) {
     fields.set(id, Object.assign(new EventTarget(), {
@@ -66,7 +67,8 @@ async function transcribe({start = '', end = '', follow = false, duration = 4} =
     close() {}
   }
   const context = vm.createContext({
-    document: {getElementById: field, querySelectorAll: () => [], querySelector: () => ({value: 'file'})},
+    document: {getElementById: field, querySelectorAll: () => [], querySelector: () => ({value: source})},
+    window: {isSecureContext: secure}, navigator: {mediaDevices},
     location: {protocol: 'http:', host: 'localhost'},
     MeetingTurnLog: class { start() {} append() {} },
     WebSocket: Socket, setTimeout, clearTimeout,
@@ -114,4 +116,23 @@ test('invalid or reversed ranges never begin decoding', async () => {
     assert.ok(sent.every(row => row.type === 'start'), status);
     assert.ok(status && status !== '转录结束');
   }
+});
+
+test('system capture requests shared audio and releases a video-only selection', async () => {
+  let stopped = false, requested;
+  const video = {stop() { stopped = true; }};
+  const mediaDevices = {async getDisplayMedia(options) {
+    requested = {...options};
+    return {getAudioTracks: () => [], getTracks: () => [video]};
+  }};
+  const run = await transcribe({source: 'system', mediaDevices});
+  assert.deepEqual(requested, {video: true, audio: true, systemAudio: 'include'});
+  assert.match(run.status, /共享音频/);
+  assert.equal(stopped, true);
+  assert.equal(run.sent.length, 0);
+});
+
+test('system capture explains an insecure origin and a missing browser API', async () => {
+  assert.match((await transcribe({source: 'system', secure: false})).status, /HTTPS/);
+  assert.match((await transcribe({source: 'system', mediaDevices: {}})).status, /桌面浏览器/);
 });

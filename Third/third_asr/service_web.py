@@ -337,15 +337,20 @@ def add_web_arguments(parser):
     parser.add_argument("--max-sessions", type=int, default=1)
     parser.add_argument("--ssl-certfile")
     parser.add_argument("--ssl-keyfile")
+    parser.add_argument("--https-host", action="append", default=[], metavar="IP_OR_NAME",
+                        help="Issue/reuse a local HTTPS certificate for this browser-facing IP or name (repeatable)")
+    parser.add_argument("--cert-dir", type=Path, help="Persist local HTTPS certificates here (default: recipe certs/)")
 
 
 def serve_web(parser, args, backend_factory, options, app_factory):
-    if bool(args.ssl_certfile) != bool(args.ssl_keyfile):
-        parser.error("TLS needs both certificate and private key")
+    from .web_tls import TLSConfigError, meeting_tls
+    try:
+        certfile, keyfile = meeting_tls(args, Path(__file__).resolve().parents[1])
+    except (OSError, TLSConfigError) as exc:
+        parser.error(str(exc))
     import uvicorn
     app = app_factory(backend_factory, options, max_sessions=args.max_sessions)
     max_ms = round(options.chunk_seconds * 1000)
     uvicorn.run(app, host=args.host, port=args.port, workers=1,
                 ws_max_size=max(65536, max_ms * 32),  # mono PCM16 at 16 kHz
-                ws_max_queue=4, ssl_certfile=args.ssl_certfile,
-                ssl_keyfile=args.ssl_keyfile)
+                ws_max_queue=4, ssl_certfile=certfile, ssl_keyfile=keyfile)

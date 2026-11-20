@@ -10,6 +10,7 @@ venv/
 !.env.example
 *.pem
 *.key
+certs/
 data/
 datasets/
 outputs/
