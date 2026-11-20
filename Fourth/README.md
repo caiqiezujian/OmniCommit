@@ -4,6 +4,53 @@ Fourth 从带语种、说话人和逐段时间戳的原始 JSONL 构建流式 SF
 
 ## 1. 从原始标注生成训练集
 
+### 已跑完第一步合并的训练集
+
+`merge_timestamped_segments.py` 完成时才发布 `full_10000h_augmented.merged_v2.jsonl`。每行保留原音频路径和参考转录，`output.segments` 存新分组，`timestamps` 存对应区间。新合并组的 `timestamps[].spans` 保留细时间，`merge_source_units` 指向原段。合并阶段保留末尾标点，也没有添加录音自然结束标记。可直接把这份输出交给第二步。
+
+~~~bash
+cd /data/yb/Code/OmniCommit/Fourth
+python Data-Scripts/build_sft.py \
+  /data/s50062929/FLEX/SFT_data/full_10000h_augmented.merged_v2.jsonl \
+  --output-dir /data/yb/Code/OmniCommit/datasets/fourth_merged_1s_v2 \
+  --chunk-ms 1000 --release-on merged-unit --tail-policy short-open
+
+python SFT-Scripts/check_sft.py \
+  /data/yb/Code/OmniCommit/datasets/fourth_merged_1s_v2/train.1000ms.jsonl \
+  --rows 100 --decode
+~~~
+
+`merged-unit` 直接使用已合并语义段。在每个音频窗口结束时，按参考顺序一次提交所有已说完的连续段，没有可提交内容才产生 `<|WAIT|>`。同一人换语种时直接转录新语种的正文；每次换人在新人的第一段正文前插入 `<|SPK_CHANGE|>`。例如 A 的“准备好了吗？”在 0.55 秒结束，B 的“好。”在 0.78 秒结束，B 随后的英语在 1.25 秒结束。第一秒的目标是 `<|DIRECT|>准备好了吗？<|SPK_CHANGE|>好。`，英语在下一轮交付。混合归属段有可靠子时间时可以分归属提交，只有整段时间时要等段末。重叠发言维持参考顺序。
+
+| 尾部选项 | 适用数据与训练行为 |
+| --- | --- |
+| `keep`（默认） | 完整录音。处理到 WAV 末尾，保留参考标点，再训练 `<end_of_audio> → <\|WAIT\|>`。 |
+| `short-open` | 本次截取数据的启发式选项。以 WAV 总长减去最晚标注结束时间，尾隙严格小于 1000 ms（含零）时，按开放尾部处理。正好 1000 ms 及以上走完整录音流程。 |
+| `annotated-prefix` | 整批都只保证前缀有转录时使用。所有样本在标注结束处停止，长尾也不产生无标注音频轮。 |
+
+开放尾部仅生成到最后有效标注的虚拟音频引用，最后一个音频回复有正文，后面不追加结束事件。尾隙不足一秒时可移除最后一个独立的句末句点，保留原词、内部标点、问号、感叹号、省略号以及规则能识别的缩写。若句号单独占一个有时间的段，移除后可回退到上一段正文的结束时间。源 WAV、合并标注及参考原文保持原样。`short-open` 也会命中快速收尾的完整句子，时间差本身无法鉴定音频是否被截断。
+
+在 `summary.json` 的 `by_chunk_ms` 中查看 `open_ended_rows` 和 `terminal_periods_removed`。每条开放样本的 `recast.events` 以 `annotation_end` 结束，`supervised_frames` 和 `source_frames` 分别记录监督截止帧和源音频总帧数。
+
+构建结束后，在 Fourth 的 SFT 环境中直接训练这份 `train.1000ms.jsonl`。同目录的 `train.1000ms.jsonl.tokens.txt` 由构建脚本生成，训练入口会自动读取。下面沿用 8 卡、packing 4096、全局 batch 128、1 个 epoch，每 1000 步保存一次。
+
+~~~bash
+cd /data/yb/Code/OmniCommit/Fourth
+mkdir -p logs
+nohup bash SFT-Scripts/train_sft.sh \
+  /data/yb/models/qwen3_omni_mcore_3.12.1 \
+  /data/yb/Code/OmniCommit/datasets/fourth_merged_1s_v2/train.1000ms.jsonl \
+  /data/yb/Code/OmniCommit/output/fourth-merged-1s-v2 \
+  --gpu-ids 0,1,2,3,4,5,6,7 --attention_backend flash \
+  --packing true --padding_free true \
+  --max_length 4096 --packing_length 4096 \
+  --micro_batch_size 2 --global_batch_size 128 \
+  --max_epochs 1 --split_dataset_ratio 0 --save_interval 1000 \
+  > logs/train_fourth_merged_1s_v2.log 2>&1 < /dev/null &
+~~~
+
+### 从未合并的原始标注开始
+
 将整个 `Fourth/` 目录放到服务器，确认容器能读取原始音频路径。在已有数据环境中执行：
 
 ~~~bash

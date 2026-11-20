@@ -24,7 +24,7 @@ def _content(message, role):
     return content
 
 
-def _check_recast(meta, path, turns, switch_turns):
+def _check_recast(meta, path, turns):
     if not isinstance(meta, dict) or meta.get("source_audio") != path:
         raise ValueError("recast.source_audio must match the virtual audio references")
     for name, minimum in (("chunk_ms", 1), ("merged_units", 0)):
@@ -32,9 +32,10 @@ def _check_recast(meta, path, turns, switch_turns):
             raise ValueError(f"Invalid recast.{name}")
     events = meta.get("events")
     if not isinstance(events, list) or not events:
-        raise ValueError("recast.events must include the final audio_end event")
+        raise ValueError("recast.events must include an audio_end or annotation_end event")
     previous_turn = 0
-    by_kind = {"speaker_change": set(), "switch_deferred": set(), "punctuation_deferred": set(), "audio_end": set()}
+    by_kind = {kind: set() for kind in ("speaker_change", "switch_deferred", "punctuation_deferred",
+                                         "audio_end", "annotation_end")}
     for event in events:
         if not isinstance(event, dict):
             raise ValueError("Invalid recast.events entry")
@@ -44,12 +45,19 @@ def _check_recast(meta, path, turns, switch_turns):
             raise ValueError("recast.events requires unique known events in audio turn order")
         previous_turn = turn
         by_kind[kind].add(turn)
-    if by_kind["audio_end"] != {turns}:
-        raise ValueError("recast.events must contain exactly one audio_end on the last audio turn")
     if turns in by_kind["switch_deferred"] or turns in by_kind["punctuation_deferred"]:
         raise ValueError("recast.events cannot defer text beyond the final audio turn")
-    if by_kind["speaker_change"] != set(switch_turns):
-        raise ValueError("recast speaker_change events differ from the assistant replies")
+    open_end = bool(by_kind["annotation_end"])
+    if open_end:
+        if by_kind["audio_end"] or by_kind["annotation_end"] != {turns} or events[-1]["kind"] != "annotation_end":
+            raise ValueError("annotation_end must be the sole end event and occur last on the final audio turn")
+        source_frames, supervised_frames = meta.get("source_frames"), meta.get("supervised_frames")
+        if (type(source_frames) is not int or type(supervised_frames) is not int
+                or not 0 < supervised_frames <= source_frames):
+            raise ValueError("annotation_end requires integer frame counts with 0 < supervised_frames <= source_frames")
+    elif by_kind["audio_end"] != {turns}:
+        raise ValueError("recast.events must contain exactly one audio_end on the last audio turn")
+    return open_end, by_kind["speaker_change"]
 
 
 def validate_row(row, token_inventory=None, decode=False):
@@ -59,8 +67,15 @@ def validate_row(row, token_inventory=None, decode=False):
     refs, messages = row["audios"], row["messages"]
     if not isinstance(refs, list) or not refs:
         raise ValueError("audios must be a nonempty array of virtual references")
-    if not isinstance(messages, list) or len(messages) != 1 + 2 * (len(refs) + 1):
-        raise ValueError("Expected system, one message pair per audio, and an EOS pair")
+    source_path = decode_chunk_ref(refs[0])["path"]
+    if not (PurePosixPath(source_path).is_absolute() or PureWindowsPath(source_path).is_absolute()):
+        raise ValueError("Source audio path must be absolute on the training host")
+    open_end, expected_switches = False, None
+    if "recast" in row:
+        open_end, expected_switches = _check_recast(row["recast"], source_path, len(refs))
+    expected_pairs = len(refs) if open_end else len(refs) + 1
+    if not isinstance(messages, list) or len(messages) != 1 + 2 * expected_pairs:
+        raise ValueError("Expected one message pair per audio and an EOS pair only for closed recordings")
     instruction = _content(messages[0], "system")
     profiles = PROTOCOLS.values()
     if token_inventory is not None:
@@ -70,16 +85,13 @@ def validate_row(row, token_inventory=None, decode=False):
     profile = next((p for p in profiles if instruction in (p.system_prompt(), p.system_prompt("normalized"))), None)
     if profile is None:
         raise ValueError("Unexpected Fourth system instruction")
-    if _content(messages[-2], "user") != EOS or _content(messages[-1], "assistant") != WAIT:
+    if not open_end and (_content(messages[-2], "user") != EOS or _content(messages[-1], "assistant") != WAIT):
         raise ValueError("Expected final text-only end_of_audio followed by standalone WAIT")
-
-    source_path = decode_chunk_ref(refs[0])["path"]
-    if not (PurePosixPath(source_path).is_absolute() or PureWindowsPath(source_path).is_absolute()):
-        raise ValueError("Source audio path must be absolute on the training host")
     if decode:
         import soundfile as sf
         source_info = sf.info(source_path)
-    tokens, has_text, previous_end = {WAIT}, False, 0
+    tokens = set() if open_end else {WAIT}
+    has_text, previous_end = False, 0
     switch_turns = []
     for i, ref in enumerate(refs):
         try:
@@ -89,7 +101,10 @@ def validate_row(row, token_inventory=None, decode=False):
             previous_end = segment["end"]
             if _content(messages[1 + 2*i], "user") != "<audio>":
                 raise ValueError("Expected one live audio placeholder")
-            text = profile.parse_reply(_content(messages[2 + 2*i], "assistant"))
+            reply = _content(messages[2 + 2*i], "assistant")
+            text = profile.parse_reply(reply)
+            if open_end and i == len(refs) - 1 and not (text and reply.startswith(DIRECT)):
+                raise ValueError("annotation_end must end with a DIRECT containing transcript text")
             if text:
                 if SPK_CHANGE in text:
                     if not has_text and text.lstrip().startswith(SPK_CHANGE):
@@ -99,6 +114,8 @@ def validate_row(row, token_inventory=None, decode=False):
                 has_text = True
                 if profile.prefix:
                     tokens.add(DIRECT)
+            else:
+                tokens.add(WAIT)
             if decode:
                 with sf.SoundFile(io.BytesIO(chunk_wav_bytes(ref))) as chunk:
                     if (chunk.samplerate != SAMPLE_RATE or chunk.channels != 1
@@ -108,10 +125,17 @@ def validate_row(row, token_inventory=None, decode=False):
             raise ValueError(f"audio turn {i+1}: {exc}") from exc
     if not has_text:
         raise ValueError("Recording contains no transcribed speech")
-    if "recast" in row:
-        _check_recast(row["recast"], source_path, len(refs), switch_turns)
-    if decode and round(previous_end * source_info.samplerate) != source_info.frames:
-        raise ValueError("Final audio interval ends before or beyond the source recording end")
+    if expected_switches is not None and expected_switches != set(switch_turns):
+        raise ValueError("recast speaker_change events differ from the assistant replies")
+    if decode:
+        if open_end:
+            meta = row["recast"]
+            if meta["source_frames"] != source_info.frames:
+                raise ValueError("annotation_end source_frames differ from the original audio header")
+            if abs(previous_end * source_info.samplerate - meta["supervised_frames"]) > 1e-5:
+                raise ValueError("Last audio reference does not end at supervised_frames of the original audio")
+        elif round(previous_end * source_info.samplerate) != source_info.frames:
+            raise ValueError("Final audio interval ends before or beyond the source recording end")
     if token_inventory is not None and not tokens.issubset(token_inventory):
         raise ValueError(f"Tokens missing from training token file: {sorted(tokens - set(token_inventory))}")
     return tokens

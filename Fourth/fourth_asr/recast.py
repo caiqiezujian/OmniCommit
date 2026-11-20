@@ -15,7 +15,7 @@ def validate_chunk_ms(chunk_ms: int) -> None:
         raise ValueError(f"chunk-ms must be an integer between 1 and {MAX_CHUNK_SECONDS * 1000}")
 
 
-def _end_frame(end_ms: float, frames: int, rate: int) -> int:
+def end_frame(end_ms: float, frames: int, rate: int) -> int:
     if end_ms == frames * 1000 / rate:
         return frames
     frame = Fraction(str(end_ms)) * rate / 1000
@@ -32,7 +32,7 @@ def _switch_cuts(units, ends, frames, rate, chunk_ms):
         covered_until = max(covered_until, new.end_ms)
         if old.spans[-1][:2] == new.spans[0][:2] or overlaps:
             continue
-        new_start = _end_frame(new.start_ms, frames, rate)
+        new_start = end_frame(new.start_ms, frames, rate)
         turn = new_start * 1000 // (chunk_ms * rate) + 1
         window_start = ((turn-1) * chunk_ms * rate + 999) // 1000
         if ends[i-1] > window_start:
@@ -62,16 +62,18 @@ def _punctuation_cut(units, cursor, ready, protected, chunk_ms):
 
 
 def build_sft_row(units: list[Unit], path: Path, frames: int, rate: int,
-                  chunk_ms: int, number_format: str, *, protocol: FourthProtocol, audit=None) -> dict:
+                  chunk_ms: int, number_format: str, *, protocol: FourthProtocol, audit=None,
+                  release_completed=False, open_end=False) -> dict:
     validate_chunk_ms(chunk_ms)
     if not units or frames <= 0 or rate <= 0:
         raise ValueError("A record needs positive-duration audio and aligned text")
     if chunk_ms * rate < 1000:
         raise ValueError("The selected chunk size contains less than one source sample")
-    ends = [_end_frame(unit.end_ms, frames, rate) for unit in units]
+    ends = [end_frame(unit.end_ms, frames, rate) for unit in units]
     if any(end > frames for end in ends):
         raise ValueError("Unit ends must fit the audio")
-    cuts = _switch_cuts(units, ends, frames, rate, chunk_ms)
+    defer = protocol.name == "speaker" and not release_completed
+    cuts = _switch_cuts(units, ends, frames, rate, chunk_ms) if defer else {}
     if audit is not None:
         audit.update(switch_deferred_turns=[], punctuation_deferred_turns=[])
 
@@ -90,7 +92,7 @@ def build_sft_row(units: list[Unit], path: Path, frames: int, rate: int,
         while ready < len(units) and ends[ready] <= end:
             ready += 1
         cutoff = ready
-        if end < frames and protocol.name == "speaker":
+        if end < frames and defer:
             switch = cuts.get(turn)
             if switch is not None and max(cursor+1, previously_ready) <= switch <= ready:
                 cutoff = switch
@@ -113,5 +115,6 @@ def build_sft_row(units: list[Unit], path: Path, frames: int, rate: int,
         turn += 1
     if cursor != len(units):
         raise ValueError("Audio ended with uncommitted transcript units")
-    messages.extend([{"role": "user", "content": EOS}, {"role": "assistant", "content": WAIT}])
+    if not open_end:
+        messages.extend([{"role": "user", "content": EOS}, {"role": "assistant", "content": WAIT}])
     return {"audios": refs, "messages": messages}

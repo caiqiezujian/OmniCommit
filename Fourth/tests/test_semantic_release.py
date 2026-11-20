@@ -143,3 +143,53 @@ def test_split_decimal_delimiter_preserved():
     want = ["Genau, 12,5 Prozent."]
     turns, _, _, _ = build(monolingual(pieces, want, "de"), 3200)
     assert turns == [None,"Genau,"," 12,5 Prozent.",None]
+
+
+def merged_row(record, duration, *, open_end=False):
+    units, _ = prepare_units(record, duration, chunk_ms=1000, release_on="merged-unit")
+    audit = {}
+    row = build_sft_row(units, Path("test.wav"), duration * 16, 16000, 1000, "normalized",
+                        protocol=get_protocol("speaker"), audit=audit,
+                        release_completed=True, open_end=open_end)
+    assert audit == {"switch_deferred_turns": [], "punctuation_deferred_turns": []}
+    return row
+
+
+def test_merged_group_commits_completed_interjection_before_next_language_finishes():
+    record = make_record([(0, 440, "zh", "spk1", "听到了吗？"),
+                          (530, 730, "zh", "spk2", "好。"),
+                          (810, 1260, "en", "spk2", " Yes."),
+                          (1320, 1500, "zh", "spk1", "谢谢。"),
+                          (1550, 1870, "zh", "spk2", "客气。")])
+    replies = [m["content"] for m in merged_row(record, 2550)["messages"] if m["role"] == "assistant"]
+    assert replies == [DIRECT + "听到了吗？" + SPK_CHANGE + "好。",
+                       DIRECT + " Yes." + SPK_CHANGE + "谢谢。" + SPK_CHANGE + "客气。",
+                       WAIT, WAIT]
+
+
+def test_merged_groups_preserve_adjacent_number_boundaries_and_open_recording():
+    # Both numbers were kept separate by Step 1. The legacy number heuristic
+    # could join even across a 0 ms gap with --short-ms 0.
+    parts = [(130, 860, "12"), (860, 1430, "345")]
+    record = monolingual(parts, ["12345"], "en")
+    row = merged_row(record, 1430, open_end=True)
+    assert [m["content"] for m in row["messages"][1:]] == [
+        "<audio>", DIRECT + "12", "<audio>", DIRECT + "345"]
+    assert len(row["audios"]) == 2
+
+
+@pytest.mark.parametrize("timed,first,second", [
+    (False, WAIT, DIRECT + "请。" + SPK_CHANGE + "OK."),
+    (True, DIRECT + "请。", DIRECT + SPK_CHANGE + "OK."),
+])
+def test_mixed_merged_unit_uses_real_child_times_only(timed, first, second):
+    head, tail = "<zh><spk1>请。", "<en><spk2>OK."
+    record = {"audios": ["test.wav"], "messages": [{"role": "assistant", "content": head + tail}],
+              "output": {"segments": [{"source_text": head + tail}]},
+              "timestamps": [{"start_ms": 250, "end_ms": 1260}]}
+    if timed:
+        record["timestamps"][0]["spans"] = [
+            {"start_ms": 250, "end_ms": 870, "language": "zh", "speaker": "spk1", "text": head},
+            {"start_ms": 920, "end_ms": 1260, "language": "en", "speaker": "spk2", "text": tail}]
+    row = merged_row(record, 2000)
+    assert [m["content"] for m in row["messages"][2:-2:2]] == [first, second]

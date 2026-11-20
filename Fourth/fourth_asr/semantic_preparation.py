@@ -162,13 +162,17 @@ def prepare_units(record, duration_ms, *, chunk_ms, short_ms=300, release_on="se
     """Build release units from exact source timestamps, independently for each grid."""
     if type(short_ms) is not int or short_ms < 0 or type(chunk_ms) is not int or chunk_ms <= 0:
         raise ValueError("short-ms must be nonnegative and chunk-ms must be positive")
-    if release_on not in ("semantic-unit", "timed-span"):
-        raise ValueError("release-on must be semantic-unit or timed-span")
+    if release_on not in ("semantic-unit", "timed-span", "merged-unit"):
+        raise ValueError("release-on must be semantic-unit, timed-span or merged-unit")
     stats = Counter(merged_units=0, split_units=0, mixed_units_kept=0, overlapping_switches=0)
     units = _split_mixed(parse_record(record, duration_ms), stats)
     stats["overlapping_switches"] = sum(
         old.end_ms > new.start_ms and old.spans[-1][:2] != new.spans[0][:2]
         for old, new in zip(units, units[1:]))
+    if release_on == "merged-unit":
+        # Step 1 has already chosen the display units. Children are timing
+        # evidence for attribution changes only, not new lexical boundaries.
+        return units, stats
     regions = _reference_regions(reference_text(record))
     groups = _merge(units, regions, short_ms, chunk_ms, stats)
     if release_on == "timed-span":

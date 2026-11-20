@@ -12,8 +12,9 @@ from pathlib import Path
 import soundfile as sf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from fourth_asr.annotation_tail import project_open_tail
 from fourth_asr.protocol import SPK_CHANGE, WAIT, get_protocol
-from fourth_asr.recast import build_sft_row, validate_chunk_ms
+from fourth_asr.recast import build_sft_row, end_frame, validate_chunk_ms
 from fourth_asr.semantic_preparation import prepare_units
 from fourth_asr.timestamped_source import reference_spans
 
@@ -22,11 +23,11 @@ def json_line(value):
     return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":")) + "\n"
 
 
-def reference_body(record):
+def reference_body(spans):
     """Render the source independently of short-fragment merging and release scheduling."""
     expected = []
     last_speaker = None
-    for _, speaker, text in reference_spans(record):
+    for _, speaker, text in spans:
         if text.strip():
             if last_speaker is not None and speaker != last_speaker:
                 expected.append(SPK_CHANGE)
@@ -48,7 +49,7 @@ def checked_changes(expected, replies, protocol):
     return changed
 
 
-def prepare_record(record, audio_root, steps, number_format, release_on, *, protocol, short_ms):
+def prepare_record(record, audio_root, steps, number_format, release_on, *, protocol, short_ms, tail_policy="keep"):
     audios = record.get("audios") if isinstance(record, dict) else None
     if not (isinstance(audios, list) and len(audios) == 1 and
             isinstance(audios[0], str) and audios[0].strip()):
@@ -61,17 +62,29 @@ def prepare_record(record, audio_root, steps, number_format, release_on, *, prot
     if info.frames < 1 or info.samplerate < 1:
         raise ValueError(f"Invalid audio length or sample rate: {path}")
     duration_ms = info.frames * 1000 / info.samplerate
-    expected = reference_body(record)
+    source_spans = reference_spans(record)
+    expected = reference_body(source_spans)
     result = {}
     for step in steps:
         units, preparation = prepare_units(record, duration_ms, chunk_ms=step, short_ms=short_ms,
                                            release_on=release_on)
         audit = {}
-        row = build_sft_row(units, path, info.frames, info.samplerate, step, number_format,
-                            protocol=protocol, audit=audit)
-        real_replies = row["messages"][2:-2:2]
+        # Use the latest original timestamp even for overlapping speech. The file
+        # name and timestamp of the last segment in text order can both mislead.
+        last_annotated = max(t["end_ms"] for t in record["timestamps"])
+        last_frame = end_frame(last_annotated, info.frames, info.samplerate)
+        short_tail = info.frames - last_frame < info.samplerate
+        open_end = tail_policy == "annotated-prefix" or (tail_policy == "short-open" and short_tail)
+        frames, target, stripped = info.frames, expected, False
+        if open_end:
+            if short_tail:
+                units, target, stripped = project_open_tail(units, source_spans[-1][2], expected)
+            frames = end_frame(max(u.end_ms for u in units), info.frames, info.samplerate)
+        row = build_sft_row(units, path, frames, info.samplerate, step, number_format, protocol=protocol,
+                            audit=audit, release_completed=release_on == "merged-unit", open_end=open_end)
+        real_replies = row["messages"][2:2+2*len(row["audios"]):2]
         waits = sum(msg["content"] == WAIT for msg in real_replies)
-        changes = checked_changes(expected, real_replies, protocol)
+        changes = checked_changes(target, real_replies, protocol)
         events = [{"turn": turn, "kind": kind}
                   for kind, turns in (("speaker_change", changes),
                                       ("switch_deferred", audit["switch_deferred_turns"]),
@@ -80,14 +93,18 @@ def prepare_record(record, audio_root, steps, number_format, release_on, *, prot
         events.sort(key=lambda event: event["turn"])
         # A real audio-end event keeps Arrow's nested event schema typed even
         # when the first shard contains only single-speaker, monolingual rows.
-        events.append({"turn": len(real_replies), "kind": "audio_end"})
+        events.append({"turn": len(real_replies), "kind": "annotation_end" if open_end else "audio_end"})
         row["recast"] = {
             "source_audio": str(path), "chunk_ms": step, "merged_units": preparation["merged_units"],
             "events": events,
         }
+        if tail_policy != "keep":
+            row["recast"].update(source_frames=info.frames, supervised_frames=frames,
+                                 terminal_period_removed=stripped)
         stats = Counter(preparation)
         stats.update(audio_turns=len(real_replies), wait_audio_turns=waits,
                      direct_audio_turns=len(real_replies) - waits, speaker_change_turns=len(changes),
+                     open_ended_rows=int(open_end), terminal_periods_removed=int(stripped),
                      switch_deferred_turns=len(audit["switch_deferred_turns"]),
                      punctuation_deferred_turns=len(audit["punctuation_deferred_turns"]))
         result[step] = (json_line(row).encode("utf-8"), stats)
@@ -110,8 +127,12 @@ def main(argv=None):
     parser.add_argument("--audio-root", type=Path, help="Base for relative audio paths (default: input directory)")
     parser.add_argument("--chunk-ms", nargs="+", type=int, default=[1000], metavar="MS")
     parser.add_argument("--short-ms", type=int, default=300, help="Short-fragment merge threshold in ms")
-    parser.add_argument("--release-on", choices=("semantic-unit", "timed-span"), default="semantic-unit",
-                        help="Commit at semantic segment ends or at each validated sub-span end when available")
+    parser.add_argument("--release-on", choices=("semantic-unit", "timed-span", "merged-unit"), default="semantic-unit",
+                        help="Use merged-unit after merge_timestamped_segments.py to emit completed groups immediately")
+    parser.add_argument("--tail-policy", choices=("keep", "short-open", "annotated-prefix"), default="keep",
+                        help="keep: original whole recording; short-open: treat a trailing gap under 1 s as a crop; "
+                             "annotated-prefix: end all examples at the last annotation. Both open modes remove a "
+                             "simple terminal period only for a gap under 1 s.")
     parser.add_argument("--number-format", choices=["normalized", "verbatim"], default="normalized")
     parser.add_argument("--protocol", choices=("speaker", "explicit"), default="speaker",
                         help="Fourth speaker-change protocol; explicit is a CLI alias")
@@ -151,7 +172,7 @@ def main(argv=None):
                 record = json.loads(line)
                 rows, (gap_start, gap_end) = prepare_record(
                     record, audio_root, steps, args.number_format, args.release_on,
-                    protocol=protocol, short_ms=args.short_ms)
+                    protocol=protocol, short_ms=args.short_ms, tail_policy=args.tail_policy)
             except (ValueError, KeyError, TypeError, OSError, OverflowError, RecursionError) as exc:
                 # Serialize errors as ASCII so even malformed Unicode input can be reported.
                 errors.write(json.dumps({"line": line_number, "error": str(exc)}, ensure_ascii=True) + "\n")
@@ -178,7 +199,7 @@ def main(argv=None):
         report = {"input": str(args.input.resolve()), "number_format": args.number_format, "release_on": args.release_on,
                   "kept": kept, "rejected": bad, "chunk_ms": steps, "short_ms": args.short_ms, "by_chunk_ms": counts,
                   "longest_unannotated_gap": longest_gap}
-        report["protocol"] = protocol.name
+        report.update(protocol=protocol.name, tail_policy=args.tail_policy)
         with summary.open("x", encoding="utf-8", newline="\n") as handle:
             json.dump(report, handle, ensure_ascii=False, indent=2)
             handle.write("\n")
