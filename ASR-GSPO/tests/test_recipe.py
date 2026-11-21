@@ -13,7 +13,7 @@ import evaluate
 import prepare_data
 import train_gspo
 from finalize_export import verify_weights
-from asr_gspo.protocol import DIRECT, WAIT
+from asr_gspo.protocol import DIRECT, SPK_CHANGE, WAIT
 from split_data import split
 
 
@@ -34,7 +34,7 @@ def test_full_recording_to_rollout_scores(tmp_path):
                       {"text": "OK", "start_ms": 1100, "end_ms": 1600}]
     }), encoding="utf-8")
     dataset = tmp_path / "task.jsonl"
-    prepare_data.main([str(source), "--output", str(dataset)])
+    prepare_data.main([str(source), "--output", str(dataset), "--timing-mode", "aligned"])
     row = json.loads(dataset.read_text(encoding="utf-8"))
     task = json.loads(row["asr_task"])
     assert task["reference_text"] == "开始。OK."
@@ -51,8 +51,8 @@ def test_full_recording_to_rollout_scores(tmp_path):
 
     traces = tmp_path / "traces.jsonl"
     with traces.open("w", encoding="utf-8") as trace:
-        for variants in ([DIRECT + "开始。", DIRECT + "OK.", WAIT, WAIT],
-                         [WAIT, WAIT, DIRECT + "开始。OK.", WAIT],
+        for variants in ([DIRECT + "开始。", DIRECT + SPK_CHANGE + "OK.", WAIT, WAIT],
+                         [WAIT, WAIT, DIRECT + "开始。" + SPK_CHANGE + "OK.", WAIT],
                          [DIRECT + "开始。", WAIT, WAIT, WAIT]):
             backend = Backend(variants)
             turns = evaluate.model_turns(backend, row, task)

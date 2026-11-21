@@ -1,4 +1,4 @@
-"""Convert full-recording Third annotations to causal ASR GSPO prompts and scorer metadata."""
+"""Convert full-recording Fourth annotations to causal ASR GSPO prompts and scorer metadata."""
 from __future__ import annotations
 
 import json
@@ -12,19 +12,23 @@ import soundfile as sf
 
 from .audio import encode_chunk_ref
 from .protocol import initial_messages
+from .tail_source import tail_text_metadata
 
-from third_asr.recast import validate_chunk_ms
-from third_asr.timestamped_source import HEADER_TIME, LANGUAGE, SPEAKER, TAG, parse_record
+from fourth_asr.recast import validate_chunk_ms, end_frame
+from fourth_asr.annotation_tail import project_open_tail
+from fourth_asr.semantic_preparation import prepare_units
+from fourth_asr.timestamped_source import HEADER_TIME, LANGUAGE, SPEAKER, TAG, parse_record, reference_spans
 
 
-def audio_chunks(frames, rate, chunk_ms, max_turns=65):
-    """Same absolute frame grid and tail padding as Third SFT, with no copied audio."""
+def audio_chunks(frames, rate, chunk_ms, max_turns=65, *, with_eof=True):
+    """Same absolute frame grid and tail padding as Fourth SFT, with no copied audio."""
     validate_chunk_ms(chunk_ms)
     if rate < 1 or frames < 1 or rate * chunk_ms < 1000:
         raise ValueError("Empty audio or chunk shorter than one source sample")
-    required_turns = (frames - 1) * 1000 // (chunk_ms * rate) + 2
+    required_turns = (frames - 1) * 1000 // (chunk_ms * rate) + 1 + int(with_eof)
     if type(max_turns) is not int or max_turns < 2 or required_turns > max_turns:
-        raise ValueError(f"Audio requires {required_turns} turns including EOF; max_turns={max_turns}")
+        suffix = "including EOF" if with_eof else "ending at annotation_end"
+        raise ValueError(f"Audio requires {required_turns} turns {suffix}; max_turns={max_turns}")
     start = 0
     chunks = []
     while start < frames:
@@ -44,6 +48,12 @@ def transcript_parts(row):
     cleaned = HEADER_TIME.sub("", answer["content"])
     if "content_original" in answer and cleaned != answer["content_original"]:
         raise ValueError("content_original differs from the timestamp-stripped transcript")
+    if re.search(rf"<{SPEAKER}>", cleaned) and re.search(rf"<{LANGUAGE}>", cleaned):
+        # Use Fourth's exact attribution rules for fully labelled data,
+        # including rejecting contradictory adjacent headers without speech.
+        if not TAG.sub("", cleaned).strip():
+            raise ValueError("Transcript contains only attribution tags")
+        return list(reference_spans(row))
 
     lang = row.get("lang", "und")
     if not isinstance(lang, str) or not re.fullmatch(LANGUAGE, lang):
@@ -110,7 +120,6 @@ def _checked_alignment(entries, reference, duration_ms):
         raise ValueError("Expected a list of timed units")
     alignment = []
     cursor = 0
-    previous_start = previous_end = 0
     for i, item in enumerate(entries):
         if not isinstance(item, dict):
             raise ValueError(f"Invalid alignment entry {i}")
@@ -137,14 +146,12 @@ def _checked_alignment(entries, reference, duration_ms):
         begin, finish = _timing(item, "start"), _timing(item, "end")
         if begin is None and finish is None:
             continue
-        if ((begin is not None and not previous_start <= begin <= duration_ms + 1e-6) or
-            (finish is not None and not previous_end <= finish <= duration_ms + 1e-6) or
+        if ((begin is not None and not 0 <= begin <= duration_ms + 1e-6) or
+            (finish is not None and not 0 <= finish <= duration_ms + 1e-6) or
             (finish is not None and begin is not None and begin >= finish)):
             raise ValueError(f"Invalid chronological/audio bounds at alignment entry {i}")
-        if begin is not None:
-            previous_start = begin
-        if finish is not None:
-            previous_end = finish
+        # Transcript order is checked by offsets. Overlapping speakers can
+        # have nested intervals, so acoustic ends need not be monotonic.
         alignment.append(dict(text=text, start_ms=begin, end_ms=finish, char_start=start, char_end=end))
     return alignment
 
@@ -235,7 +242,7 @@ def _check_audio_identity(metadata, path, root, duration_ms):
 
 
 def _native_aligned_row(row):
-    """Read the repository's schema-v2 alignment output through the Third validator."""
+    """Read the repository's schema-v2 alignment output through the Fourth validator."""
     if row.get("status") != "ok" or row.get("schema_version") != 2:
         raise ValueError("Expected successful schema_version=2 aligned_asr output")
     segments = row.get("segments")
@@ -251,9 +258,51 @@ def _native_aligned_row(row):
                 output={"segments": segments}, timestamps=stamps)
 
 
-def prepare_record(row, audio_root, chunk_ms=1000, max_turns=65):
+def _tail_projection(row, parts, info, chunk_ms, policy):
+    """Use the same unit parser and tail projection as Fourth build_sft."""
+    if policy not in ("keep", "short-open", "annotated-prefix"):
+        raise ValueError("Unknown tail-policy")
+    if policy == "keep" or not parts:
+        return parts, info.frames, False, None
+    stamps = row.get("timestamps")
+    if not stamps or not all(isinstance(s, dict) and "end_ms" in s for s in stamps):
+        raise ValueError("Open tail policies require per-unit timestamps, not switch-onset-only annotations")
+    duration_ms = info.frames * 1000 / info.samplerate
+    units, _ = prepare_units(row, duration_ms, chunk_ms=chunk_ms, short_ms=0, release_on="merged-unit")
+    last = end_frame(max(t["end_ms"] for t in stamps), info.frames, info.samplerate)
+    short = info.frames - last < info.samplerate
+    opened = policy == "annotated-prefix" or short
+    if not opened:
+        return parts, info.frames, False, None
+    text = "".join(p[2] for p in parts)
+    target = text
+    if short:
+        units, target, stripped = project_open_tail(units, parts[-1][2], text)
+    else:
+        stripped = False
+    removed = None
+    if stripped:
+        removed = next(i for i, (a, b) in enumerate(zip(text + "\0", target + "\0")) if a != b)
+        old_parts, parts, cursor = parts, [], 0
+        for lang, speaker, body in old_parts:
+            lo, hi = cursor, cursor + len(body)
+            cursor = hi
+            if lo <= removed < hi:
+                body = body[:removed-lo] + body[removed-lo+1:]
+            parts.append((lang, speaker, body))
+    frames = end_frame(max(u.end_ms for u in units), info.frames, info.samplerate)
+    return parts, frames, True, removed
+
+
+def prepare_record(row, audio_root, chunk_ms=1000, max_turns=65, *, tail_policy="keep", timing_mode="tail-only"):
     if not isinstance(row, dict):
         raise ValueError("Expected a JSON object")
+    if timing_mode not in ("tail-only", "aligned"):
+        raise ValueError("timing_mode must be tail-only or aligned")
+    if timing_mode == "tail-only" and tail_policy != "keep":
+        raise ValueError("tail-only timing requires --tail-policy keep; open-tail projection needs --timing-mode aligned")
+    if type(row.get("punctuation_trusted", True)) is not bool:
+        raise ValueError("punctuation_trusted must be a JSON boolean")
     if row.get("kind") == "aligned_asr":
         row = _native_aligned_row(row)
     paths = row.get("audios")
@@ -262,8 +311,14 @@ def prepare_record(row, audio_root, chunk_ms=1000, max_turns=65):
     root = Path(audio_root)
     path = (root / paths[0]).resolve(strict=True)
     info = sf.info(str(path))
-    chunks = audio_chunks(info.frames, info.samplerate, chunk_ms, max_turns)
     parts = transcript_parts(row)
+    original_reference = "".join(p[2] for p in parts)
+    # The final distilled DIRECT may omit a stop still present in the source.
+    # Preserve source text; withhold only that uncertain terminal-stop reward.
+    terminal_trusted = (tail_text_metadata(row, original_reference)["terminal_punctuation_trusted"]
+                        if timing_mode == "tail-only" and any(c.isalnum() for c in original_reference) else True)
+    parts, supervised_frames, opened, removed = _tail_projection(row, parts, info, chunk_ms, tail_policy)
+    chunks = audio_chunks(supervised_frames, info.samplerate, chunk_ms, max_turns, with_eof=not opened)
     spans = []
     for lang, _, body in parts:
         if spans and spans[-1]["lang"] == lang:
@@ -273,13 +328,41 @@ def prepare_record(row, audio_root, chunk_ms=1000, max_turns=65):
     reference = "".join(s["text"] for s in spans)
     duration_ms = 1000 * info.frames / info.samplerate
     _check_audio_identity(row, path, root, duration_ms)
-    if isinstance(row.get("alignment"), dict):
+    if timing_mode == "aligned" and isinstance(row.get("alignment"), dict):
         _check_audio_identity(row["alignment"], path, root, duration_ms)
         if row.get("id") is not None and row["alignment"].get("id") is not None:
             if str(row["id"]) != str(row["alignment"]["id"]):
                 raise ValueError("Acoustic alignment belongs to another record ID")
-    alignment = _alignment(row, reference, duration_ms)
-    switches = _switches(row, reference, duration_ms)
+    # In the default source-transcript path, legacy semantic chunks/actions are
+    # not policy targets and their timestamps are not latency supervision. The
+    # independent filter uses just the final endpoint when punctuation needs it.
+    # Keep an opt-in path for experiments with validated word/semantic timing.
+    alignment = _alignment(row, original_reference, duration_ms) if timing_mode == "aligned" else []
+    switches = _switches(row, original_reference, duration_ms) if timing_mode == "aligned" else []
+    if removed is not None:
+        def projected_offset(i):
+            return i - int(i > removed)
+        projected = []
+        for item in alignment:
+            lo, hi = projected_offset(item["char_start"]), projected_offset(item["char_end"])
+            if lo < hi:
+                projected.append(dict(item, char_start=lo, char_end=hi, text=reference[lo:hi]))
+        alignment = projected
+        switches = [dict(s, char_start=projected_offset(s["char_start"])) for s in switches]
+    effective_ms = supervised_frames * 1000 / info.samplerate
+    if opened:
+        # A separately timed final period may have shortened the supervised
+        # range. Do not invent a new acoustic end for its enclosing text span.
+        alignment = [dict(a, end_ms=(None if a.get("end_ms") is not None and a["end_ms"] > effective_ms + .001 else a.get("end_ms")))
+                     for a in alignment if a.get("start_ms") is None or a["start_ms"] < effective_ms]
+    attributed, speaker_changes, cursor, previous = [], [], 0, None
+    for lang, speaker, body in parts:
+        attributed.append(dict(text=body, lang=lang, speaker=speaker, char_start=cursor, char_end=cursor+len(body)))
+        if body.strip():
+            if previous is not None and speaker != previous:
+                speaker_changes.append(cursor)
+            previous = speaker
+        cursor += len(body)
     bucket = row.get("bucket", "switch" if len(spans) > 1 else ("general" if reference else "stability"))
     if bucket not in ("general", "switch", "stability"):
         raise ValueError(f"Unknown sampling bucket {bucket!r}")
@@ -289,8 +372,15 @@ def prepare_record(row, audio_root, chunk_ms=1000, max_turns=65):
     stat = path.stat()
     task = dict(id=str(identity), audio_path=str(path), audio_size_bytes=stat.st_size,
                 audio_mtime_ns=stat.st_mtime_ns, source_ids=_source_ids(row, path, root),
-                bucket=bucket, duration_seconds=info.frames / info.samplerate,
+                protocol="fourth_speaker_v1", end_policy="annotation_end" if opened else "eof",
+                tail_policy=tail_policy, timing_mode=timing_mode, terminal_period_removed=removed is not None,
+                source_duration_seconds=info.frames / info.samplerate,
+                bucket=bucket, duration_seconds=supervised_frames / info.samplerate,
                 chunks=chunks, reference_text=reference, spans=spans, alignment=alignment)
+    task.update(attribution_spans=attributed, speaker_changes=speaker_changes,
+                speaker_scorable=bool(parts) and all(s is not None for _, s, body in parts if body.strip()),
+                punctuation_trusted=row.get("punctuation_trusted", True),
+                terminal_punctuation_trusted=terminal_trusted)
     if switches:
         task["switches"] = switches
     return dict(messages=initial_messages(), audios=[encode_chunk_ref(task, 0)],

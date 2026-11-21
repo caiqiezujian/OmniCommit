@@ -1,20 +1,21 @@
-"""Reference-based trajectory rewards for the explicit Third streaming protocol."""
+"""CER-led trajectory rewards for Fourth streaming ASR."""
 from __future__ import annotations
 
 from bisect import bisect_left
-from collections import Counter
 from dataclasses import dataclass
 from math import ceil, isclose
 import unicodedata
 
-from third_asr.protocol import WAIT, get_protocol
+from .protocol import PROTOCOL, SPK_CHANGE, WAIT, total_turns
+from .character_quality import cer_metrics, local_switch_cer
+from .speaker_quality import speaker_metrics
+from .timing_quality import timing_metrics
 
 from .sentence_boundaries import sentence_boundary_errors
 from .switch_quality import disjoint_script_metrics, switch_quality_metrics
 
-PROTOCOL = get_protocol("explicit")
 SWITCH_HEAD = 3
-DELAY_SCALE_SECONDS = 4.0
+REWARD_VERSION = "fourth_boundary_v2"
 
 
 @dataclass(frozen=True)
@@ -187,7 +188,7 @@ def _anchors(task, ref):
 
 def _parse_turns(task, turns):
     chunks = task["chunks"]
-    if len(turns) != len(chunks) + 1:
+    if len(turns) != total_turns(task):
         return "incomplete_trajectory", [], [], []
     pieces, char_ends, times = [], [], []
     length = 0
@@ -213,13 +214,16 @@ def _parse_turns(task, turns):
     return None, pieces, char_ends, times
 
 
-def score_trajectory(task, turns, mode="quality_latency"):
+def score_trajectory(task, turns, mode="quality_latency", *, switch_grace_turns=1):
     """Score one candidate independently, before the trainer's group comparison."""
     if mode not in ("quality", "quality_latency"):
         raise ValueError("expected quality or quality_latency reward mode")
+    if type(switch_grace_turns) is not int or not 0 <= switch_grace_turns <= 4:
+        raise ValueError("switch_grace_turns must be an integer in 0..4")
     reason, pieces, char_ends, commit_times = _parse_turns(task, turns)
     if reason:
-        return {"valid": False, "reason": reason, "reward": -3.0}
+        return {"valid": False, "reason": reason, "reward": -3.0,
+                "reward_version": REWARD_VERSION, "switch_grace_turns": switch_grace_turns}
     text = task["reference_text"]
     ref = _units(text)
     changes = _changed_spans(task.get("spans"), text)
@@ -228,13 +232,23 @@ def score_trajectory(task, turns, mode="quality_latency"):
     # Choose the scoring granularity from the reference alone and apply it to
     # both sides, so omission/addition of a space cannot hide the switch head.
     characters = False
-    for start, _ in changes:
+    for start in [lo for lo, _ in changes] + task.get("speaker_changes", []):
         previous = bisect_left(starts, start) - 1
         if previous >= 0 and start < ref[previous].end:
             characters = True
             ref = _units(text, characters=True)
             break
-    hypothesis = "".join(pieces)
+    speaker_offsets, clean_pieces, clean_ends, cursor = [], [], [], 0
+    for piece in pieces:
+        sections = piece.split(SPK_CHANGE)
+        for i, section in enumerate(sections):
+            if i:
+                speaker_offsets.append(cursor)
+            cursor += len(section)
+        clean_pieces.append("".join(sections))
+        clean_ends.append(cursor)
+    hypothesis = "".join(clean_pieces)
+    char_ends = clean_ends
     hyp = _units(hypothesis, characters=characters)
     onsets, offsets = _anchors(task, ref)
     emitted_at = [commit_times[bisect_left(char_ends, unit.end)] for unit in hyp]
@@ -259,7 +273,8 @@ def score_trajectory(task, turns, mode="quality_latency"):
                 inserts += 1
     errors = len(deleted) + subs + inserts
     error_rate = errors / max(1, len(ref))
-    quality = 1 - min(2., error_rate)
+    cer = cer_metrics(text, hypothesis)
+    quality = 1 - min(2., cer["cer"])
     if not ref and not text.strip() and pieces:
         # Even punctuation-only DIRECTs are hallucinations in an annotated silent clip.
         quality = -1.
@@ -272,45 +287,50 @@ def score_trajectory(task, turns, mode="quality_latency"):
             short_count += 1
             short_dels += all(i in deleted for i in range(lo, hi))
     switch_error = sum(local_errors) / max(1, len(local_errors))
-    grid = [c["end_seconds"] for c in task["chunks"]]
-    delays = []
-    switch_head = {i for lo, hi, _ in windows for i in range(lo, hi)}
-    switch_delays = []
-    early = {i for i in matches if i in onsets and matches[i] + 1e-6 < onsets[i]}
-    missing_or_early = 0
-    for i, end in offsets.items():
-        if i not in matches or i in early:
-            missing_or_early += 1
-            continue
-        eligible = grid[bisect_left(grid, end - 1e-6)]
-        delay = max(0., matches[i] - eligible)
-        delays.append(delay)
-        if i in switch_head:
-            switch_delays.append(delay)
-    delays.sort()
-    # Missing timed words receive the maximum timing cost, so skipping a late
-    # word cannot improve the timing component. Raw latency metrics use matches only.
-    # A soft cost distinguishes long stalls even above eight or thirty seconds.
-    delay_costs = [d / (DELAY_SCALE_SECONDS + d) for d in delays] + [1.] * missing_or_early
-    timing_cost = (sum(delay_costs) / len(delay_costs)) if delay_costs else 0.
     switch_content = switch_quality_metrics(ref, hyp, changes, operations)
+    local_cer = local_switch_cer(text, ref, hyp, changes, operations, hypothesis=hypothesis)
+    speakers, attributed_units = speaker_metrics(task, ref, hyp, operations, speaker_offsets, return_details=True)
+    timing = timing_metrics(ref, changes,
+                            task.get("speaker_changes", []) if task.get("speaker_scorable") else [],
+                            [c["end_seconds"] for c in task["chunks"]], onsets, offsets, matches,
+                            grace_turns=switch_grace_turns, head_units=SWITCH_HEAD,
+                            attributed_units=attributed_units, alignment=task.get("alignment") or [])
     scripts = disjoint_script_metrics(ref, hyp, operations)
-    boundaries = sentence_boundary_errors(text, hypothesis, ref, hyp, operations)
-    extra = boundaries["extra_internal_periods"]
-    # First extra full stop costs 0.20; repeated fragmentation costs progressively
-    # more, with a cap below the cost of losing a complete switched phrase.
-    punctuation_penalty = .60 * extra / (2 + extra)
-    punctuation_penalty += .12 * boundaries["missing_sentence_stops"] / max(1, boundaries["reference_sentence_stops"])
+    boundaries = sentence_boundary_errors(text, hypothesis, ref, hyp, operations,
+                                         trusted=task.get("punctuation_trusted", True),
+                                         score_terminal=(task.get("end_policy", "eof") == "eof"
+                                                         and task.get("terminal_punctuation_trusted", True)))
+    extra = boundaries["extra_internal_stops"]
+    punctuation_cost = .60 * extra / (2 + extra)
+    punctuation_cost += .12 * boundaries["missing_sentence_stops"] / max(1, boundaries["reference_sentence_stops"])
+    short_breaks = boundaries["unsupported_short_breaks"]
+    punctuation_cost += .10 * short_breaks / (1 + short_breaks)
+    # Punctuation needs exact lexical anchors. A typo can destroy those anchors;
+    # never let that evade a larger cost than the typo itself. Combined with the
+    # latency cap (.5/N), these auxiliary deductions stay below one CER edit.
+    punctuation_penalty = min(.10, .25 / max(1, cer["reference_characters"])) * min(1., punctuation_cost)
     runs = scripts["script_mismatch_runs"]
     # A translated switch can trigger both detectors for the same words.
-    language_penalty = .90 * max(switch_content["switch_content_error"], runs / (1 + runs))
+    language_penalty = .90 * max(switch_content["switch_content_error"], local_cer["switch_cer_cost"], runs / (1 + runs))
     reward = quality - .40 * switch_error - .20 * short_dels / max(1, short_count)
-    reward -= language_penalty + punctuation_penalty
+    speaker_attribution_penalty = .40 * speakers["speaker_attribution_error"]
+    speaker_penalty = .40 * speakers["speaker_error"] + speaker_attribution_penalty
+    reward -= language_penalty + punctuation_penalty + speaker_penalty
+    # A bounded latency deduction, gated by *both* overall and local quality.
+    # No latency bonus for translating, dropping a switch, or losing a speaker.
+    quality_gate = max(0., 1 - cer["cer"]) * (1 - max(
+        switch_content["switch_content_error"], local_cer["switch_cer_cost"], speakers["speaker_error"],
+        speakers["speaker_attribution_error"]))
+    latency_penalty = 0.
     if mode == "quality_latency":
-        reward -= .15 * timing_cost + .10 * len(early) / max(1, len(onsets))
-    if ref and not matches:
-        # No coverage: emitting unrelated words must never beat an all-WAIT
-        # trajectory just because DIRECT contained something.
+        # Even a maximally stalled exact transcript must not lose to one
+        # character error just because the erroneous candidate is fast.
+        latency_penalty = min(.10, .5 / max(1, cer["reference_characters"])) * quality_gate * timing["timing_cost"]
+        reward -= latency_penalty + .10 * timing["early_units"] / max(1, len(onsets))
+    if ref and not matches and cer["cer"] >= .5:
+        # No exact lexical coverage plus large character error: unrelated
+        # output must not gain from merely containing letters in common.
+        # Keep small spelling errors graded by CER even without an exact word.
         reward = -2.5 - .20 * min(1., len(hyp) / len(ref))
     elif reward < -2.0:
         # Preserve ordering among poor partial transcripts while keeping them
@@ -319,17 +339,14 @@ def score_trajectory(task, turns, mode="quality_latency"):
         reward = -2.0 - .5 * excess / (.5 + excess)
     return {
         "valid": True, "reason": None, "reward": reward, "quality": quality,
+        "reward_version": REWARD_VERSION,
         "unit_mode": "character_cross_boundary" if characters else "mixed",
         "reference_units": len(ref), "matched_units": len(matches), "errors": errors,
         "substitutions": subs, "deletions": len(deleted), "insertions": inserts,
         "error_rate": error_rate, "switch_segments": len(windows), "switch_error_rate": switch_error,
         "short_switch_segments": short_count, "short_switch_deletions": short_dels,
-        **switch_content, **scripts, **boundaries,
+        **cer, **local_cer, **speakers, **switch_content, **scripts, **boundaries, **timing,
         "language_penalty": language_penalty, "punctuation_penalty": punctuation_penalty,
-        "timed_units": len(offsets), "timed_matches": sum(i in matches for i in offsets),
-        "delay_samples": len(delays), "early_units": len(early), "timing_cost": timing_cost,
-        "extra_wait_ms_histogram": dict(Counter(round(d * 1000) for d in delays)),
-        "switch_extra_wait_ms_histogram": dict(Counter(round(d * 1000) for d in switch_delays)),
-        "mean_extra_wait_seconds": sum(delays) / len(delays) if delays else None,
-        "delay_p95_seconds": delays[ceil(.95 * len(delays)) - 1] if delays else None,
+        "punctuation_cost": punctuation_cost, "speaker_attribution_penalty": speaker_attribution_penalty,
+        "speaker_penalty": speaker_penalty, "latency_penalty": latency_penalty, "quality_gate": quality_gate,
     }

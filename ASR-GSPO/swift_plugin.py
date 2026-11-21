@@ -16,18 +16,19 @@ from asr_gspo.audio import SAMPLE_RATE, materialize_chunk_refs
 from asr_gspo.online import ASRStreamHooks, score_batch
 from asr_gspo.protocol import WAIT
 from asr_gspo.rollout_sync import install_rollout_sync_patch
+from asr_gspo.export_callback import register_export_callback
 
 
 class OmniCommitASRTemplate(Qwen3OmniTemplate):
     def _preprocess_inputs(self, inputs):
         if getattr(self, "sampling_rate", SAMPLE_RATE) != SAMPLE_RATE:
-            raise ValueError("OmniCommit Third requires 16 kHz audio")
+            raise ValueError("OmniCommit Fourth requires 16 kHz audio")
         inputs.audios = materialize_chunk_refs(inputs.audios)
         return super()._preprocess_inputs(inputs)
 
     @staticmethod
     def _add_dynamic_eos(input_ids, labels, loss_scale, suffix_tokens_id):
-        # Third returns immediately after a sampled WAIT. A later prompt adds
+        # Fourth returns immediately after a sampled WAIT. A later prompt adds
         # the normal ChatML separator; that separator has no policy logprob.
         # Keep its existing mask. Real sampled EOS tokens already carry masks.
         return None
@@ -43,10 +44,12 @@ class OnlineASRReward(ORM):
     def __init__(self, **kwargs):
         super().__init__()
         self.mode = os.environ.get("ASR_GSPO_REWARD_MODE", "quality_latency")
+        self.switch_grace_turns = int(os.environ.get("ASR_GSPO_SWITCH_GRACE_TURNS", "1"))
         self.log_dir = os.environ.get("ASR_GSPO_LOG_DIR")
 
     def __call__(self, completions, asr_task=None, rollout_infos=None, **kwargs):
-        return score_batch(completions, asr_task, rollout_infos, mode=self.mode, log_dir=self.log_dir)
+        return score_batch(completions, asr_task, rollout_infos, mode=self.mode, log_dir=self.log_dir,
+                           switch_grace_turns=self.switch_grace_turns)
 
 
 meta = QwenTemplateMeta(
@@ -58,3 +61,4 @@ meta.stop_words.append(WAIT)
 register_template(meta)
 multi_turns["asr_stream"] = ASRStreamScheduler
 orms["asr_online"] = OnlineASRReward
+register_export_callback()

@@ -1,4 +1,4 @@
-"""Evaluate full Third trajectories from a local merged model or saved candidate traces."""
+"""Evaluate full Fourth trajectories from a local merged model or saved candidate traces."""
 import argparse
 from collections import Counter, defaultdict
 import io
@@ -7,8 +7,8 @@ import json
 import math
 from pathlib import Path
 
-from asr_gspo.reward import score_trajectory
-from asr_gspo.protocol import EOS, parse_reply
+from asr_gspo.reward import REWARD_VERSION, _changed_spans, score_trajectory
+from asr_gspo.protocol import EOS, parse_reply, total_turns
 
 
 def read_jsonl(path):
@@ -24,11 +24,11 @@ def read_jsonl(path):
 def model_turns(backend, row, task):
     import soundfile as sf
     from asr_gspo.audio import encode_chunk_ref, materialize_chunk_refs
-    from third_asr.runtime.streaming import ContextBudgetError, GenerationTruncated
+    from fourth_asr.runtime.streaming import ContextBudgetError, GenerationTruncated
 
     messages = [dict(row["messages"][0])]
     audios, turns = [], []
-    for ix in range(len(task["chunks"]) + 1):
+    for ix in range(total_turns(task)):
         eof = ix == len(task["chunks"])
         if not eof:
             wav, = materialize_chunk_refs([encode_chunk_ref(task, ix)])
@@ -80,9 +80,9 @@ def eval_cases(args):
                 raise ValueError(f"Trace ID {task_id!r} is absent in the supplied manifest")
             yield tasks[task_id], candidate["turns"]
         return
-    from third_asr.service_backend import build_backend, detect_model_protocol
-    if detect_model_protocol(args.model) != "explicit":
-        raise ValueError("Expected a merged explicit Third checkpoint")
+    from fourth_asr.service_backend import build_backend, detect_model_protocol
+    if detect_model_protocol(args.model) != "speaker":
+        raise ValueError("Expected a merged explicit Fourth checkpoint")
     # vLLM profiles these audiovisual limits once when creating the engine.
     max_rounds, max_input = 0, 0.
     for row in itertools.islice(read_jsonl(args.dataset), args.limit):
@@ -115,6 +115,19 @@ def summarize(group, waits, switch_waits):
         return group[a] / group[b] if group[b] else None
     return {"cases": group["cases"], "invalid": group["invalid"],
             "mean_reward": ratio("reward", "cases"),
+            "valid_cer": ratio("character_errors", "reference_characters"),
+            "reference_characters": group["reference_characters"],
+            "speaker_missed_changes": group["speaker_missed_changes"],
+            "speaker_extra_changes": group["speaker_extra_changes"],
+            "speaker_correct_changes": group["speaker_correct_changes"],
+            "speaker_reference_changes": group["speaker_reference_changes"],
+            "speaker_predicted_changes": group["speaker_predicted_changes"],
+            "speaker_misattributed_characters": group["speaker_misattributed_characters"],
+            "speaker_deleted_turn_characters": group["speaker_deleted_turn_characters"],
+            "speaker_attribution_characters": group["speaker_attribution_characters"],
+            "speaker_shifted_changes": group["speaker_shifted_changes"],
+            "speaker_unpaired_changes": group["speaker_unpaired_changes"],
+            "unsupported_short_breaks": group["unsupported_short_breaks"],
             "valid_mixed_unit_error_rate": ratio("errors", "reference_units"),
             "valid_reference_units": group["reference_units"],
             "switches": group["switch_segments"],
@@ -127,14 +140,31 @@ def summarize(group, waits, switch_waits):
             "punctuation_scored_trajectories": group["punctuation_scorable"],
             "scored_internal_gaps": group["scored_internal_gaps"],
             "extra_internal_periods": group["extra_internal_periods"],
+            "extra_internal_stops": group["extra_internal_stops"],
             "reference_sentence_stops": group["reference_sentence_stops"],
             "missing_sentence_stops": group["missing_sentence_stops"],
             "short_switch_segments": group["short_switch_segments"], "timed_matches": group["timed_matches"],
             "timed_units": group["timed_units"], "early_units": group["early_units"],
+            "attributed_timed_matches": group["attributed_timed_matches"],
+            "attributed_timing_coverage": ratio("attributed_timed_matches", "timed_units"),
+            "timing_wrong_side_units": group["timing_wrong_side_units"],
+            "switch_grace_used_units": group["switch_grace_used_units"],
+            "switch_timed_units": group["switch_timed_units"],
+            "p50_extra_wait_seconds": percentile(waits, .50),
             "p95_extra_wait_seconds": percentile(waits, .95),
+            "p50_switch_head_extra_wait_seconds": percentile(switch_waits, .50),
             "p95_switch_head_extra_wait_seconds": percentile(switch_waits, .95),
             "switch_head_delay_samples": sum(switch_waits.values()),
             "mean_valid_matched_extra_wait_seconds": ratio("sum_delay", "delay_weight")}
+
+
+def evaluation_groups(task):
+    """Keep dataset buckets and add exclusive switch cohorts for comparison."""
+    language = bool(_changed_spans(task.get("spans"), task["reference_text"]))
+    speaker = bool(task.get("speaker_scorable") and task.get("speaker_changes"))
+    cohort = ("both" if language and speaker else "language_only" if language
+              else "speaker_only" if speaker else "none")
+    return tuple(dict.fromkeys(("all", task["bucket"], "boundary/" + cohort)))
 
 
 def evaluate(args):
@@ -150,22 +180,28 @@ def evaluate(args):
         raise FileExistsError(summary_file)
     with args.output.open("x", encoding="utf-8") as output:
         for task, turns in eval_cases(args):
-            result = score_trajectory(task, turns, mode=args.reward_mode)
+            result = score_trajectory(task, turns, mode=args.reward_mode,
+                                      switch_grace_turns=getattr(args, "switch_grace_turns", 1))
             record = {"id": task["id"], "bucket": task["bucket"], "mode": args.reward_mode,
                       "turns": turns, "score": result}
             output.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
             output.flush()
-            for key in ("all", task["bucket"]):
+            for key in evaluation_groups(task):
                 group = groups[key]
                 group.update(cases=1, reward=result["reward"], invalid=int(not result["valid"]))
                 if result["valid"]:
                     waits[key].update(result["extra_wait_ms_histogram"])
                     switch_waits[key].update(result["switch_extra_wait_ms_histogram"])
                     group.update({name: result[name] for name in (
+                        "character_errors", "reference_characters", "speaker_missed_changes", "speaker_extra_changes",
+                        "speaker_misattributed_characters", "speaker_deleted_turn_characters", "speaker_attribution_characters",
+                        "speaker_shifted_changes", "speaker_unpaired_changes", "attributed_timed_matches",
+                        "timing_wrong_side_units", "switch_grace_used_units", "switch_timed_units",
+                        "speaker_correct_changes", "speaker_reference_changes", "speaker_predicted_changes", "unsupported_short_breaks",
                         "errors", "reference_units", "short_switch_deletions", "short_switch_segments",
                         "switch_segments", "timed_units", "timed_matches", "early_units",
                         "switch_content_spans", "switch_content_fully_missed", "script_mismatch_runs", "punctuation_scorable",
-                        "scored_internal_gaps", "extra_internal_periods", "reference_sentence_stops",
+                        "scored_internal_gaps", "extra_internal_periods", "extra_internal_stops", "reference_sentence_stops",
                         "missing_sentence_stops")})
                     group["switch_errors_sum"] += result["switch_error_rate"] * result["switch_segments"]
                     if result["switch_content_spans"]:
@@ -176,6 +212,8 @@ def evaluate(args):
     if not groups:
         raise ValueError("No candidates evaluated")
     report = {key: summarize(group, waits[key], switch_waits[key]) for key, group in groups.items()}
+    for group in report.values():
+        group.update(reward_version=REWARD_VERSION, switch_grace_turns=getattr(args, "switch_grace_turns", 1))
     summary_file.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(report, indent=2))
     return report
@@ -189,6 +227,8 @@ def main():
         parser.add_argument("dataset", type=Path, help="Prepared evaluation JSONL")
         parser.add_argument("--output", type=Path, required=True, help="New file for traces and per-example scores")
         parser.add_argument("--reward-mode", choices=("quality", "quality_latency"), default="quality_latency")
+        parser.add_argument("--switch-grace-turns", type=int, choices=range(5), default=1,
+                            help="Use the same confirmation allowance as training")
         parser.add_argument("--limit", type=int, help="Use the same first N evaluation rows for all checkpoints")
         if name == "model":
             parser.add_argument("--model", type=Path, required=True)
@@ -198,7 +238,7 @@ def main():
             parser.add_argument("--tensor-parallel-size", type=int, default=1)
             parser.add_argument("--gpu-memory-utilization", type=float, default=.85)
             parser.add_argument("--attention", choices=("sdpa", "flash_attention_2", "eager"), default="sdpa")
-            parser.set_defaults(protocol="explicit", context_policy="window", enable_recovery=False,
+            parser.set_defaults(protocol="speaker", context_policy="window", enable_recovery=False,
                                 device_map="auto", dtype="auto", max_reference_seconds=.5,
                                 enable_prefix_caching=True, mm_processor_cache_gb=0, vllm_image_slots=1)
         else:

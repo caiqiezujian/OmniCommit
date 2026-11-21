@@ -37,6 +37,10 @@ def main(argv=None):
     parser.add_argument("--chunk-ms", default=1000, type=int)
     parser.add_argument("--max-turns", default=65, type=int,
                         help="Maximum number of rollout turns including EOF (default: %(default)s)")
+    parser.add_argument("--tail-policy", choices=("keep", "short-open", "annotated-prefix"), default="keep",
+                        help="Keep full source audio/text by default; open-tail policies require aligned timing mode")
+    parser.add_argument("--timing-mode", choices=("tail-only", "aligned"), default="tail-only",
+                        help="tail-only: full source transcript, timestamps used only by filter_tail.py; aligned: opt in to detailed timing rewards")
     parser.add_argument("--skip-invalid", action="store_true", help="Continue after invalid input rows")
     parser.add_argument("--rejects", type=Path, help="Write skipped row numbers and reasons here (implies --skip-invalid)")
     args = parser.parse_args(argv)
@@ -46,6 +50,8 @@ def main(argv=None):
         parser.error(str(exc))
     if args.max_turns < 2:
         parser.error("--max-turns must allow at least one audio turn and EOF")
+    if args.timing_mode == "tail-only" and args.tail_policy != "keep":
+        parser.error("--timing-mode tail-only requires --tail-policy keep")
     paths = [p.resolve() for p in (args.input, args.output, args.rejects) if p is not None]
     if len(set(paths)) != len(paths):
         parser.error("Input, output and rejects must be distinct paths")
@@ -63,7 +69,8 @@ def main(argv=None):
         for line, raw in enumerate(source, 1):
             try:
                 record = json.loads(raw.decode("utf-8-sig" if line == 1 else "utf-8"))
-                prepared = prepare_record(record, audio_root, args.chunk_ms, args.max_turns)
+                prepared = prepare_record(record, audio_root, args.chunk_ms, args.max_turns,
+                                          tail_policy=args.tail_policy, timing_mode=args.timing_mode)
                 encoded = json.dumps(prepared, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
                 # Unpaired UTF-16 surrogates are syntactically valid JSON escapes,
                 # but would make the prepared UTF-8 row unwritable.
@@ -82,6 +89,7 @@ def main(argv=None):
                 target.write(encoded + "\n")
                 counts["kept"] += 1
                 buckets[task["bucket"]] += 1
+                timing["mode_" + task["timing_mode"]] += 1
                 if any(unit.get("end_ms") is not None for unit in task["alignment"]):
                     timing["has_reference_end"] += 1
                 elif task.get("switches"):

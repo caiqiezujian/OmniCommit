@@ -1,6 +1,6 @@
 """Local reference-word fidelity at annotated language changes.
 
-The text-only Third protocol does not predict language IDs. Shared words and
+The Fourth protocol does not predict language IDs. Shared words and
 borrowings are scored against the actual transcript, independent of its tags.
 """
 from bisect import bisect_left

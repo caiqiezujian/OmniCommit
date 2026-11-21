@@ -181,12 +181,14 @@ class TestPinnedSwift(unittest.TestCase):
         qwen = SimpleNamespace(Qwen3OmniTemplate=object, QwenTemplateMeta=lambda *a, **kw: SimpleNamespace(
             stop_words=["<|endoftext|>"], **kw))
         fake = {"swift.rewards": SimpleNamespace(ORM=object, orms={}),
+                "swift.megatron.callbacks": SimpleNamespace(MegatronCallback=object, megatron_callbacks_map={}),
                 "swift.rollout": SimpleNamespace(MultiTurnScheduler=ns["MultiTurnScheduler"], multi_turns={}),
                 "swift.template": SimpleNamespace(register_template=registrations.append),
                 "swift.template.templates.qwen": qwen}
         with patch.dict(sys.modules, fake):
             plugin = runpy.run_path(str(Path(__file__).resolve().parents[1] / "swift_plugin.py"))
         self.assertIn(WAIT, registrations[0].stop_words)
+        self.assertIn("omnicommit_export", fake["swift.megatron.callbacks"].megatron_callbacks_map)
         load("infer_engine/infer_engine.py", ["_get_stop_token_ids"], owner="InferEngine")
         tk = SimpleNamespace(encode=lambda t, **kw: [2] if t == WAIT else [6])
         self.assertIn(2, ns["_get_stop_token_ids"](SimpleNamespace(tokenizer=tk), registrations[0].stop_words))

@@ -1,160 +1,79 @@
-# 给 OmniCommit Third 做流式 ASR 强化学习
+# OmniCommit Fourth 流式 ASR GSPO
 
-输入是原始录音和完整的原语言转录。模型从你们已经训练好的 **Third explicit 合并 HF 权重** 出发，每轮听到一块新音频，自己决定提交哪些正文或继续等。训练器对同一条录音在线采样一组完整转录，再比较识别质量、切换处漏词和出字时间。参考文本、语种和时间戳只交给评分器。
+从 Fourth 合并后的 SFT HF 模型出发，每条录音在线生成 **8 条完整轨迹**。每轮只追加已到达的音频，评分参考不会送给 actor。支持四卡 / 八卡：micro batch 2，global batch 分别为 32 / 64。默认 1 秒新音频、2000 步、每 500 步保存，开启 TensorBoard，不划分验证集。
 
-- [四卡运行命令：整份训练集、每条录音 4 个候选、TensorBoard](四卡GSPO训练指南.md)
-- [从原始 JSONL 到训练任务、逐轮输出和奖励日志](DATA_FORMAT.md)
+- [四卡 / 八卡完整运行指南](四卡GSPO训练指南.md)
+- [原始数据到在线轨迹](DATA_FORMAT.md)
+- [奖励公式、论文依据及限制](REWARD_DESIGN.md)
 
-代码位于 OmniCommit 的 `ASR-GSPO/`，复用同仓库 `Third/` 的音频读取、动作协议和部署校验。训练服务器需要这一整个 OmniCommit checkout。Python/CUDA 环境沿用 FLEX-GSPO 的 **ms-swift 提交 `f15bb91439d756d4a366b51956d72d1f088b7af6`、mcore-bridge 1.6.3 和配套的 Megatron/vLLM**。已有该环境即可使用。数据准备依赖 Python、soundfile，非 16 kHz 波形的实际读取还需要 scipy；本地评分支持 CPU。
+**旧 Third tasks.jsonl 必须重新准备；起点必须是 Fourth 的合并 HF 模型。**
 
-## 1. 准备任务
+## 环境和协议
 
-以下为单独留出评测集的示例，Linux 路径按实际情况替换。四卡全训练集方案在准备后直接使用 `tasks.jsonl`，可按上面的四卡指南执行。
+复用同仓库 Fourth/fourth_asr 的协议、音频读取和末尾投影，需要整个 OmniCommit checkout。GPU 环境沿用 FLEX-GSPO 的 ms-swift 提交 f15bb91439d756d4a366b51956d72d1f088b7af6、mcore-bridge 1.6.3 及原有 Megatron/vLLM。不要仅凭发行版本号替换镜像。数据准备需要 soundfile，非 16 kHz 音频按需使用 scipy。评分优先用 RapidFuzz，缺少时回退到同定义的 Python 编辑距离。
 
-```bash
-cd /data/yb/Code/OmniCommit/ASR-GSPO
+~~~text
+<|DIRECT|>新增正文
+<|WAIT|>
+<|DIRECT|>前人的句尾。<|SPK_CHANGE|>新人的开头。
+~~~
 
-bash 01_prepare.sh \
-  /data/yb/Code/OmniCommit/datasets/timestamped.jsonl \
-  --output /data/yb/Code/OmniCommit/datasets/gspo01/tasks.jsonl \
-  --chunk-ms 1000 \
-  --max-turns 65 \
-  --rejects /data/yb/Code/OmniCommit/datasets/gspo01/rejected.jsonl
+同人换语言不加换人标记；换人不强制 WAIT。SPK_CHANGE 表示变化，不是持久身份编号。
 
-python3 split_data.py \
-  /data/yb/Code/OmniCommit/datasets/gspo01/tasks.jsonl \
-  --output-dir /data/yb/Code/OmniCommit/datasets/gspo01/split \
-  --dev-fraction 0.02 --seed 42
-```
+当前奖励版本为 `fourth_boundary_v2`：全文 CER、切换原文和换人位置共同核对，并按归错段文字量评分。Fourth 协议保持 DIRECT / WAIT / SPK_CHANGE。确认宽限需要可信详细时间戳；当前默认 tail-only 数据只用最后 end 做末尾筛选，不产生逐词延迟奖励。
 
-示例中的时间相对于当前 WAV 开头。每行一个 JSON 对象，下面把一行展开显示。
+## 准备与训练
 
-```json
-{
-  "id": "meeting-12-clip-03",
-  "meeting_id": "meeting-12",
-  "audios": ["/data/asr/meeting-12-clip-03.wav"],
-  "messages": [
-    {"role": "user", "content": "<audio>"},
-    {"role": "assistant", "content": "<zh><spk1>开始。<en><spk2>OK."}
-  ],
-  "alignment": [
-    {"text": "开", "start_ms": 100, "end_ms": 410},
-    {"text": "始", "start_ms": 420, "end_ms": 800},
-    {"text": "OK", "start_ms": 1100, "end_ms": 1600}
-  ]
-}
-```
+完整参考只取 `messages` 中的 `assistant.content`。移除 `<ru>`、`<zh>` 等语种标签得到正文，标签信息用于评分侧语言区间；说话人标签生成真正换人边界。原 output 的 WAIT/DIRECT 不规定新的动作，WAIT 中的正文也保留。默认 `--timing-mode tail-only` 不再严格重建旧中间切分，因此旧段落重新分配空格不会误伤完整转录。
 
-- 原始数据中连续出现的相同语种、说话人标签可以保留。准备器提取完整正文和真实语言变化。普通静音样本应有人工或可信标注明确的空转录；缺少 assistant 字段会记作数据错误。
-- **有字符或词级 CTC** 时，传 `alignment` 列表或 `chars`、`words`、`word_segments`。字段 `start_ms/end_ms` 用毫秒，`start/end` 用秒。显式 `char_start/char_end` 指去标签后原始正文里的 Python 字符偏移，左闭右开。偏移适合稀疏标注与重复词。单元可用 `trusted:false` 跳过不可信时间。已有 Third 的 `output.segments` 与起止区间、仓库的 `kind:"aligned_asr", schema_version:2, status:"ok"` 文件也可直接读取。
-- **只有切换点**（例如 `timestamps[].time_ms=20440`）也能使用。该点可约束新段最早可能出现的位置。词尾缺失时，这条数据仍贡献正文和切换质量分，却无法提供精确的词级出字延迟。如果什么时间戳都没有，保留音频与完整参考即可。
-- 叠加 `--rejects` 后，错误行、重复 ID、超回合上限的录音分别写入拒绝文件并继续准备其他录音。默认 65 轮含一次 EOF。1 秒步长时最多有 64 个音频轮；500、800 ms 等通过 `--chunk-ms` 配置，较长样本可同步调大准备和训练的 `--max-turns`，并核对上下文与显存。短尾按 Third 训练规则补齐，提交时间仍取真实音频末尾。
-- 数据集复用原 WAV，只写 JSONL 和虚拟切块地址。新建 split 目录中有 `train.jsonl`、`dev.jsonl` 和 `split.json`。划分时将同一 `meeting_id`、原录音标识、`source_ids` 或 `synthesis.clips[].audio` 关联的样本放在一起，包括 A+B、B+C 这类跨样本关联。来自同一会议但文件名各异时，应填写共有的 `meeting_id` 或 `recording_id`。划分依据是提供的来源关系。
-- 默认保留自然分布。要定量抽样，可在 split 命令中加 `--train-size 10000 --mix 0.4 0.4 0.2`，分别对应普通、语种切换、稳定性样本。稳定性样本包括有明确空转录的静音，也可在原始数据显式写 `"bucket":"stability"` 纳入长停顿后恢复说话等案例。某类数量不足时会报告可用数。切分遇到拼接数据形成的大连通组，可以先按原始会议划分，再在各自集合内拼接。
+先用 `filter_tail.py` 检查末尾：真实末尾无标点则保留，即使离音频结束不足 1 秒；末尾有标点时，只有“音频总时长减最后正文 end 严格大于 1000 ms”才保留。整行复制，原音频/正文/标点不改动。只有带标点的尾部必须提供相关可信 end；必需信息有错或音频不可读会记录原因并继续。具体命令见四卡 / 八卡指南。
 
-## 2. 启动在线 GSPO
+准备器只生成第一块虚拟音频引用及私有评分元数据，不复制每秒 WAV。既有 `--tail-policy short-open` 仍支持保留截取样本的其他实验；它会调整有效音频范围及末尾标点，和本次“整行过滤后 keep”的策略不同。
 
-```bash
-cd /data/yb/Code/OmniCommit/ASR-GSPO
+过滤后以 `--tail-policy keep --timing-mode tail-only` 准备任务。最后 end 不当作整句话所有字的时间：任务 alignment 为空、不提供 switches 时间条目，全文 CER、局部语种、换人及标点目标仍生效，延迟罚分为 0。若完整参考仍有末尾标点而对应最后 DIRECT 没有，保留原正文，仅关闭该末尾标点的可信监督，句内评分不受影响。需要详细时间监督的另一个实验可显式用 `--timing-mode aligned`，并承担全量对齐校验。末尾间隔只是筛选条件，不保证剩余音频无漏标语音或句末标点一定正确。
 
-bash 02_train.sh \
-  /data/yb/Code/OmniCommit/models/third-merged \
-  /data/yb/Code/OmniCommit/datasets/gspo01/split/train.jsonl \
-  /data/yb/Code/OmniCommit/output/gspo01-quality-latency \
-  --gpu-ids 0,1,2,3,4,5,6,7 \
-  --reward-mode quality_latency \
-  --group-size 8 --micro-batch-size 2 --global-batch-size 64 \
-  --train-iters 300 --save-steps 100
-```
+~~~bash
+bash 02_train.sh /data/models/fourth-sft-merged /data/OmniCommit/gspo04/tasks.jsonl /data/OmniCommit/output/gspo04-g8 \
+  --gpu-ids 0,1,2,3 --group-size 8 --micro-batch-size 2 --global-batch-size 32 \
+  --train-iters 2000 --save-steps 500 --reward-mode quality_latency --switch-grace-turns 1
+~~~
 
-这条命令的 300 步是第一组比较实验的预算，实际迭代和显存占用需在服务器上测。先验证训练环境时，可使用独立输出目录、`--train-iters 2 --save-steps 1`，这能覆盖首次 rollout、反向更新、权重同步、第二次 rollout 和保存。仅检查最终参数可在原命令后加 `--dry-run`。已有 FLEX 项目通过本地源码加载 Swift 的话，把同一个 `--swift-source /path/to/ms-swift` 加到训练命令。
+四卡使用 TP2/EP2 训练、TP4 colocated vLLM 采样，LoRA 更新 Thinker 语言模型，冻结声学编码器和对齐层，保留学习率 1e-6、KL 0.01。全局 batch 按候选轨迹计：32/8=4 条录音/步；2000 步是 8000 次录音抽取、64000 条轨迹，2500 步是 10000 次抽取、80000 条轨迹，不等于整个大数据集走完一遍。
 
-训练沿用 FLEX 的 colocated vLLM 采样、Megatron TP2/EP2、bf16 和 Thinker LoRA。冻结声学编码器与对齐层。同组候选看到相同音频，随各自的历史预测继续。当前四卡实验显式指定 `--gpu-ids 0,1,2,3 --group-size 4 --micro-batch-size 2 --global-batch-size 16`，每步抽取 4 条录音，每条生成 4 个候选。上面的八卡示例每步抽取 8 条录音，每条生成 8 个候选。GSPO 在 Swift 的 GRPO trainer 中使用 `importance_sampling_level=sequence`，按序列计算比率并裁剪，同组奖励中心化，KL 单独计入 loss。
+八卡按当前 FLEX 06/07 配方使用 `--gpu-ids 0,1,2,3,4,5,6,7 --group-size 8 --micro-batch-size 2 --global-batch-size 64`。训练 TP2/EP2/DP4、两组 TP4 vLLM，每步 8 条录音各 8 个候选。八卡 2000 步共 16000 次录音抽取、128000 条候选。保持 G8/micro2 时不能沿用 B32；当前入口会检查布局。完整命令在运行指南中。
 
-对照实验保持同一个 SFT 起点、划分、采样和训练步数，另设一个输出目录（如 `gspo01-quality`）并改 `--reward-mode quality`。这组只优化整段与切换处的转录。保存时，原生 `checkpoint-N` 可用 `--resume-from` 续训，保持原训练配置及最终 `--train-iters`；同次导出的 `checkpoint-N-merged` 用于评测和部署。
+默认 save_total_limit=6，保留本计划全部保存点。实际显存与耗时取决于音频轮数和候选长度。--dry-run 只展示实际框架参数，不分配 GPU、不写文件。确切续训需要保持原来的 train-iters 学习率计划；要训 2500 步应启动时设定。
 
-采样返回 `<|WAIT|>` 时本轮立即结束，与 Third 部署时一致。训练保留这一动作的实际 token ID 和采样 log probability。模板为了排版插入的轮间分隔符不参与策略 loss，用户音频也不参与策略 loss。
+## 奖励
 
-如果这批录音以前全部参加过 SFT，这次划出的 dev 集只能检验 GSPO 阶段的变化。要判断真实会议能否泛化，请另外留一批 SFT 和 GSPO 都没有见过的录音，尤其保留人工核对过的短语种切换和长静音后重新开口的片段。
+CER 是主质量项。旧混合词/字符编辑路径保留作局部对齐和可用时的时间统计，不再把它称为 CER。切换区间另外计算局部 CER 和原词覆盖，检查短段是否被吞、翻译或替换。默认 quality_latency 入口对有详细时间戳的 aligned 数据才计算等待成本；本次 tail-only 不伪造这部分监督。
 
-## 3. 哪些结果会得高分
+换人位置偏移按归错文字量区分程度；删除新人的开头也计入成本。漏一个换人标记不会机械改变后续全部人的归属。对 aligned 数据，`--switch-grace-turns 1` 给新发言区间一个共享的确认截止轮，不能每个词不断顺延；tail-only 没有该时间效应，也不强制 WAIT。
 
-假定上例最后 1 秒是静音，两个词在第 1、2 秒各自说完。三条候选按 1 秒一轮排列，末项为 EOF。
+句子终止符在拼接后的正文中按位置评分，不因一个 DIRECT 只有几个字就罚分；真实短句和正确句号后的新句开头允许出现。标点是受上限约束的辅助项，防止“写错字破坏对齐，比正确文字多句号反而分高”。截取末尾与句内分开处理。错误参考仍会污染奖励，不能靠加大权重修复。正确数字的小数点、正负号、百分号在全文和局部 CER 中保持一致。
 
-```text
-按时出字    <|DIRECT|>开始。   <|DIRECT|>OK.    <|WAIT|>            <|WAIT|>
-同文晚出    <|WAIT|>          <|WAIT|>         <|DIRECT|>开始。OK.  <|WAIT|>
-切换漏词    <|DIRECT|>开始。   <|WAIT|>         <|WAIT|>            <|WAIT|>
-```
+本版沿用序列级 GSPO；借鉴固定角色 SA-WER 的归属原则和确认宽限，未宣称复现固定角色身份识别或 token 级局部 advantage。依据、公式、参数取舍见 [REWARD_DESIGN.md](REWARD_DESIGN.md)。
 
-前两条的全文和断句相同，在 `quality` 模式并列。切换处漏掉 `OK` 的第三条得分最低。有词级结束时间时，`quality_latency` 还会区分前两条的出字时间。一次提交可以包含前一种语言的句尾和新语言的开头。只有音频输入轮可提交正文，随后一次文本 `<end_of_audio>` 对应单独的 `<|WAIT|>`。
+## 保存和直接部署
 
-| 目标 | 当前实现 |
-|---|---|
-| 原语言转录正确 | 拼接各轮新增正文后全局做编辑对齐。中日韩等按字符单位，带空格的多数语种按词单位。记录插入、删除、替换；提前胡编和持续重复会影响分数。 |
-| 切换后保留原语言正文 | 用参考语言段定位切换，同时考察开头和整个新语言段。比如中文句子中的 `fifteen dollars` 被写成“十五美元”，或英转法之后把后半段写回英文，都会扣分。整段漏写也扣分。对于单语录音，评分器同样检查文字系统明显不相容的正文替换。参考中已有的外来词按原拼写接受。共享拼写的词只能验证文字是否保留。 |
-| 控制句中多出的句号 | 先拼接所有轮次的正文，再依据可对齐的参考断句评分。参考“我知道你有点问题。”允许分两轮提交“我知道”和“你有点问题。”。如果第一轮写成“我知道。”，这个额外句号会扣分。漏掉能确认的真实句界也有较轻的扣分。整段参考没有标点时跳过断句监督。 |
-| 已经说完的词及时出现 | 按参考单元结束后第一个可提交块计算额外等待。举例来说，词在 1.6 秒结束、2 秒提交，额外等待为 0；拖到 5 秒为 3 秒。可用起点还可标记声音出现前的预测。整块语义区间仅使用可证实的边缘，不给内部每个词虚构时间。 |
+checkpoint-N 是可续训的原生 checkpoint；checkpoint-N-merged 是部署/评测的 HF 模型。每次同步保存后，回调从**准确的 SFT 父模型**恢复缺失 tokenizer、processor、chat template 和 omnicommit_tokens.json，并校验词表、token ID、音频处理配置及权重形状。不会用 SFT 权重覆盖 RL 权重，不覆盖冲突 tokenizer。
 
-两种奖励模式都从 `1 − min(2, 全文混合单位错误率)` 起算，再扣 `0.40 × 平均切换首段错误率`、`0.20 × 短切换段全删比例`，以及下面两项。权重是本项目的实验设置。
+成功写 omnicommit_export_status.json，ready:true 表示静态检查通过。失败打印 [export ERROR] 和 ready:false，保留原生训练结果并继续训练；失败目录不要直接部署。已有缺文件的 Fourth RL 导出可执行：
 
-- **原语言正文**。每个新语段同时看开头的 3 个计分单位和全段原词，两项等权。取最差语段与所有语段平均错误的均值，得到 `switch_content_error`。同一候选若有 k 段可确认的异文字系统替换，再计算 `k/(1+k)`。两个分数取较大值，乘以 0.90，避免一次翻译错误在两种判定下重复扣分。
-- **断句**。句中核实多出一个句号扣 0.20，两个合计扣 0.30；有 n 个时扣 `0.60 × n / (2 + n)`。漏掉可核实的参考句界按漏掉的比例最多扣 0.12。
+~~~bash
+python3 finalize_export.py /data/models/fourth-sft-merged /data/OmniCommit/output/gspo04-g8/实际版本/checkpoint-500-merged
+~~~
 
-`quality_latency` 另扣 `0.15 × 时间成本` 和 `0.10 × 提前命中比例`。有部分正文命中的极低分候选按顺序压缩到全程等待的分数之上。无词命中、静音和协议错误沿用原有处理。[奖励实现](asr_gspo/reward.py)
+第一个目录必须是这次 RL 的准确起点，不能混拷另一个 tokenizer 版本。
 
-已有的整份 `tasks.jsonl` 可以直接使用。训练器会校验奖励源码指纹，使用更新后的奖励开新实验时，请从 Third 合并模型启动并指定新的输出目录。参考转录中的错误句号会直接影响断句监督，应优先使用人工核过断句的会议录音。
+## 评测与监视
 
-## 4. 评测与 Third 服务导出
+~~~bash
+python3 evaluate.py model /data/OmniCommit/test/tasks.jsonl \
+  --model /data/OmniCommit/output/gspo04-g8/实际版本/checkpoint-500-merged \
+  --backend vllm --switch-grace-turns 1 --output /data/OmniCommit/test/gspo04-step500.jsonl
+~~~
 
-先用相同的留出集分别评测 SFT、质量 GSPO、质量加时延 GSPO。评测使用 Third 后端逐块贪心解码，读取同一套音频切块，保留完整轮次。这样可以单独测模型策略，不混入生产服务里的超时重试或 VAD 补识别。
+用已有独立测试集比较 SFT 和各保存点。评测逐轮解码，不混入 Web 的 VAD/补识别。汇总同时看 CER、切换漏段、归错字符、换人误报/漏报与碎句，不能只看总 reward。另按只有语种切换、只有换人、两者都有、都没有四类分别汇总。只有 aligned 数据具有可信详细标注时才解释正确提交延迟，并同时看删除与计时覆盖；tail-only 的未知时间不是零延迟。
 
-```bash
-cd /data/yb/Code/OmniCommit/ASR-GSPO
-
-CUDA_VISIBLE_DEVICES=0 python3 evaluate.py model \
-  /data/yb/Code/OmniCommit/datasets/gspo01/split/dev.jsonl \
-  --model /data/yb/Code/OmniCommit/models/third-merged \
-  --backend vllm \
-  --output /data/yb/Code/OmniCommit/output/eval/sft.jsonl
-
-find /data/yb/Code/OmniCommit/output/gspo01-quality-latency -type d -name 'checkpoint-*-merged'
-```
-
-下面的 `<实际版本目录>` 请替换成上一条命令列出的目录名。导出检查会验证合并 HF 权重分片、processor、词表以及动作 token 的 ID，并补齐 Third 服务读取的协议清单。
-
-```bash
-python3 finalize_export.py \
-  /data/yb/Code/OmniCommit/models/third-merged \
-  '/data/yb/Code/OmniCommit/output/gspo01-quality-latency/<实际版本目录>/checkpoint-100-merged'
-
-CUDA_VISIBLE_DEVICES=0 python3 evaluate.py model \
-  /data/yb/Code/OmniCommit/datasets/gspo01/split/dev.jsonl \
-  --model '/data/yb/Code/OmniCommit/output/gspo01-quality-latency/<实际版本目录>/checkpoint-100-merged' \
-  --backend vllm \
-  --output /data/yb/Code/OmniCommit/output/eval/gspo100.jsonl
-```
-
-输出每条录音的逐轮原文、终止状态、奖励及分项，同时生成 `*.summary.json`。汇总含有效轨迹的全文错误率、协议无效率、短段整段漏掉数、全体及切换开头的额外等待 P95（按匹配单元合并统计）。时延要和 `timed_units`、`timed_matches` 一起读。时延以音频时钟计，HTTP 排队、模型计算耗时与页面渲染应另外测。模型合格后，可把同一合并目录交给原有的 [Third HTTP / Web 服务](../Third/README.md)。
-
-训练输出目录的 `rewards/rollouts-rank*-pid*.jsonl` 保存每个候选的逐轮文本、奖励和计分项，不保存 WAV 副本。取一份 rank 日志重算评分时，传入当时实际参与训练的 manifest：
-
-```bash
-python3 evaluate.py replay \
-  /data/yb/Code/OmniCommit/datasets/gspo01/split/train.jsonl \
-  /path/to/rollouts-rank0-pid12345.jsonl \
-  --reward-mode quality_latency --limit 100 \
-  --output /data/yb/Code/OmniCommit/output/eval/replay-first100.jsonl
-```
-
-## 测试与依据
-
-```bash
-cd /data/yb/Code/OmniCommit
-python3 -m pytest -q ASR-GSPO/tests
-# 如本机有固定版 Swift 源码，同时验证其多轮 driver 与训练样本的连接
-ASR_GSPO_SWIFT_SOURCE=/path/to/ms-swift python3 -m pytest -q ASR-GSPO/tests
-```
-
-序列级比率与 clipping 取自 [GSPO 原论文](https://arxiv.org/abs/2507.18071)。用可验证的原语言转录误差优化 code-switch ASR 有 [Ye 与 Vickers 的实验](https://arxiv.org/abs/2607.02757)；这里用真实切换后的局部编辑误差，可覆盖英语、德语等共享文字系统的组合。按已经播到的音频位置检查提交文本，也可对照 [X2Streaming-ASR 的流式评测](https://github.com/X-Square-Robot/X2Streaming-ASR)。本项目的切换权重与按块延迟函数需要用自己的会议数据验证。
+TensorBoard 包含 reward、组内奖励相同比例及 CER、语言/换人/标点/时延罚分。rewards/rollouts-*.jsonl 记录逐轮输出及评分，metrics-*.json 是小型累计快照，不保存波形。CPU 测试验证数据/评分/导出契约，不能代替 GPU 训练和真实会议评测。

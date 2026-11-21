@@ -39,12 +39,24 @@ class SentenceBoundaryTests(unittest.TestCase):
         s = score("如果方便，明天见。", "如果方便。", "明天见。")
         self.assertEqual(s["extra_internal_periods"], 1)
 
-    def test_reference_with_no_sentential_punctuation_abstains(self):
+    def test_missing_terminal_punctuation_does_not_require_final_period(self):
         for ref in ["有时间联系我", "有时间，联系我", "I paid 3.50 to Dr. Lee", ""]:
             with self.subTest(ref=ref):
                 s = score(ref, ref + ".")
-                self.assertFalse(s["punctuation_scorable"])
+                self.assertEqual(s["reference_sentence_stops"], 0)
                 self.assertEqual(s["extra_internal_periods"], 0)
+
+    def test_unpunctuated_reference_still_scores_internal_fragmentation(self):
+        s = score("有时间联系我", "有时间。联系我。")
+        self.assertEqual(s["extra_internal_periods"], 1)
+        self.assertEqual(s["unsupported_short_breaks"], 1)
+
+    def test_question_or_exclamation_cannot_evade_false_boundary_penalty(self):
+        for mark in ["。", "!", "？", "؟"]:
+            s = score("我知道这个问题。", "我知道" + mark + "这个问题。")
+            self.assertEqual(s["extra_internal_stops"], 1)
+            self.assertEqual(s["unsupported_short_breaks"], 1)
+        self.assertEqual(score("好！你说。", "好！你说。")["extra_internal_stops"], 0)
 
     def test_technical_dots_and_acronyms(self):
         ref = "Dr Lee paid US $3.50 on example.com today."

@@ -7,6 +7,7 @@ passed as a subprocess argv list, never executed through a shell.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import datetime as dt
 import hashlib
 import importlib.util
@@ -18,6 +19,8 @@ import shlex
 import subprocess
 import sys
 
+from asr_gspo.reward import REWARD_VERSION
+
 ROOT = Path(__file__).resolve().parent
 AUDITED_SWIFT_COMMIT = "f15bb91439d756d4a366b51956d72d1f088b7af6"
 
@@ -28,14 +31,16 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("dataset", help="Prepared train.jsonl, NOT trajectories.jsonl")
     p.add_argument("output", help="New run directory, or existing run with --resume-from")
     p.add_argument("--reward-mode", choices=("quality", "quality_latency"), default="quality_latency")
+    p.add_argument("--switch-grace-turns", type=int, default=1, choices=range(5),
+                   help="Scorer-only confirmation allowance at a true language/speaker boundary; never forces WAIT")
     p.add_argument("--gpu-ids", default=os.environ.get("CUDA_VISIBLE_DEVICES", "0,1,2,3"),
                    help="Four or eight distinct local GPU IDs; eight GPUs with G8/micro2 require global batch >=64")
     p.add_argument("--group-size", type=int, default=8)
     p.add_argument("--global-batch-size", type=int, help="Defaults to group size x DP x micro-batch")
     p.add_argument("--micro-batch-size", type=int, default=2)
     p.add_argument("--steps-per-generation", type=int, default=1)
-    p.add_argument("--train-iters", type=int, default=3000)
-    p.add_argument("--max-turns", type=int, default=65, help="Includes one EOF text round; 65 allows 64 audio chunks")
+    p.add_argument("--train-iters", type=int, default=2000)
+    p.add_argument("--max-turns", type=int, default=65, help="Includes EOF for natural-end tasks; annotation_end needs only audio rounds")
     p.add_argument("--max-chunk-seconds", type=float, default=2.0, help="vLLM audio profiling length cap; must cover prepared input_seconds")
     p.add_argument("--image-slots", type=int, choices=(0, 1), default=1,
                    help="Keep one image profiling slot for accepted Omni initialization compatibility; requests stay audio-only")
@@ -47,6 +52,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--lora-rank", type=int, default=8)
     p.add_argument("--lora-alpha", type=float, default=32.0)
     p.add_argument("--save-steps", type=int, default=500)
+    p.add_argument("--save-total-limit", type=int, default=6, help="Retain all 500-step checkpoints through 2500 steps")
     p.add_argument("--vllm-memory", type=float, default=0.40)
     p.add_argument("--vllm-max-num-seqs", type=int, default=16)
     p.add_argument("--vllm-mm-processor-cache-gb", type=float, default=0.0,
@@ -82,11 +88,13 @@ def validate_options(a: argparse.Namespace) -> None:
     if a.global_batch_size is None:
         a.global_batch_size = a.group_size * layout["data_parallel_size"] * a.micro_batch_size
     for name in ("group_size", "global_batch_size", "micro_batch_size", "steps_per_generation", "train_iters",
-                 "max_turns", "max_length", "max_new_tokens", "lora_rank", "save_steps", "vllm_max_num_seqs", "dataset_num_proc", "rollout_log_every"):
+                 "max_turns", "max_length", "max_new_tokens", "lora_rank", "save_steps", "save_total_limit", "vllm_max_num_seqs", "dataset_num_proc", "rollout_log_every"):
         if getattr(a, name) <= 0:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
     if a.group_size < 2:
         raise ValueError("GSPO requires at least two candidates per group")
+    if type(a.switch_grace_turns) is not int or not 0 <= a.switch_grace_turns <= 4:
+        raise ValueError("switch-grace-turns must be in 0..4")
     generation_batch = a.global_batch_size * a.steps_per_generation
     if generation_batch % a.group_size:
         raise ValueError("global-batch-size * steps-per-generation must be divisible by group-size")
@@ -161,7 +169,7 @@ def build_command(a: argparse.Namespace) -> list[str]:
         "vllm_enable_prefix_caching": "true", "vllm_mm_processor_cache_gb": a.vllm_mm_processor_cache_gb,
         "sleep_level": "2", "offload_model": "true", "offload_optimizer": "true", "offload_bridge": "false",
         "save_safetensors": "true", "merge_lora": "true", "save_missing_weights": "true", "save_steps": a.save_steps,
-        "no_save_optim": "false", "no_save_rng": "false", "save_total_limit": "3",
+        "no_save_optim": "false", "no_save_rng": "false", "save_total_limit": a.save_total_limit, "callbacks": "omnicommit_export", "async_save": "false",
         "finetune": "false" if a.resume_from else "true", "no_load_optim": "false", "no_load_rng": "false",
         # Upstream completion logging re-encodes messages without their audios.
         # Keep it disabled for this audio-only recipe. Our complete trajectory
@@ -187,9 +195,11 @@ def build_environment(a: argparse.Namespace) -> dict[str, str]:
     env.update({"CUDA_VISIBLE_DEVICES": a.gpu_ids, "ENABLE_AUDIO_OUTPUT": "0", "PYTHONUNBUFFERED": "1",
                 "CUDA_DEVICE_MAX_CONNECTIONS": "1", "TOKENIZERS_PARALLELISM": "false",
                 "ASR_GSPO_REWARD_MODE": a.reward_mode,
+                "ASR_GSPO_SWITCH_GRACE_TURNS": str(a.switch_grace_turns),
+                "ASR_GSPO_SFT_MODEL": str(Path(a.model).resolve()),
                 "ASR_GSPO_LOG_DIR": str(Path(a.output).resolve() / "rewards"),
                 "ASR_GSPO_ROLLOUT_LOG_EVERY": str(a.rollout_log_every)})
-    paths = [str(ROOT), str(ROOT.parent / "Third")]
+    paths = [str(ROOT), str(ROOT.parent / "Fourth")]
     if a.swift_source:
         paths.insert(0, str(Path(a.swift_source).resolve()))
     if env.get("PYTHONPATH"):
@@ -221,6 +231,7 @@ def validate_framework(swift_source=None):
         "megatron/trainers/grpo_trainer.py": ("importance_sampling_level", "seq_level_log_weights"),
         "rl_core/data.py": ("def apply_rollout_output", "rollout_output.rollout_infos", "_MULTIMODAL_KEYS"),
         "rollout/multi_turn.py": ("def get_response_token_data", "def on_turn_end"),
+        "megatron/callbacks/base.py": ("def on_save(self, output_dir)",),
         "template/templates/qwen.py": ("class Qwen3OmniTemplate",),
     }
     for relative, required in capabilities.items():
@@ -233,18 +244,19 @@ def validate_framework(swift_source=None):
 def validate_local_inputs(a: argparse.Namespace) -> dict:
     from finalize_export import verify_weights
     from asr_gspo.audio import encode_chunk_ref
-    from asr_gspo.protocol import initial_messages
-    from third_asr.service_backend import detect_model_protocol, validate_manifest
+    from asr_gspo.protocol import initial_messages, total_turns
+    from fourth_asr.service_backend import detect_model_protocol, validate_manifest
     from transformers import AutoTokenizer
 
     model = Path(a.model)
-    if detect_model_protocol(model) != "explicit":
-        raise ValueError("Use a merged Third explicit DIRECT/WAIT checkpoint")
+    if detect_model_protocol(model) != "speaker":
+        raise ValueError("Use a merged Fourth DIRECT/WAIT/SPK_CHANGE checkpoint")
     token_manifest = json.loads((model / "omnicommit_tokens.json").read_text(encoding="utf-8"))
     validate_manifest(AutoTokenizer.from_pretrained(model, local_files_only=True), token_manifest)
     verify_weights(model, token_manifest["token_ids"].values())
     expected_messages = initial_messages()
     digest, count = hashlib.sha256(), 0
+    timing_modes, timed_tasks = Counter(), 0
     print("[preflight] Checking prepared rows without decoding waveforms", flush=True)
     with Path(a.dataset).open("rb") as manifest:
         for n, raw in enumerate(manifest, 1):
@@ -255,16 +267,20 @@ def validate_local_inputs(a: argparse.Namespace) -> dict:
                 row = json.loads(raw)
                 task = json.loads(row["asr_task"])
                 msgs = row["messages"]
+                if task.get("protocol") != "fourth_speaker_v1":
+                    raise ValueError("Re-prepare data with the Fourth GSPO preparer")
                 if msgs != expected_messages or row.get("audios") != [encode_chunk_ref(task, 0)]:
-                    raise ValueError("expected Third prompt and first audio chunk only")
+                    raise ValueError("expected Fourth prompt and first audio chunk only")
                 chunks = task["chunks"]
-                if not chunks or len(chunks) + 1 > a.max_turns:
-                    raise ValueError("chunk count plus EOF exceeds --max-turns or input is empty")
+                if not chunks or total_turns(task) > a.max_turns:
+                    raise ValueError("task turn count exceeds --max-turns or input is empty")
                 if any(c["input_seconds"] > a.max_chunk_seconds + 1e-8 for c in chunks):
                     raise ValueError("chunk exceeds --max-chunk-seconds")
             except (KeyError, IndexError, TypeError, ValueError) as exc:
                 raise ValueError(f"{a.dataset} line {n}: {exc}") from exc
             count += 1
+            timing_modes[task.get("timing_mode", "aligned")] += 1
+            timed_tasks += any(a.get("end_ms") is not None for a in task.get("alignment", []))
     if count < a.global_batch_size * a.steps_per_generation // a.group_size:
         raise ValueError("Dataset too small for one complete generation batch")
     if a.swift_source and not (Path(a.swift_source) / "swift" / "cli" / "_megatron" / "rlhf.py").is_file():
@@ -299,7 +315,11 @@ def validate_local_inputs(a: argparse.Namespace) -> dict:
     output = Path(a.output)
     if output.exists() and any(output.iterdir()) and not a.resume_from:
         raise ValueError("Output directory is nonempty. Choose a new directory or use --resume-from; nothing overwritten.")
-    return {"sha256": digest.hexdigest(), "tasks": count}
+    print(f"[preflight] timing_modes={dict(timing_modes)} tasks_with_end_timing={timed_tasks}/{count}", flush=True)
+    if not timed_tasks and a.reward_mode == "quality_latency":
+        print("[preflight] No completion timing: CER/language/speaker/punctuation rewards are active; "
+              "latency penalties and switch grace have no effect on these tasks.", flush=True)
+    return {"sha256": digest.hexdigest(), "tasks": count, "timing_modes": dict(timing_modes), "timed_tasks": timed_tasks}
 
 
 def run_identity(a: argparse.Namespace, manifest: dict) -> dict:
@@ -319,9 +339,10 @@ def run_identity(a: argparse.Namespace, manifest: dict) -> dict:
                "save_steps", "dataset_num_proc", "rollout_log_every"}
     # Include train_iters: changing the LR decay horizon mid-run is not exact resume.
     settings = {k: v for k, v in vars(a).items() if k not in ignored}
-    source_files = [ROOT / "swift_plugin.py", ROOT / "train_gspo.py", *sorted((ROOT / "asr_gspo").glob("*.py"))]
-    third = ROOT.parent / "Third" / "third_asr"
-    source_files.extend(third / name for name in ("training_audio.py", "chunk_refs.py", "protocol.py"))
+    source_files = [ROOT / "swift_plugin.py", ROOT / "train_gspo.py", ROOT / "finalize_export.py",
+                    *sorted((ROOT / "asr_gspo").glob("*.py"))]
+    fourth = ROOT.parent / "Fourth" / "fourth_asr"
+    source_files.extend(fourth / name for name in ("training_audio.py", "chunk_refs.py", "protocol.py"))
     identity = {"schema": 1, "framework_commit": AUDITED_SWIFT_COMMIT, "model_path": str(model),
             # Physical device IDs may change; world size/DP may not change during exact resume.
             "parallelism": parallel_layout(a),
@@ -361,12 +382,15 @@ def main(argv=None):
         env = build_environment(a)
         plan = {"framework_commit": AUDITED_SWIFT_COMMIT, "parallelism": parallel_layout(a),
                 "reward_mode": a.reward_mode, "command": cmd, "group_size": a.group_size,
+                "reward_version": REWARD_VERSION,
+                "switch_grace_turns": a.switch_grace_turns,
                 "prompts_per_generation": a.global_batch_size * a.steps_per_generation // a.group_size}
         print(json.dumps(plan, indent=2), flush=True)
         if a.dry_run:
             return 0
         validate_framework(a.swift_source)
         manifest = validate_local_inputs(a)
+        plan["data_summary"] = manifest
         plan["run_identity"] = run_identity(a, manifest)
         verify_resume_identity(a, plan["run_identity"])
         output = Path(a.output)

@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 
 from .audio import encode_chunk_ref
-from .protocol import EOS, WAIT, initial_messages, parse_reply
+from .protocol import EOS, WAIT, initial_messages, parse_reply, total_turns
 from .reward import score_trajectory
 
 
@@ -71,14 +71,17 @@ class ASRStreamHooks:
         for req in requests:
             task = _object((req.data_dict or {}).get("asr_task"), "asr_task")
             refs, ends = _schedule(task)
-            if self.max_turns is not None and len(refs) + 1 > self.max_turns:
-                raise ValueError(f"{task['id']} requires {len(refs) + 1} turns including EOF")
+            if task.get("end_policy", "eof") not in ("eof", "annotation_end"):
+                raise ValueError("Unknown end_policy")
+            if self.max_turns is not None and total_turns(task) > self.max_turns:
+                raise ValueError(f"{task['id']} requires {total_turns(task)} turns")
             if req.messages != initial_messages() or req.audios != refs[:1] or req.images or req.videos:
-                raise ValueError("First observation must be the explicit Third prompt with only the first chunk")
+                raise ValueError("First observation must be the Fourth prompt with only the first chunk")
             # Keep references, switch/CTC annotations and future transcripts out
             # of the actor request. The trainer supplies its original asr_task
             # column to the ORM only after the rollout is complete.
             req.data_dict = {STATE_KEY: {"key": _task_key(task), "refs": refs, "ends": ends,
+                                        "total_turns": total_turns(task),
                                         "turns": [], "ready": 1, "done": False}}
             req.messages = initial_messages()
             req.audios = refs[:1]
@@ -107,13 +110,13 @@ class ASRStreamHooks:
             try:
                 parse_reply(raw)
                 if eof and raw != WAIT:
-                    error = "Third EOF expects standalone WAIT"
+                    error = "Natural EOF expects standalone WAIT"
             except ValueError as exc:
                 error = str(exc)
         state["turns"].append({"kind": "eof" if eof else "audio", "response": raw,
                                "audio_end_seconds": state["ends"][observed - 1], "finish_reason": finish})
         state["ready"] = None
-        state["done"] = eof or error is not None
+        state["done"] = current_turn == state["total_turns"] or error is not None
         if not state["done"]:
             return {"done": False}
         # OnPolicySample.merge_rollout_output restores multimodal inputs only
@@ -139,7 +142,7 @@ class ASRStreamHooks:
         return {"infer_request": infer_request}
 
 
-def score_batch(completions, asr_task, rollout_infos, *, mode, log_dir=None):
+def score_batch(completions, asr_task, rollout_infos, *, mode, log_dir=None, switch_grace_turns=1):
     """Score every full rollout. The last completion is normally just WAIT."""
     if not isinstance(completions, (list, tuple)):
         raise ValueError("Expected a batch of completions")
@@ -157,12 +160,12 @@ def score_batch(completions, asr_task, rollout_infos, *, mode, log_dir=None):
         # An early stop is legitimate only if an actual generated response was
         # truncated or violated the action grammar. A missing observation is a
         # pipeline failure and must not train the actor against a bogus reward.
-        if not turns or len(turns) > len(task["chunks"]) + 1:
+        if not turns or len(turns) > total_turns(task):
             raise ValueError("Missing ASR turns or unexpected extra observations")
         invalid_reason = trajectory["invalid_reason"]
-        if invalid_reason is None and len(turns) != len(task["chunks"]) + 1:
-            raise ValueError("An ASR trajectory without an invalid reply must reach EOF")
-        score = score_trajectory(task, turns, mode=mode)
+        if invalid_reason is None and len(turns) != total_turns(task):
+            raise ValueError("An ASR trajectory without an invalid reply must reach its configured end")
+        score = score_trajectory(task, turns, mode=mode, switch_grace_turns=switch_grace_turns)
         if score["valid"] != (invalid_reason is None) or not _finite(score["reward"]):
             raise RuntimeError("Inconsistent scheduler and reward result")
         scores.append(score["reward"])
@@ -175,4 +178,6 @@ def score_batch(completions, asr_task, rollout_infos, *, mode, log_dir=None):
         with path.open("a", encoding="utf-8") as out:
             for record in records:
                 out.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
+        from .metrics import publish_metrics
+        publish_metrics(log_dir, records)
     return scores

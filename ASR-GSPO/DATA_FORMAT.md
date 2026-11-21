@@ -1,145 +1,133 @@
-# 一条录音在 ASR-GSPO 中的数据格式
+# Fourth GSPO：一条录音、一条任务、在线八条轨迹
 
-操作方准备一条音频路径、对应的整段原语言转录，以及已有的时间标注。下面用同一条 2.75 秒的中英双人示例走完整个流程。示例的时间和文字用于说明格式；数据准备与奖励已用临时 WAV 验证，候选回复为手写示例。
+## 1. 原始输入
 
-## 1. 原始输入 `timestamped.jsonl`
+使用用户现有的 `audios + messages + output + timestamps + tags` 文件即可。完整识别参考只取 messages 中的 assistant.content，不重新拼接 output.segments，不受旧 WAIT/DIRECT 策略约束。旧段落重分配空格不能改写完整参考正文。
 
-每一行对应一条完整录音。文件采用 UTF-8，下面为了便于阅读展开了一行。如果 `audios` 中写相对路径，默认从输入 JSONL 所在目录寻找音频，亦可用 `--audio-root` 指定目录。
+以用户提供的俄中样例为例，无标签正文是：
 
-```json
+~~~text
+Ты что лыбишься?  Господи! Как же хорошо. На матрасе.  Значит, всё дело в матрасе?  Юль, делай что хочешь, я на диван больше не вернусь.150克之间，诸如矮萌以其敏捷的动作和团队合作的生活方式而闻名。
+~~~
+
+原 `<ru>`、`<zh>` 用于评分侧语言区间；原 `<spk1>` 等用于评分侧真正的换人位置。重复的同人/同语种标签不生成新边界。Fourth 输出仍只有 DIRECT / WAIT / SPK_CHANGE，不要求输出语言标签和持久说话人编号。旧 WAIT 段中的“Господи!”、“Значит,”、“150克之间，”照样保留在完整参考里，不能丢弃。
+
+下列缩短例子用来说明字段；假设 WAV 总长 3 秒，JSONL 实际每行一个对象：
+
+~~~json
 {
-  "id": "demo-001",
-  "meeting_id": "meeting-01",
-  "audios": ["demo.wav"],
-  "messages": [
-    {"role": "user", "content": "<audio>**Entity Reference:** []"},
-    {"role": "assistant", "content": "<zh><spk1>好了。<en><spk2>OK. Next."}
+  "id":"example-1",
+  "audios":["/data/asr/example.wav"],
+  "messages":[
+    {"role":"user","content":"<audio>"},
+    {"role":"assistant","content":"<zh><spk1>开始。<en><spk2>OK."}
   ],
-  "timestamps": [
-    {"time_ms": 680, "language": "en", "speaker": "spk2", "changed": ["language", "speaker"]}
-  ],
-  "alignment": [
-    {"text": "好", "start_ms": 100, "end_ms": 400},
-    {"text": "了", "start_ms": 410, "end_ms": 620},
-    {"text": "OK", "start_ms": 680, "end_ms": 950},
-    {"text": "Next", "start_ms": 2100, "end_ms": 2530}
+  "output":{"segments":[
+    {"source_text":"<zh><spk1>开始。","action":"WAIT"},
+    {"source_text":"<en><spk2>OK.","action":"DIRECT"}
+  ]},
+  "timestamps":[
+    {"start_ms":100,"end_ms":800,"source_text":"<zh><spk1>开始。"},
+    {"start_ms":1000,"end_ms":1600,"source_text":"<en><spk2>OK."}
   ]
 }
-```
+~~~
 
-原始文件已有的 system 消息和重复语义标签可以保留。常规输入需要 `audios` 中的一条可读录音，以及 `messages` 中一条含完整转录的 assistant 消息。原始行无须填写 `DIRECT` 或 `WAIT`。`id` 也可用 `key`，两者均缺省时准备器使用音频绝对路径。`meeting_id` 可选，同一会议的多个片段可以据此放入同一数据划分。
+output 可以为 JSON 字符串，像用户样例一样保留旧 action 字段。末尾过滤仅核对相关尾段及其最后 end，不要求整份旧分段再次严格对齐。所有时间相对当前 WAV。
 
-时间以当前 WAV 开头为零。`timestamps` 记录真实归属变化的起点，`alignment` 记录参考中的字或词何时开始、何时结束。缺少词级 CTC 时可以省略 `alignment`；只有切换起点的样本仍能训练正文和切换处的覆盖。如果只有音频和带标签正文，这两个时间字段都可以省略。已有同语言同说话人的重复标签不需要打时间戳。
+本次默认 `--timing-mode tail-only` 不把中间 timestamps/CTC 转为逐词延迟目标。若后续明确使用可信全量对齐，可选择 `--timing-mode aligned`；该路径仍支持 alignment、chars、words、word_segments，并保留严格内容与偏移核验。
 
-## 2. 准备输出 `tasks.jsonl`
+有末尾标点时需要可信的最终 end；仅有切换起点 time_ms 不足以筛选。真实末尾没有标点时，不因 end 缺失或间隔不足一秒而排除，但必须满足正文、音频及末尾一致性等基本校验。
 
-运行 `bash 01_prepare.sh 原始.jsonl --output tasks.jsonl --chunk-ms 1000` 后，**一条通过校验的录音生成一条任务**。外层有三个字段。下面为了展示层次，缩写了两串机器生成的字符串。
+## 2. 先过滤，再准备为任务
 
-```json
+~~~bash
+python3 filter_tail.py source.jsonl --output filtered.jsonl
+bash 01_prepare.sh filtered.jsonl --output tasks.jsonl --chunk-ms 1000 --tail-policy keep --timing-mode tail-only --rejects rejected.jsonl
+~~~
+
+上例末尾是 `OK.`，最后 DIRECT 有句末标点，尾部差 1400 ms，因此整行保留。若 end 为 2300 ms，差 700 ms，则整行过滤。如果最后 DIRECT 为没有标点的 `OK`，则差 700 ms 也保留；完整参考若仍是 `OK.`，正文不改写，仅设 `terminal_punctuation_trusted:false`，不以这个不一致的末尾句号约束模型。句内标点继续评分。下面是保留记录的部分任务字段：
+
+~~~json
 {
-  "messages": [
-    {"role": "system", "content": "Transcribe new speech in its original language. Begin new text with <|DIRECT|>. Emit <|WAIT|> if nothing is ready. Use digits for numbers."},
-    {"role": "user", "content": "<audio>"}
-  ],
-  "audios": ["omnicommitaudio:v1:…"],
-  "asr_task": "{\"id\":\"demo-001\",…}"
-}
-```
-
-`audios[0]` 是**第一块音频**的虚拟地址，解码后包含原 WAV 路径、`start=0.0`、`end=1.0`、`input_seconds=1.0` 和文件校验信息。程序按需读取这段波形，不需要为每秒另存 WAV。
-
-`asr_task` 在文件里是 JSON 字符串。调用 `json.loads(row["asr_task"])` 后，下例展示解码内容。原路径按 Linux 示例目录书写，文件大小和修改时间由准备器从实际文件读取。
-
-```json
-{
-  "id": "demo-001",
-  "audio_path": "/data/asr/demo.wav",
-  "audio_size_bytes": 88044,
-  "audio_mtime_ns": 1794999785078068400,
-  "source_ids": ["/data/asr/demo.wav", "meeting:meeting-01"],
-  "bucket": "switch",
-  "duration_seconds": 2.75,
-  "chunks": [
-    {"start_seconds": 0.0, "end_seconds": 1.0, "input_seconds": 1.0},
-    {"start_seconds": 1.0, "end_seconds": 2.0, "input_seconds": 1.0},
-    {"start_seconds": 2.0, "end_seconds": 2.75, "input_seconds": 0.75}
-  ],
-  "reference_text": "好了。OK. Next.",
-  "spans": [
-    {"text": "好了。", "lang": "zh"},
-    {"text": "OK. Next.", "lang": "en"}
-  ],
-  "alignment": [
-    {"text": "好", "start_ms": 100, "end_ms": 400, "char_start": 0, "char_end": 1},
-    {"text": "了", "start_ms": 410, "end_ms": 620, "char_start": 1, "char_end": 2},
-    {"text": "OK", "start_ms": 680, "end_ms": 950, "char_start": 3, "char_end": 5},
-    {"text": "Next", "start_ms": 2100, "end_ms": 2530, "char_start": 7, "char_end": 11}
-  ],
-  "switches": [
-    {"char_start": 3, "time_ms": 680.0, "lang": "en", "speaker": "spk2"}
+  "protocol":"fourth_speaker_v1",
+  "source_duration_seconds":3.0,
+  "duration_seconds":3.0,
+  "end_policy":"eof",
+  "tail_policy":"keep",
+  "timing_mode":"tail-only",
+  "terminal_period_removed":false,
+  "reference_text":"开始。OK.",
+  "speaker_scorable":true,
+  "speaker_changes":[3],
+  "spans":[{"lang":"zh","text":"开始。"},{"lang":"en","text":"OK."}],
+  "alignment":[],
+  "chunks":[
+    {"start_seconds":0.0,"end_seconds":1.0,"input_seconds":1.0},
+    {"start_seconds":1.0,"end_seconds":2.0,"input_seconds":1.0},
+    {"start_seconds":2.0,"end_seconds":3.0,"input_seconds":1.0}
   ]
 }
-```
+~~~
 
-`chunks` 描述新音频的到达顺序。`reference_text` 保留说出的原语言，`spans` 记录连续语言段，`switches` 在有切换时间标注时保留实际切点。字符偏移计入标点和空格，左闭右开。准备器会替换原来的离线提示词；模型的首轮输入只有上面的短 system 和第一块音频。训练时模型接触不到评分用的整段参考、语言段和时间戳。
+实际还保留原音频路径、文件身份、完整归属区间等。tail-only 不向奖励器提供中间语音时间戳，也不提供 switches 时间条目。原 WAV 不修改、不另存切片；全部 3 秒继续作为模型输入，参考原文不改动。末尾间隔不是 VAD 验证的静音；有漏标音频时仍需改善源标注。
 
-## 3. 划分输出 `split/train.jsonl` 和 `split/dev.jsonl`
+磁盘训练行外层为：
 
-运行 `split_data.py` 后，训练集和评测集**逐行沿用上述任务格式**。`split.json` 保存划分统计。同一条任务进入其中一个集合；同一来源的关联样本放在一起。把 `split/train.jsonl` 交给 `02_train.sh`，把 `split/dev.jsonl` 交给 `evaluate.py model`。批量划分需要有足够多的独立来源，单条演示样本可直接用来检查准备结果。
-
-## 4. 在线训练才出现每一轮的动作
-
-调度器追加新块，保留该候选已经听到的音频和自己之前的回复。示例里第 1 块的 680 毫秒处同时换人、换语种，`OK` 在 950 毫秒已经说完。下面是一条可以得到满分的候选，第二块是停顿。
-
-```text
-本轮新输入                 assistant 的完整回复
-0.00–1.00 秒              <|DIRECT|>好了。OK.
-1.00–2.00 秒              <|WAIT|>
-2.00–2.75 秒              <|DIRECT|> Next.
-<end_of_audio>            <|WAIT|>
-```
-
-第一轮可同时提交两种语言。第二轮等待不会追加正文。最后是文本结束事件，不增加音频。把三轮音频里的新增正文串起来是 `好了。OK. Next.`。磁盘里每条录音保存一行训练任务。[四卡训练命令](四卡GSPO训练指南.md)显式设置 `--group-size 4`，训练时为这行任务在线生成 4 条完整候选轨迹，并分别评分。省略该参数时启动器默认生成 8 条。
-
-## 5. 训练日志和评测文件
-
-训练目录的 `rewards/rollouts-rank*-pid*.jsonl` 中，每一行是一条候选的整段轨迹。下面摘出该行最常用的字段，实际还包含插入、删除、替换、时延覆盖等指标。
-
-```json
+~~~json
 {
-  "task_id": "demo-001",
-  "mode": "quality_latency",
-  "turns": [
-    {"kind": "audio", "audio_end_seconds": 1.0, "response": "<|DIRECT|>好了。OK.", "finish_reason": "stop"},
-    {"kind": "audio", "audio_end_seconds": 2.0, "response": "<|WAIT|>", "finish_reason": "stop"},
-    {"kind": "audio", "audio_end_seconds": 2.75, "response": "<|DIRECT|> Next.", "finish_reason": "stop"},
-    {"kind": "eof", "audio_end_seconds": 2.75, "response": "<|WAIT|>", "finish_reason": "stop"}
+  "messages":[
+    {"role":"system","content":"Transcribe new speech. Use <|DIRECT|> for text, <|WAIT|> to wait, and insert <|SPK_CHANGE|> when the speaker changes. Use digits for numbers."},
+    {"role":"user","content":"<audio>"}
   ],
-  "valid": true,
-  "reward": 1.0
+  "audios":["omnicommitaudio:v1:机器生成的第一块引用"],
+  "asr_task":"评分参考和音频调度计划的JSON字符串"
 }
-```
+~~~
 
-对上述手写候选运行项目评分器得到下表。三行共用同一份参考与时间戳。
+actor 不接触 asr_task 的参考、语种、说话人和未来时间戳；调度器每轮追加新音频。原始离线长 system 被替换为与 Fourth SFT 一致的短协议。
 
-| 候选的提交方式 | quality | quality_latency |
-|---|---:|---:|
-| 首轮提交“好了。OK.”，末块提交“ Next.” | 1.000 | 1.000 |
-| 首轮只出“好了。”，把 OK 和 Next 都放到末块 | 1.000 | 0.989 |
-| 首轮出“好了。”，末块出“ Next.”，漏掉 OK | 0.100 | 0.063 |
+## 3. 在线轨迹
 
-单独运行 `evaluate.py` 时，每行结果的外层字段为 `id`、`bucket`、`mode`、`turns`、`score`，奖励在 `score.reward`。要检查切换片段，查看 `switch_content_error` 和 `switch_content_fully_missed`；要检查断句，查看 `punctuation_scorable`、`extra_internal_periods` 和 `missing_sentence_stops`。同目录的 `*.summary.json` 汇总全体及各类样本的指标。
+同一任务在线采样八条完整候选，各自根据已经输出的历史继续。以下为一条合规候选：
 
-在服务器查看第一条真实任务，可以从 `ASR-GSPO/` 执行：
+~~~text
+新增音频 0.0～1.0 秒： <|DIRECT|>开始。
+新增音频 1.0～2.0 秒： <|DIRECT|><|SPK_CHANGE|>OK.
+新增音频 2.0～3.0 秒： <|WAIT|>
+用户 <end_of_audio>：  <|WAIT|>
+~~~
 
-```bash
-python3 - <<'PY'
-import json
-from pprint import pprint
+别的候选可能晚输出、漏英文、误标换人或多句号。奖励可核对完整内容、语言和边界；本次 tail-only 没有精确时间监督，不能仅因输出较晚就按未知的词结束时间扣分。没有离线写死八条答案。最后音频轮仍由模型自由生成，不会强制用参考替换。
 
-with open("../datasets/gspo01/tasks.jsonl", encoding="utf-8") as f:
-    row = json.loads(next(f))
-pprint(row["messages"], sort_dicts=False)
-pprint(json.loads(row["asr_task"]), sort_dicts=False)
-PY
-```
+keep 样本另有用户 <end_of_audio> 事件，对应 WAIT。既有 short-open 等实验产生的 annotation_end 样本仍在最后音频轮结束，不追加空轮；本次整行过滤后 keep 流程不使用这种尾部投影。
+
+## 4. 日志
+
+rewards/rollouts-*.jsonl 每行一条候选。示例：
+
+~~~json
+{
+  "task_id":"example-1",
+  "mode":"quality_latency",
+  "turns":[
+    {"kind":"audio","audio_end_seconds":1.0,"response":"<|DIRECT|>开始。","finish_reason":"stop"},
+    {"kind":"audio","audio_end_seconds":2.0,"response":"<|DIRECT|><|SPK_CHANGE|>OK.","finish_reason":"stop"},
+    {"kind":"audio","audio_end_seconds":3.0,"response":"<|WAIT|>","finish_reason":"stop"},
+    {"kind":"eof","audio_end_seconds":3.0,"response":"<|WAIT|>","finish_reason":"stop"}
+  ],
+  "valid":true,
+  "reward_version":"fourth_boundary_v2",
+  "switch_grace_turns":1,
+  "reward":1.0,
+  "cer":0.0,
+  "timed_units":0,
+  "latency_penalty":0.0,
+  "speaker_correct_changes":1,
+  "extra_internal_periods":0
+}
+~~~
+
+evaluate.py 输出逐条评分与 summary，覆盖 CER、切换漏段、换人错位/归错字符和额外断句。tail-only 中计时单元为 0、延迟罚分为 0、延迟百分位未知，不能解释为真实零延迟。以后使用 aligned 评测时，延迟百分位只统计拼写正确且未检测到归属错误的可计时单元，要同时看删除与覆盖。确认宽限不写入 actor 输入，不预设 WAIT 答案。
+
+整份文件作为训练，不调用 split_data.py；保留该独立工具供明确需要按来源分组划分的其他实验使用。

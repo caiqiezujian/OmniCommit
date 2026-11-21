@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from asr_gspo.data import audio_chunks, prepare_record
 from asr_gspo.protocol import initial_messages
 from prepare_data import main
-from third_asr.chunk_refs import decode_chunk_ref
+from fourth_asr.chunk_refs import decode_chunk_ref
 
 
 class TestASRPreparation(unittest.TestCase):
@@ -28,7 +28,7 @@ class TestASRPreparation(unittest.TestCase):
             {"role": "assistant", "content": text}]}
 
     def task(self, record):
-        formatted = prepare_record(record, self.root)
+        formatted = prepare_record(record, self.root, timing_mode="aligned")
         return json.loads(formatted["asr_task"])
 
     def test_switches_are_onsets_and_repeated_headers_are_not_boundaries(self):
@@ -38,7 +38,7 @@ class TestASRPreparation(unittest.TestCase):
         row["timestamps"] = [
             {"language": "en", "speaker": "spk1", "time_ms": 400},
             {"language": "en", "speaker": "spk2", "time_ms": 980}]
-        prepared = prepare_record(row, self.root)
+        prepared = prepare_record(row, self.root, timing_mode="aligned")
         self.assertEqual(prepared["messages"], initial_messages())
         self.assertNotIn("SECRET", json.dumps(prepared, ensure_ascii=False))
         self.assertEqual(len(prepared["audios"]), 1)

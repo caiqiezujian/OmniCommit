@@ -93,8 +93,8 @@ def _local_repetition(units, left, right):
     return insert == before or insert == after
 
 
-def sentence_boundary_errors(reference_text, hypothesis_text, ref_units, hyp_units, operations):
-    """Compare internal periods and auditable reference sentence endings.
+def sentence_boundary_errors(reference_text, hypothesis_text, ref_units, hyp_units, operations, *, trusted=True, score_terminal=True):
+    """Compare internal sentence stops and auditable reference sentence endings.
 
     Use the reward's existing edit path. Both adjacent lexical anchors must
     match. Permit an inserted echo between these anchors if the reference is
@@ -102,9 +102,9 @@ def sentence_boundary_errors(reference_text, hypothesis_text, ref_units, hyp_uni
     anchors an explicit reference ending at EOF independently of chunking.
     """
     ref_marks = _marks(reference_text, ref_units)
-    extra = missing = reference_stops = internal = 0
+    extra = extra_stops = missing = reference_stops = internal = short_breaks = 0
     strong = ("stop", "period")
-    if any(mark in strong for mark in ref_marks):
+    if trusted:
         hyp_marks = _marks(hypothesis_text, hyp_units)
         anchors = [(r, h) for op, r, h in operations if op == "match"]
         for (r, h), (next_r, next_h) in zip(anchors, anchors[1:]):
@@ -124,7 +124,19 @@ def sentence_boundary_errors(reference_text, hypothesis_text, ref_units, hyp_uni
             else:
                 internal += sum(mark != "ambiguous" for mark in seen)
                 extra += seen.count("period")
-        if anchors and anchors[-1] == (len(ref_units) - 1, len(hyp_units) - 1):
+                extra_stops += sum(mark in strong for mark in seen)
+                for k in range(h, next_h):
+                    if hyp_marks[k] in strong:
+                        left = k
+                        while left > 0 and hyp_marks[left-1] not in strong:
+                            left -= 1
+                        right = k + 1
+                        while right < len(hyp_units) - 1 and hyp_marks[right] not in strong:
+                            right += 1
+                        before = sum(len(u.value) for u in hyp_units[left:k+1])
+                        after = sum(len(u.value) for u in hyp_units[k+1:right+1])
+                        short_breaks += int(0 < before <= 5 or 0 < after <= 5)
+        if score_terminal and anchors and anchors[-1] == (len(ref_units) - 1, len(hyp_units) - 1):
             if ref_marks[-1] in strong and hyp_marks[-1] != "ambiguous":
                 reference_stops += 1
                 missing += hyp_marks[-1] not in strong
@@ -133,5 +145,7 @@ def sentence_boundary_errors(reference_text, hypothesis_text, ref_units, hyp_uni
         "reference_sentence_stops": reference_stops,
         "missing_sentence_stops": missing,
         "extra_internal_periods": extra,
+        "extra_internal_stops": extra_stops,
         "scored_internal_gaps": internal,
+        "unsupported_short_breaks": short_breaks,
     }
