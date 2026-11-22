@@ -252,7 +252,17 @@ def validate_local_inputs(a: argparse.Namespace) -> dict:
     if detect_model_protocol(model) != "speaker":
         raise ValueError("Use a merged Fourth DIRECT/WAIT/SPK_CHANGE checkpoint")
     token_manifest = json.loads((model / "omnicommit_tokens.json").read_text(encoding="utf-8"))
-    validate_manifest(AutoTokenizer.from_pretrained(model, local_files_only=True), token_manifest)
+    try:
+        validate_manifest(AutoTokenizer.from_pretrained(model, local_files_only=True), token_manifest)
+    except ValueError as exc:
+        if "Protocol token is not registered special:" in str(exc):
+            raise ValueError(
+                f"{exc}. Tokenizer registration failed before GPU training; do not change token IDs. "
+                f"Inspect in this same environment: python3 {shlex.quote(str(ROOT / 'repair_tokenizer.py'))} "
+                f"{shlex.quote(str(model))}. If IDs and trained vocabulary rows match, append --apply "
+                "to restore special-token metadata only."
+            ) from exc
+        raise
     verify_weights(model, token_manifest["token_ids"].values())
     expected_messages = initial_messages()
     digest, count = hashlib.sha256(), 0

@@ -66,6 +66,21 @@ python3 finalize_export.py /data/models/fourth-sft-merged /data/OmniCommit/outpu
 
 第一个目录必须是这次 RL 的准确起点，不能混拷另一个 tokenizer 版本。
 
+## 启动前特殊 token 注册失败
+
+若出现 `[launch] Protocol token is not registered special: <|WAIT|>`，退出发生在训练前的 tokenizer 校验。对于报错的这个 token，词表长度和单 token ID 已通过检查，但当前环境的 `all_special_tokens` 没有包含它。其他协议 token 还需检查，不能直接删除这项校验或重新分配 ID。
+
+在同一个 FLEX-GSPO 环境检查启动命令的第一个模型目录：
+
+~~~bash
+python3 repair_tokenizer.py /data/models/fourth-sft-merged
+python3 repair_tokenizer.py /data/models/fourth-sft-merged --apply
+~~~
+
+第一条只读；第二条先核对全部协议 ID、词表和权重行覆盖，再修复已有 token 的特殊注册。发现缺 token、ID 冲突或权重不完整则拒绝修复。修复保留原有特殊 token，在临时目录重载校验后只写 tokenizer 文件，不改模型权重、模型 config、音频 processor 或训练数据。成功后重新运行原训练命令，不需要重建 tasks。不要在服务或训练进程正在使用该目录时修改 tokenizer。
+
+这类现象可能来自导出元数据或 Transformers 环境差异，不能仅凭日志认定具体版本。上游曾记录新旧特殊 token 字段并存时加载丢失注册的问题：[Transformers #47838](https://github.com/huggingface/transformers/issues/47838)。`rope_parameters` 的警告与这里的显式校验异常是不同信息；不要为消除警告删除 Omni 的 mRoPE 配置。
+
 ## 评测与监视
 
 ~~~bash

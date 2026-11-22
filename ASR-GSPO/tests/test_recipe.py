@@ -108,6 +108,35 @@ def test_launch_modes_and_batch_layout():
         assert train_gspo.build_environment(a)["ASR_GSPO_REWARD_MODE"] == "quality"
 
 
+def test_preflight_registration_error_points_to_guarded_repair(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from fourth_asr.service_backend import _metadata
+
+    model = tmp_path / "model with spaces"
+    model.mkdir()
+    ids = {WAIT: 10, DIRECT: 11, SPK_CHANGE: 12}
+    manifest = dict(_metadata("speaker"), tokens=list(ids), token_ids=ids, tokenizer_length=13)
+    (model / "omnicommit_tokens.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    class Tokenizer:
+        all_special_tokens = []
+
+        def __len__(self):
+            return 13
+
+        def encode(self, token, **kwargs):
+            return [ids[token]]
+
+    loader = SimpleNamespace(from_pretrained=lambda *args, **kwargs: Tokenizer())
+    monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(AutoTokenizer=loader))
+    args = train_gspo.parser().parse_args([str(model), "tasks", "out"])
+    with pytest.raises(ValueError, match="repair_tokenizer.py") as error:
+        train_gspo.validate_local_inputs(args)
+    assert "<|WAIT|>" in str(error.value)
+    assert "--apply" in str(error.value)
+    assert "do not change token IDs" in str(error.value)
+
+
 def test_export_catches_short_heads_and_missing_audio_encoder(tmp_path):
     import numpy as np
     from safetensors.numpy import save_file
