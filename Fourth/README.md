@@ -207,7 +207,9 @@ python -m pip install -r requirements-web.txt
 
 ### 一条命令启动会议网页
 
-在 `Flex_web` 容器中编辑一次 [web_config.sh](web_config.sh)。默认使用 GPU 6、checkpoint 2721、1 秒音频步长和 HTTPS 端口 18895。`ASR_MODEL` 指向合并好的 HF 目录；把 `SILERO_VAD_MODEL` 改为容器中已有的 `silero_vad.onnx` 绝对路径。首次启用需要可用的 CPU ONNX Runtime。如果容器里 `python3 -c "import onnxruntime"` 报缺少该包，执行 `python3 -m pip install 'onnxruntime>=1.20,<2'`。服务在加载 Omni 之前会校验本地 ONNX 的输入、输出并试算一帧。需要重新取权重时可使用[官方 v6.2.3 文件](https://github.com/snakers4/silero-vad/blob/v6.2.3/src/silero_vad/data/silero_vad.onnx)。
+在 `Flex_web` 容器中编辑一次 [web_config.sh](web_config.sh)。默认使用 GPU 6、checkpoint 2721、1 秒音频步长和 HTTPS 端口 18895。`ASR_MODEL` 指向合并好的 HF 目录；把 `SILERO_VAD_MODEL` 改为容器中已有的 `silero_vad.onnx` 绝对路径。首次启用需要可用的 CPU ONNX Runtime。如果容器里 `python3 -c "import onnxruntime"` 报缺少该包，执行 `python3 -m pip install 'onnxruntime>=1.20,<2'`。
+
+服务自动识别两种流式 ONNX 接口：旧版的 `input,sr,h,c → output,hn,cn`，以及新版的 `input,sr,state → output,stateN`。启动时用本地权重连续试算两帧，确认状态能传到下一帧后，打印 `[Silero VAD] ready: layout=h/c` 或 `layout=state`，随后加载 Omni。如果已有其中一种兼容权重，直接使用现有文件。[旧版官方流式实现](https://github.com/snakers4/silero-vad/blob/v4.0/utils_vad.py) · [官方 v6.2.3 权重](https://github.com/snakers4/silero-vad/blob/v6.2.3/src/silero_vad/data/silero_vad.onnx)
 
 ~~~bash
 cd /data/yb/Code/OmniCommit
@@ -225,7 +227,7 @@ bash Fourth/start_server.sh
 | 新块里出现人声，或者有短促起音让检测结果不确定 | 当轮送入完整原始块，沿用同一场会议和原有窗口。话筒、系统声音及文件输入都使用相同逻辑。 |
 | 用户结束时最后一个音频块已被静音过滤 | 结束轮回 `WAIT` 并关闭会话。逐轮日志可以区分模型返回的 `WAIT` 和静音跳过。 |
 
-Silero 在 CPU 上以 32 ms 帧计算人声概率，模型权重由网页进程加载一次，每场会议独立维护状态。默认静音上限为 `SILERO_QUIET_THRESHOLD=0.10`，降低它会让更多可疑音频进入 Omni。检测到人声只决定是否送入 ASR。房间内其他人在说话、背景视频有人声等情况仍可能触发转录。
+Silero 在 CPU 上计算人声概率，16 kHz 下默认每帧 32 ms。旧版 h/c 图如果声明固定的 64 或 96 ms 帧，则使用其声明的长度。模型权重由网页进程加载一次，每场会议独立维护状态。默认静音上限为 `SILERO_QUIET_THRESHOLD=0.10`，降低它会让更多可疑音频进入 Omni。检测到人声只决定是否送入 ASR。房间内其他人在说话、背景视频有人声等情况仍可能触发转录。
 
 ### 已经合并的旧模型
 
