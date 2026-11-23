@@ -4,6 +4,25 @@ Fourth 从带语种、说话人和逐段时间戳的原始 JSONL 构建流式 SF
 
 ## 1. 从原始标注生成训练集
 
+### 直接用现有分段做 1 秒重铸
+
+如果一条音频已经有合适的分段，用 `Data-Scripts/recast_1s.py`。传入原始 JSONL：每行需要 `audios`、带语种和说话人的 assistant 参考转录、`output.segments[].source_text`，以及与原段一一对应的 `timestamps[].start_ms/end_ms`。时间相对当前音频起点，以毫秒计。
+
+~~~bash
+cd /data/yb/Code/OmniCommit/Fourth
+python Data-Scripts/recast_1s.py \
+  /data/yb/Code/OmniCommit/datasets/timestamped.jsonl \
+  --output-dir /data/yb/Code/OmniCommit/datasets/fourth_source_1s
+
+python SFT-Scripts/check_sft.py \
+  /data/yb/Code/OmniCommit/datasets/fourth_source_1s/train.1000ms.jsonl \
+  --rows 100 --decode
+~~~
+
+每个原段按自己的结束时间提交。到达整秒边界时按原文顺序提交所有已完成的连续段，剩余音频不足一秒时以真实末尾为最后一个窗口。没有到期正文就输出 `<|WAIT|>`。同一秒完成的多个原段共用一个 `<|DIRECT|>`，换人在新人的正文前插入 `<|SPK_CHANGE|>`。段内即使有更细的 `spans` 也按原段末尾释放，输入的旧动作不决定输出。构建器用原 WAV 的区间引用生成训练数据。
+
+默认 `--tail-policy keep` 保留原文末尾标点和完整音频。若这批也是之前的截取数据，沿用 `--tail-policy short-open`。训练文件、token 清单及 SFT 启动方式与下方配方一致。`summary.json` 中此入口的 `release_on` 为 `source-segment`。
+
 ### 已跑完第一步合并的训练集
 
 `merge_timestamped_segments.py` 完成时才发布 `full_10000h_augmented.merged_v2.jsonl`。每行保留原音频路径和参考转录，`output.segments` 存新分组，`timestamps` 存对应区间。新合并组的 `timestamps[].spans` 保留细时间，`merge_source_units` 指向原段。合并阶段保留末尾标点，也没有添加录音自然结束标记。可直接把这份输出交给第二步。

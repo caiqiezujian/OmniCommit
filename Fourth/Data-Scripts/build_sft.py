@@ -81,7 +81,8 @@ def prepare_record(record, audio_root, steps, number_format, release_on, *, prot
                 units, target, stripped = project_open_tail(units, source_spans[-1][2], expected)
             frames = end_frame(max(u.end_ms for u in units), info.frames, info.samplerate)
         row = build_sft_row(units, path, frames, info.samplerate, step, number_format, protocol=protocol,
-                            audit=audit, release_completed=release_on == "merged-unit", open_end=open_end)
+                            audit=audit, release_completed=release_on in ("merged-unit", "source-segment"),
+                            open_end=open_end)
         real_replies = row["messages"][2:2+2*len(row["audios"]):2]
         waits = sum(msg["content"] == WAIT for msg in real_replies)
         changes = checked_changes(target, real_replies, protocol)
@@ -120,15 +121,19 @@ def prepare_record(record, audio_root, steps, number_format, release_on, *, prot
     return result, longest_gap
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
+def main(argv=None, *, source_segments_only=False):
+    description = "Recast original timestamped segments directly into 1-second Fourth SFT turns."
+    parser = argparse.ArgumentParser(description=description if source_segments_only else __doc__)
     parser.add_argument("input", type=Path, help="Source JSONL with per-unit timestamps in ms")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--audio-root", type=Path, help="Base for relative audio paths (default: input directory)")
-    parser.add_argument("--chunk-ms", nargs="+", type=int, default=[1000], metavar="MS")
-    parser.add_argument("--short-ms", type=int, default=300, help="Short-fragment merge threshold in ms")
-    parser.add_argument("--release-on", choices=("semantic-unit", "timed-span", "merged-unit"), default="semantic-unit",
-                        help="Use merged-unit after merge_timestamped_segments.py to emit completed groups immediately")
+    if source_segments_only:
+        parser.set_defaults(chunk_ms=[1000], short_ms=0, release_on="source-segment")
+    else:
+        parser.add_argument("--chunk-ms", nargs="+", type=int, default=[1000], metavar="MS")
+        parser.add_argument("--short-ms", type=int, default=300, help="Short-fragment merge threshold in ms")
+        parser.add_argument("--release-on", choices=("semantic-unit", "timed-span", "merged-unit"), default="semantic-unit",
+                            help="Use merged-unit after merge_timestamped_segments.py to emit completed groups immediately")
     parser.add_argument("--tail-policy", choices=("keep", "short-open", "annotated-prefix"), default="keep",
                         help="keep: original whole recording; short-open: treat a trailing gap under 1 s as a crop; "
                              "annotated-prefix: end all examples at the last annotation. Both open modes remove a "
@@ -197,9 +202,11 @@ def main(argv=None):
             with path.open("x", encoding="utf-8", newline="\n") as handle:
                 handle.write("".join(t + "\n" for t in protocol.tokens))
         report = {"input": str(args.input.resolve()), "number_format": args.number_format, "release_on": args.release_on,
-                  "kept": kept, "rejected": bad, "chunk_ms": steps, "short_ms": args.short_ms, "by_chunk_ms": counts,
+                  "kept": kept, "rejected": bad, "chunk_ms": steps, "by_chunk_ms": counts,
                   "longest_unannotated_gap": longest_gap}
         report.update(protocol=protocol.name, tail_policy=args.tail_policy)
+        if not source_segments_only:
+            report["short_ms"] = args.short_ms
         with summary.open("x", encoding="utf-8", newline="\n") as handle:
             json.dump(report, handle, ensure_ascii=False, indent=2)
             handle.write("\n")
