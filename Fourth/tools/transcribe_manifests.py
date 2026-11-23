@@ -88,27 +88,28 @@ class ManifestStreamSession(FourthStreamSession):
         return generated, parsed, history
 
 
-def show_first_prompt(tokenizer):
+def show_first_prompt(tokenizer, model_path=MODEL):
     system = get_protocol("speaker").system_prompt("normalized")
     messages = [{"role": "system", "content": system}, {"role": "user", "content": "<audio>"}]
     rendered = tokenizer.apply_chat_template(multimodal_messages(messages), tokenize=False,
                                              add_generation_prompt=True)
-    print(f"[ASR prompt] model={MODEL}\n{rendered}", flush=True)
+    print(f"[ASR prompt] model={model_path}\n{rendered}", flush=True)
     if system not in rendered:
-        raise ValueError(f"导出目录的 chat template 丢失了 Fourth system 提示词: {MODEL}")
+        raise ValueError(f"导出目录的 chat template 丢失了 Fourth system 提示词: {model_path}")
 
 
-def load_model():
-    if detect_model_protocol(MODEL) != "speaker":
-        raise ValueError(f"需要带 DIRECT/WAIT/SPK_CHANGE 的 Fourth 合并 HF 模型: {MODEL}")
+def load_model(model_path=MODEL, *, gpu_ids=GPU_IDS, batch_size=BATCH_SIZE,
+               chunk_ms=CHUNK_MS, window_seconds=WINDOW_SECONDS):
+    if detect_model_protocol(model_path) != "speaker":
+        raise ValueError(f"需要带 DIRECT/WAIT/SPK_CHANGE 的 Fourth 合并 HF 模型: {model_path}")
     model = ManifestVLLMBackend(
-        MODEL, dtype="bfloat16", tensor_parallel_size=len(GPU_IDS.split(",")),
-        gpu_memory_utilization=GPU_MEMORY_UTILIZATION, max_batch_size=BATCH_SIZE,
+        model_path, dtype="bfloat16", tensor_parallel_size=len(gpu_ids.split(",")),
+        gpu_memory_utilization=GPU_MEMORY_UTILIZATION, max_batch_size=batch_size,
         max_context_tokens=MAX_CONTEXT_TOKENS, max_new_tokens=MAX_NEW_TOKENS,
-        max_audio_turns=math.ceil(WINDOW_SECONDS * 1000 / CHUNK_MS),
-        max_audio_seconds=max(.5, CHUNK_MS / 1000), enable_prefix_caching=True,
+        max_audio_turns=math.ceil(window_seconds * 1000 / chunk_ms),
+        max_audio_seconds=max(.5, chunk_ms / 1000), enable_prefix_caching=True,
     )
-    show_first_prompt(model.tokenizer)
+    show_first_prompt(model.tokenizer, model_path)
     return model
 
 

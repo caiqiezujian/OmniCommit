@@ -269,3 +269,28 @@ python tools/transcribe_manifests.py
 ~~~bash
 python tools/transcribe_manifests.py --retry-list /data/yb/Code/OmniCommit/datasets/retry.tsv
 ~~~
+
+### TSC 和 Byte 的双字段 JSONL
+
+`tools/transcribe_tsc_byte.py` 按音频文件名匹配 JSONL 的 `vid`。每成功处理一条，就将两个字段一起原子写回原文件。以 `OmniCommit_Fourth` 为前缀时，`OmniCommit_Fourth_asr` 保存 Fourth 对音频的实际转录，移除三个协议标记。`OmniCommit_Fourth_trans` 逐字复制同一行的 `translation`，包括原有空格、换行和空字符串。模型只接收流式音频、协议提示和本条音频自己的推理历史。
+
+在脚本顶部把 `DATASETS` 中的 TSC、Byte 音频目录和 JSONL 目录改为服务器实际路径，并检查 `MODEL`。运行第一条命令可预览匹配数，第二条命令处理两个数据集。
+
+~~~bash
+cd /data/yb/Code/OmniCommit/Fourth
+python tools/transcribe_tsc_byte.py --check-only
+python tools/transcribe_tsc_byte.py
+~~~
+
+也可以直接指定一套数据的目录。
+
+~~~bash
+python tools/transcribe_tsc_byte.py \
+  --audio-dir /实际路径/TSC音频目录 \
+  --jsonl-dir /实际路径/TSC原始JSONL目录 \
+  --prefix OmniCommit_Fourth
+~~~
+
+默认按文件名匹配，`vid` 可以带音频扩展名。音频分布在多级目录时加 `--recursive`。若 `vid` 含相对目录，同时加 `--vid-mode relative`。JSONL 目录取第一层的 `.jsonl` 文件。WAV 等格式直接读取，读取其他容器时按需调用系统 FFmpeg。
+
+已有同前缀字符串 ASR 的记录默认续跑时保留，译文有变会同步。若这个前缀曾由 FLEX 写入过占位 ASR，首次运行请加 `--overwrite`，重新听音频生成真实 ASR。单条音频解码失败会打印 `vid` 和路径，其他音频继续处理。
