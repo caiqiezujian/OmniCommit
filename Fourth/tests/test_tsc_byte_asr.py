@@ -89,17 +89,17 @@ def test_resume_keeps_even_empty_asr_but_refreshes_trans_then_overwrite_redecode
     first = {"vid": "a", "translation": "new reference", ASR: "stored", TRANS: "stale"}
     second = {"vid": "b", "translation": "静音。", ASR: ""}
     manifest = write_rows(manifests, first, second)
-    assert runner.run_dataset(audio, manifests, PREFIX, never_decode) == 0
+    assert runner.run_dataset(audio, manifests, PREFIX, never_decode, overwrite=False) == 0
     saved = read_rows(manifest)
     assert saved == [{**first, TRANS: first["translation"]}, {**second, TRANS: second["translation"]}]
-    answers = {a: "first new prediction", b: ""}
+    answers = {a: "", b: "previously empty, now transcribed"}
     called = []
 
     def decode(path):
         called.append(path)
         return answers[path]
 
-    assert runner.run_dataset(audio, manifests, PREFIX, decode, overwrite=True) == 0
+    assert runner.run_dataset(audio, manifests, PREFIX, decode) == 0
     assert len(called) == 2 and set(called) == {a, b}
     assert read_rows(manifest) == [{**saved[0], ASR: answers[a]}, {**saved[1], ASR: answers[b]}]
 
@@ -131,23 +131,25 @@ def test_failed_asr_keeps_original_pair_and_continues_with_next_audio(folders):
         assert path == good
         return "recognized"
 
-    assert runner.run_dataset(audio, manifests, PREFIX, decode, overwrite=True) == 1
+    assert runner.run_dataset(audio, manifests, PREFIX, decode) == 1
     assert read_rows(manifest) == [failed, {**untouched, ASR: "recognized", TRANS: "成功"}]
 
 
-def test_both_presets_stream_wavs_and_save_plain_asr(folders, tmp_path, monkeypatch):
+@pytest.mark.parametrize("mode_args", [[], ["--overwrite"]], ids=["default", "explicit-overwrite"])
+def test_both_presets_stream_wavs_and_save_plain_asr(folders, tmp_path, monkeypatch, mode_args):
     import transcribe_manifests as engine
     from fourth_asr.protocol import DIRECT, EOS, SPK_CHANGE, WAIT
 
     audio, manifests = folders
     path = make_wav(audio, "interview.wav", frames=40000)
-    row = {"vid": path.stem, "transcript": "SOURCE_REFERENCE", "translation": "TARGET_REFERENCE"}
+    row = {"vid": path.stem, "transcript": "SOURCE_REFERENCE", "translation": "TARGET_REFERENCE",
+           ASR: "", TRANS: "earlier translation"}
     manifest = write_rows(manifests, row)
     byte_audio, byte_jsonl = tmp_path / "byte-audio", tmp_path / "byte-jsonl"
     byte_audio.mkdir()
     byte_jsonl.mkdir()
     make_wav(byte_audio, path.name, frames=16000)
-    byte_row = {**row, "translation": "BYTE_TARGET"}
+    byte_row = {**row, "translation": "BYTE_TARGET", ASR: "earlier ASR"}
     byte_manifest = write_rows(byte_jsonl, byte_row)
     monkeypatch.setattr(runner, "DATASETS", {"TSC": (audio, manifests), "Byte": (byte_audio, byte_jsonl)})
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
@@ -175,7 +177,11 @@ def test_both_presets_stream_wavs_and_save_plain_asr(folders, tmp_path, monkeypa
         return Model()
 
     monkeypatch.setattr(engine, "load_model", load_model)
-    assert runner.main(["--prefix", PREFIX]) == 0
+    before = (manifest.read_bytes(), byte_manifest.read_bytes())
+    assert runner.main(["--prefix", PREFIX, "--check-only", *mode_args]) == 0
+    assert not model_loads
+    assert (manifest.read_bytes(), byte_manifest.read_bytes()) == before
+    assert runner.main(["--prefix", PREFIX, *mode_args]) == 0
     assert len(model_loads) == 1
     assert turns == ["<audio>", "<audio>", "<audio>", EOS, "<audio>", EOS]
     assert read_rows(manifest) == [{**row, ASR: "你好。 Hello!", TRANS: "TARGET_REFERENCE"}]

@@ -111,7 +111,7 @@ class VidPlan:
 
 
 def prepare_vid_update(audio_dir, jsonl_dir, prefix: str, *, recursive: bool = False,
-                       relative_vid: bool = False, overwrite: bool = False) -> VidPlan:
+                       relative_vid: bool = False, overwrite: bool = True) -> VidPlan:
     """Preflight all JSONLs before inference. Match vid only, stripping one audio extension."""
     if not isinstance(prefix, str) or not prefix.strip():
         raise ValueError("Specify a non-empty output field prefix")

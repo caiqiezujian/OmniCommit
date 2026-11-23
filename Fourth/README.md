@@ -293,4 +293,4 @@ python tools/transcribe_tsc_byte.py \
 
 默认按文件名匹配，`vid` 可以带音频扩展名。音频分布在多级目录时加 `--recursive`。若 `vid` 含相对目录，同时加 `--vid-mode relative`。JSONL 目录取第一层的 `.jsonl` 文件。WAV 等格式直接读取，读取其他容器时按需调用系统 FFmpeg。
 
-已有同前缀字符串 ASR 的记录默认续跑时保留，译文有变会同步。若这个前缀曾由 FLEX 写入过占位 ASR，首次运行请加 `--overwrite`，重新听音频生成真实 ASR。单条音频解码失败会打印 `vid` 和路径，其他音频继续处理。
+默认重新转录所有匹配音频，包括同前缀 ASR 为空串、已有正文或由 FLEX 填过占位值的记录。成功后两字段一起写回，`_asr` 取本次结果，`_trans` 取本行 `translation`。旧命令中的 `--overwrite` 仍然有效。显式加 `--resume` 时才保留已有字符串 ASR（含空串）并同步译文。单条音频解码失败会打印 `vid` 和路径，保留该行旧值，其他音频继续处理。

@@ -28,7 +28,7 @@ WINDOW_SECONDS = 60
 DISCARD_SECONDS = 50
 
 
-def run_dataset(audio_dir, jsonl_dir, prefix, transcribe_audio, *, overwrite=False, workers=1,
+def run_dataset(audio_dir, jsonl_dir, prefix, transcribe_audio, *, overwrite=True, workers=1,
                 recursive=False, relative_vid=False, check_only=False, prepare_model=None):
     """预检整个数据集后逐条落盘。普通音频失败计数返回，清单写入冲突直接报错。"""
     if workers < 1:
@@ -37,7 +37,8 @@ def run_dataset(audio_dir, jsonl_dir, prefix, transcribe_audio, *, overwrite=Fal
                               recursive=recursive, relative_vid=relative_vid)
     todo = [target for target in plan.targets if target.needs_inference]
     repairs = [target for target in plan.targets if target.needs_backfill]
-    print(f"[{jsonl_dir}] 匹配 {len(plan.targets)}，待转录 {len(todo)}，仅需同步译文 {len(repairs)}，"
+    mode_name = "全量重新转录并覆盖" if overwrite else "断点续跑"
+    print(f"[{jsonl_dir}] {mode_name}，匹配 {len(plan.targets)}，待转录 {len(todo)}，仅需同步译文 {len(repairs)}，"
           f"未匹配音频 {len(plan.unmatched_audio)}，未匹配记录 {plan.unmatched_rows}", flush=True)
     for path in plan.unmatched_audio[:5]:
         print(f"[SKIP] 没有对应 vid 的音频: {path}", flush=True)
@@ -113,7 +114,10 @@ def main(argv=None):
     parser.add_argument("--recursive", action="store_true", help="递归查找音频")
     parser.add_argument("--vid-mode", choices=("filename", "relative"), default="filename")
     parser.add_argument("--check-only", action="store_true", help="检查匹配和字段，打印待处理数量")
-    parser.add_argument("--overwrite", action="store_true", help="对已有同前缀 ASR 的记录也重新转录")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--overwrite", dest="overwrite", action="store_true", help="重新转录所有匹配音频（默认）")
+    mode.add_argument("--resume", dest="overwrite", action="store_false", help="保留已有字符串 ASR，仅补缺或同步译文")
+    parser.set_defaults(overwrite=True)
     args = parser.parse_args(argv)
     if (args.audio_dir is None) != (args.jsonl_dir is None):
         parser.error("--audio-dir 和 --jsonl-dir 需要一起指定")
