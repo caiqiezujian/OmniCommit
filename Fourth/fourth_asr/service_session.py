@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 import math
+import time
 
 import numpy as np
 
@@ -36,13 +38,16 @@ class FourthStreamOptions(StreamOptions):
 
 
 class FourthStreamSession(StreamSession):
-    def __init__(self, backend, options=None, *, activity=None):
+    def __init__(self, backend, options=None, *, activity=None, silence_detector=None):
         super().__init__(backend, options or FourthStreamOptions())
         self.protocol = get_protocol(self.options.protocol)
         self.recovery = None
         self.committed_tail = ""
         self.quiet_waits = set()
         self.quiet_evicted_seconds = 0.
+        self.silence_detector = silence_detector
+        self.allow_silence_tail = False
+        self.last_gated_turn = None
         if self.protocol.prefix and self.options.enable_recovery:
             self.recovery = VoicedWaitRecovery(self.options, activity)
 
@@ -62,14 +67,63 @@ class FourthStreamSession(StreamSession):
         return {"action": "DIRECT" if text else "WAIT", "segments": [],
                 "text": reply, "display_text": text.replace(SPK_CHANGE, ""), "transcript_parts": parts}
 
+    def _decode_audio_turn(self, history, pcm, source_samples, final_chunk):
+        if self.silence_detector is None:
+            return super()._decode_audio_turn(history, pcm, source_samples, final_chunk)
+        started = time.perf_counter()
+        try:
+            observation = self.silence_detector.observe(pcm[:source_samples], final=final_chunk)
+        except Exception as exc:
+            # An optional detector failure must never discard the current audio.
+            logging.getLogger(__name__).exception("Silero disabled for this Web session")
+            self.silence_detector = None
+            gate = {"decision": "bypass_error", "error": str(exc)}
+        else:
+            decision = observation.kind
+            if decision == "quiet":
+                decision = "tail" if self.allow_silence_tail else "skip"
+            gate = {"decision": decision, "peak_probability": observation.peak_probability}
+        gate["seconds"] = time.perf_counter() - started
+        if gate["decision"] == "skip":
+            # Keep the latest quiet audio for a weak onset. A long pause should
+            # not teach the next decode to imitate dozens of generated WAITs.
+            if (self.options.context_policy != "verified" and history
+                    and history[-1] is self.last_gated_turn):
+                history = history[:-1]
+            parsed = self._model_reply(WAIT, False)
+            parsed["silence_gate"] = gate
+            return None, parsed, history
+        generated, parsed, history = super()._decode_audio_turn(history, pcm, source_samples, final_chunk)
+        parsed["silence_gate"] = gate
+        return generated, parsed, history
+
+    def _decode_turn(self, history, pcm, end_of_audio):
+        if end_of_audio and history and history[-1] is self.last_gated_turn:
+            parsed = self._model_reply(WAIT, True)
+            parsed["silence_gate"] = {"decision": "end_quiet", "seconds": 0.}
+            return None, parsed, history
+        return super()._decode_turn(history, pcm, end_of_audio)
+
     def step(self, audio=None, *, end_of_audio=False, final_chunk=False):
         self.quiet_evicted_seconds = 0.
         result = super().step(audio, end_of_audio=end_of_audio, final_chunk=final_chunk)
+        gate = result.get("silence_gate")
+        skipped = gate is not None and gate["decision"] == "skip"
+        if gate is not None:
+            self.allow_silence_tail = (gate["decision"] in ("speech", "uncertain")
+                                       and result.get("truncation", {}).get("status") != "gap")
+            elapsed = (0. if skipped or end_of_audio else
+                       max(0., result["generation_seconds"] - gate["seconds"]))
+            result["generation_seconds"] = elapsed
+            result["realtime_factor"] = None if end_of_audio else elapsed / (result["end_seconds"] - result["start_seconds"])
         if result.get("truncation", {}).get("status") == "gap":
             self.quiet_waits.clear()
             self.committed_tail = ""
             if self.recovery is not None:
                 self.recovery.on_gap()
+        elif skipped:
+            if self.recovery is not None and self.last_gated_turn is None:
+                self.recovery.on_gap()  # Separate voiced WAIT streaks across a pause.
         elif self.recovery is not None and not end_of_audio:
             self.recovery.observe(self, result)
             seconds = result.get("recovery", {}).get("seconds", 0.)
@@ -77,6 +131,7 @@ class FourthStreamSession(StreamSession):
                 result["generation_seconds"] += seconds
                 result["realtime_factor"] = result["generation_seconds"] / (
                     result["end_seconds"] - result["start_seconds"])
+        self.last_gated_turn = self.history[-1] if skipped else None
         if result["action"] == "DIRECT":
             # A speaker boundary separates words for recovery overlap detection.
             marked = result["text"].removeprefix(self.protocol.prefix)

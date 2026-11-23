@@ -164,6 +164,9 @@ class StreamSession:
         reply = generated["text"] if isinstance(generated, dict) else generated
         return generated, self._model_reply(reply, end_of_audio)
 
+    def _decode_audio_turn(self, history, pcm, source_samples, final_chunk):
+        return self._decode_turn(history, pcm, False)
+
     def _decode_turn(self, history, pcm, end_of_audio):
         try:
             generated, parsed = self._generate_turn(history, pcm, end_of_audio)
@@ -204,9 +207,13 @@ class StreamSession:
                 # unusually small discard must still leave room for this chunk.
                 cutoff = max(self.history[0].start + self.options.discard_seconds,
                              end - self.options.window_seconds)
-                for index, turn in enumerate(self.history, 1):
-                    if turn.end + 1e-8 >= cutoff:
+                for index, turn in enumerate(self.history):
+                    # Silence compaction can leave a hole. If the cutoff is
+                    # in that hole, retain the first whole turn after it.
+                    if turn.start + 1e-8 >= cutoff:
                         return self.history[index:]
+                    if turn.end + 1e-8 >= cutoff:
+                        return self.history[index + 1:]
                 return []
             return self.history
         self._trim()
@@ -244,7 +251,8 @@ class StreamSession:
                 raise ValueError("Audio exceeds configured chunk step")
             if np.max(np.abs(pcm)) > 1.001:
                 raise ValueError("Audio samples must be in [-1,1]")
-            duration = len(pcm) / SAMPLE_RATE
+            source_samples = len(pcm)
+            duration = source_samples / SAMPLE_RATE
             history = self._history_for_audio(duration)
             # Match SFT's last short-tail padding without inventing source time.
             short_chunk = len(pcm) < round(self.options.chunk_seconds * SAMPLE_RATE)
@@ -259,8 +267,11 @@ class StreamSession:
                 generated = None
                 parsed = {"action": None, "text": "", "display_text": "", "segments": [],
                           "end_reason": "gap_already_reported"}
+            elif end_of_audio:
+                generated, parsed, history = self._decode_turn(history, pcm, True)
             else:
-                generated, parsed, history = self._decode_turn(history, pcm, end_of_audio)
+                generated, parsed, history = self._decode_audio_turn(
+                    history, pcm, source_samples, final_chunk or short_chunk)
         except Exception as exc:
             # State remains uncommitted. No fabricated WAIT hides model errors.
             self.failed = not isinstance(exc, self.retryable_errors)

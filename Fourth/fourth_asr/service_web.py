@@ -5,6 +5,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from functools import partial
 import json
 import math
 from pathlib import Path
@@ -40,7 +41,7 @@ def annotate_file_result(row, cursor, source_start, source_end):
 
 
 def create_app(backend_factory, options, *, max_sessions=1, auto_reference_factory=None,
-               max_window_seconds=None):
+               max_window_seconds=None, silero_vad_model=None, silero_quiet_threshold=.10):
     if auto_reference_factory is not None:
         raise ValueError("Fourth reports speaker changes without identity references")
     from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
@@ -54,10 +55,14 @@ def create_app(backend_factory, options, *, max_sessions=1, auto_reference_facto
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="omnicommit-model")
     active = set()
     backend = None
+    vad_model = None
     recovery = options.protocol in ("explicit", "speaker") and options.enable_recovery
     protocol_settings = {"action_protocol": options.protocol, "gap_recovery": recovery,
                          "gap_asr": "omni" if recovery else "disabled",
-                         "recovery_voiced_seconds": options.recovery_voiced_seconds}
+                         "recovery_voiced_seconds": options.recovery_voiced_seconds,
+                         "silence_gate": "silero" if silero_vad_model is not None else "off"}
+    if silero_vad_model is not None:
+        protocol_settings["silero_quiet_threshold"] = silero_quiet_threshold
     media_store = MediaStore(max_slots=max(2, max_sessions * 2))
 
     def window_settings(selected):
@@ -73,13 +78,17 @@ def create_app(backend_factory, options, *, max_sessions=1, auto_reference_facto
 
     @asynccontextmanager
     async def lifespan(app):
-        nonlocal backend
+        nonlocal backend, vad_model
         async def expire_uploads():
             while True:
                 await asyncio.sleep(60)
                 media_store.expire()
         expiry_task = None
         try:
+            if silero_vad_model is not None:
+                from .silero_vad import SileroVadModel
+                vad_model = await asyncio.get_running_loop().run_in_executor(
+                    executor, partial(SileroVadModel, silero_vad_model, quiet_threshold=silero_quiet_threshold))
             backend = await asyncio.get_running_loop().run_in_executor(executor, backend_factory)
             expiry_task = asyncio.create_task(expire_uploads())
             yield
@@ -190,7 +199,8 @@ def create_app(backend_factory, options, *, max_sessions=1, auto_reference_facto
                 cursor = MediaCursor(upload, start_seconds=init.get("file_start_seconds", 0),
                                      end_seconds=init.get("file_end_seconds"))
                 source_heard = cursor.start_seconds
-            session = FourthStreamSession(backend, selected)
+            session = FourthStreamSession(backend, selected,
+                                          silence_detector=vad_model.new_stream() if vad_model else None)
             active.add(session)
             admitted = True
             await websocket.send_json({"type": "ready", "protocol": "fourth",

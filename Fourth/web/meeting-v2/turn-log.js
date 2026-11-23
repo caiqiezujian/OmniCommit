@@ -49,6 +49,11 @@ function logHeading(row) {
     fields.push(row.start_seconds.toFixed(2) + '–' + row.end_seconds.toFixed(2) + ' s');
   }
   if (row.event === 'end_of_audio') fields.push('音频结束');
+  const vad = row.silence_gate?.decision;
+  if (vad === 'skip' || vad === 'end_quiet') fields.push('静音跳过解码');
+  if (vad === 'tail') fields.push('停顿首轮，允许提交句尾');
+  if (vad === 'uncertain') fields.push('人声不确定，已送模型');
+  if (vad === 'bypass_error') fields.push('静音检测异常，本场继续用主模型');
   if (row.truncation?.status === 'gap') fields.push(gapMessage(row));
   if (row.truncation?.status === 'recovered') fields.push('生成达到长度上限，重试已完成');
   if (row.end_reason === 'gap_already_reported') fields.push('已关闭，缺口见上一条记录');

@@ -422,6 +422,7 @@ fetch("/health", {cache: "no-store"}).then(r => r.json()).then(info => {
   }
   health = info;
   $("health").textContent = [info.backend, info.action_protocol === "speaker" ? "说话人切换" : info.action_protocol === "explicit" ? "显式动作" : "纯正文",
+    info.silence_gate === "silero" ? "静音过滤已开启（Silero）" : "静音过滤已关闭",
     info.gap_recovery ? "有声等待补识别已开启" : "补识别已关闭",
     ...(hasWindow ? [] : ["当前策略 " + (info.context_policy || "未知") + "，此会话不支持自选窗口"])].join(" · ");
   $("step").textContent = Math.round(info.chunk_seconds * 1000) + " ms";

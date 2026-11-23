@@ -19,6 +19,10 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     add_runtime_arguments(parser)
     add_web_arguments(parser)
+    parser.add_argument("--silero-vad-model", type=Path, metavar="ONNX",
+                        help="Gate sustained silence before decoding using a local streaming Silero ONNX on CPU")
+    parser.add_argument("--silero-quiet-threshold", type=float, default=.10,
+                        help="Only frames at or below this speech probability qualify as quiet (default 0.10)")
     parser.add_argument("--chunk-ms", type=int, default=1000, help="Audio step used during SFT")
     parser.add_argument("--window-seconds", type=float, help="Default live audio window, including the new chunk (60 s)")
     parser.add_argument("--discard-seconds", type=float, help="Oldest live audio to discard on overflow (50 s)")
@@ -33,6 +37,8 @@ def main(argv=None):
     parser.add_argument("--recovery-window-seconds", type=float, default=6.4)
     parser.set_defaults(backend="vllm", port=18891, number_format="normalized")
     args = parser.parse_args(argv)
+    if not 0 <= args.silero_quiet_threshold < .5:
+        parser.error("--silero-quiet-threshold must be in [0, 0.5)")
     args.chunk_seconds = args.chunk_ms / 1000
     if args.model is None and args.backend != "replay":
         parser.error("--model is required for HF and vLLM inference")
@@ -65,7 +71,8 @@ def main(argv=None):
     except (OSError, ValueError, ImportError, RuntimeError) as exc:
         parser.error(str(exc))
     serve_web(parser, args, lambda: build_backend(args), options,
-              partial(create_app, max_window_seconds=args.max_window_seconds))
+              partial(create_app, max_window_seconds=args.max_window_seconds,
+                      silero_vad_model=args.silero_vad_model, silero_quiet_threshold=args.silero_quiet_threshold))
 
 
 if __name__ == "__main__":

@@ -203,11 +203,29 @@ bash SFT-Scripts/merge_lora.sh \
   --gpu-ids 0
 
 python -m pip install -r requirements-web.txt
-CUDA_VISIBLE_DEVICES=0 bash start_server.sh \
-  /data/yb/Code/OmniCommit/models/fourth-speaker-full-merged \
-  --protocol speaker --chunk-ms 1000 --port 18891 \
-  --https-host 10.185.1.71 --cert-dir /data/yb/Code/OmniCommit/certs
 ~~~
+
+### 一条命令启动会议网页
+
+在 `Flex_web` 容器中编辑一次 [web_config.sh](web_config.sh)。默认使用 GPU 6、checkpoint 2721、1 秒音频步长和 HTTPS 端口 18895。`ASR_MODEL` 指向合并好的 HF 目录；把 `SILERO_VAD_MODEL` 改为容器中已有的 `silero_vad.onnx` 绝对路径。首次启用需要可用的 CPU ONNX Runtime。如果容器里 `python3 -c "import onnxruntime"` 报缺少该包，执行 `python3 -m pip install 'onnxruntime>=1.20,<2'`。服务在加载 Omni 之前会校验本地 ONNX 的输入、输出并试算一帧。需要重新取权重时可使用[官方 v6.2.3 文件](https://github.com/snakers4/silero-vad/blob/v6.2.3/src/silero_vad/data/silero_vad.onnx)。
+
+~~~bash
+cd /data/yb/Code/OmniCommit
+bash Fourth/start_server.sh
+~~~
+
+打开 `https://10.185.1.71:18895`，状态栏会显示「静音过滤已开启（Silero）」。`/health` 中对应字段为 `"silence_gate":"silero"`。要用同一段录音做开关对照，把 `SILERO_VAD_MODEL=''` 后重启。显式传入模型路径和参数时，启动脚本使用该次命令行设置。
+
+#### 安静、句尾和再次开口
+
+| 当前 1 秒的声音 | 网页服务的处理 |
+| --- | --- |
+| 从开始就安静，或已进入持续静音 | 本轮回 `WAIT`，时钟照常推进，跳过主模型和补识别。默认窗口只保留最近一个连续跳过的音频块，供下次开口时回听。 |
+| 刚有过人声或不确定的声音，随后判为安静 | 让主模型正常解码一个安静块，给上一轮的尾字一次提交机会。会议仍在继续。 |
+| 新块里出现人声，或者有短促起音让检测结果不确定 | 当轮送入完整原始块，沿用同一场会议和原有窗口。话筒、系统声音及文件输入都使用相同逻辑。 |
+| 用户结束时最后一个音频块已被静音过滤 | 结束轮回 `WAIT` 并关闭会话。逐轮日志可以区分模型返回的 `WAIT` 和静音跳过。 |
+
+Silero 在 CPU 上以 32 ms 帧计算人声概率，模型权重由网页进程加载一次，每场会议独立维护状态。默认静音上限为 `SILERO_QUIET_THRESHOLD=0.10`，降低它会让更多可疑音频进入 Omni。检测到人声只决定是否送入 ASR。房间内其他人在说话、背景视频有人声等情况仍可能触发转录。
 
 ### 已经合并的旧模型
 
@@ -221,9 +239,9 @@ python3 ASR-GSPO/repair_tokenizer.py "$MODEL" --apply
 
 工具先在临时目录整理特殊标记，再按 `omnicommit_tokens.json` 验证训练 ID、音频占位符、tokenizer/processor 和权重行覆盖。返回 `repaired` 或 `already_valid` 即可对同一目录运行原启动命令。省略 `--apply` 可只读诊断。此操作只发布通过校验的 tokenizer 文件，权重无须重新合并。
 
-将示例中的 `10.185.1.71` 换成访问者实际使用的内网 IP 或域名，再打开对应的 `https://10.185.1.71:18891`。首次启动需要服务器安装 OpenSSL 1.1.1 或更高版本。将生成的 `/data/yb/Code/OmniCommit/certs/root-ca.crt` 复制到访问网页的 Windows 电脑，在该文件所在目录执行 `certutil -user -addstore Root .\root-ca.crt`，重新打开浏览器。私钥留在服务器。此后使用同一个证书目录即可复用信任。
+将配置中的 `10.185.1.71` 换成访问者实际使用的内网 IP 或域名。首次启动需要服务器安装 OpenSSL 1.1.1 或更高版本。将已配置证书目录（默认 `/data06/yb/Code/OmniCommit/certs`）中的 `root-ca.crt` 复制到访问网页的 Windows 电脑，在该文件所在目录执行 `certutil -user -addstore Root .\root-ca.crt`，重新打开浏览器。私钥留在服务器。此后使用同一个证书目录即可复用信任。
 
-如果这台电脑已信任 FLEX，并且服务器访问地址在原证书内，可把最后一行参数换成 `--ssl-certfile /实际FLEX证书目录/server.crt --ssl-keyfile /实际FLEX证书目录/server.key`。服务器可用 `curl --cacert /实际证书目录/root-ca.crt https://10.185.1.71:18891/health` 验证证书和服务状态。
+如果这台电脑已信任 FLEX，并且服务器访问地址在原证书内，可把配置中的 `--https-host` 和 `--cert-dir` 两项换成 `--ssl-certfile /实际FLEX证书目录/server.crt --ssl-keyfile /实际FLEX证书目录/server.key`。服务器可用 `curl --cacert /实际证书目录/root-ca.crt https://10.185.1.71:18895/health` 验证证书和服务状态。
 
 网页中选择「电脑声音」并点击「开始转录」，在浏览器弹窗选中正在播放的标签页或系统支持的屏幕来源，勾选共享音频。声音来自访问网页的电脑，通过同一端口的 WSS 发送。网页也支持麦克风、音视频文件、文件起止时间和会议上下文窗口设置。[Chrome 共享音频说明](https://developer.chrome.com/docs/web-platform/screen-sharing-controls#the_systemaudio_option)
 
