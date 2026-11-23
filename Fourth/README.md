@@ -187,6 +187,13 @@ python SFT-Scripts/audit_encoded_lengths.py \
 
 本项目当前训练镜像使用 Swift 3.14.2。Swift 3.12 和 3.14 镜像均走已有的 3.x 合并命令。合并时的实际依赖版本记录在 `omnicommit_merge_report.json` 的 `runtime_versions` 中。Web 的 vLLM 后端在启动日志输出 `[Fourth vLLM]`，GSPO 在启动计划输出自己的 `runtime_versions`。三个位置分别记录各自进程实际使用的环境。
 
+同一个合并目录供以下两个运行环境读取。GSPO 使用训练虚拟环境中启动 `train_gspo.py` 的 Python。
+
+| 入口 | vLLM | Transformers | tokenizers | PyTorch |
+| --- | --- | --- | --- | --- |
+| Web（`Flex_web`） | `0.11.1+cu129` | `4.57.1` | `0.22.1` | `2.9.0+cu129` |
+| GSPO（`flex-gspo-online`） | `0.19.1` | `5.6.2` | `0.22.2` | `2.10.0+cu129` |
+
 ~~~bash
 bash SFT-Scripts/merge_lora.sh \
   /data/models/qwen3_omni_original_hf \

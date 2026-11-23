@@ -135,6 +135,17 @@ def normalize_tokenizer_directory(path, *, check_only=False):
                 raise ValueError(f"Conflicting special-token alias {role}")
             aliases[role] = token
     result = dict(config)
+    # Qwen's legacy processor reads chat_template.json. AutoTokenizer, used
+    # directly by the Web backend, reads a Jinja file or an embedded template.
+    # Expose the same template to both, without replacing a trained override.
+    legacy_template = directory / "chat_template.json"
+    if (not result.get("chat_template") and not (directory / "chat_template.jinja").is_file()
+            and not any((directory / "chat_templates").glob("*.jinja")) and legacy_template.is_file()):
+        legacy = json.loads(legacy_template.read_bytes())
+        template = legacy.get("chat_template") if isinstance(legacy, dict) else None
+        if not isinstance(template, str) or not template.strip():
+            raise ValueError(f"Missing default chat template in {legacy_template}")
+        result["chat_template"] = template
     result.pop("model_specific_special_tokens", None)
     if named:
         result["extra_special_tokens"] = {role: serialized(text) for role, text in named.items()}

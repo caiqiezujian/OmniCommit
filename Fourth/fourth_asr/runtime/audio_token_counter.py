@@ -38,6 +38,18 @@ def _type_id(value):
     return cls.__module__, cls.__qualname__
 
 
+def is_supported_vllm_version(version):
+    """CUDA wheels can add a local build suffix to the supported public release."""
+    from packaging.version import InvalidVersion, Version
+
+    if not isinstance(version, str):
+        return False
+    try:
+        return Version(version).public == '0.11.1'
+    except InvalidVersion:
+        return False
+
+
 class AudioTokenCounter:
     """Per-engine, serial-worker-only LRU of exact length -> expansion counts."""
 
@@ -58,7 +70,7 @@ class AudioTokenCounter:
         if not max_entries:
             counter.reason = 'disabled by configuration'
             return counter
-        if vllm_version != '0.11.1':
+        if not is_supported_vllm_version(vllm_version):
             counter.reason = 'unverified vLLM version'
             return counter
         try:

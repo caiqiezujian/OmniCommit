@@ -14,7 +14,7 @@ import sys
 import numpy as np
 
 from . import DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_NEW_TOKENS
-from .audio_token_counter import AudioTokenCounter
+from .audio_token_counter import AudioTokenCounter, is_supported_vllm_version
 from .inference_backend import AssistantPrefixDecoder, multimodal_messages
 from ..service_backend import validate_manifest
 from ..tokenizer_compat import runtime_versions
@@ -33,12 +33,13 @@ class VLLMBackend(AssistantPrefixDecoder):
         os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
         print("[Fourth vLLM] " + json.dumps(runtime_versions()), file=sys.stderr, flush=True)
         import vllm
+        if not is_supported_vllm_version(vllm.__version__):
+            raise RuntimeError("Fourth's inference backend requires vLLM 0.11.1 "
+                               f"(including CUDA builds such as 0.11.1+cu129), found {vllm.__version__!r}")
         from vllm import LLM, SamplingParams
         from vllm.inputs import TokensPrompt
         from vllm.inputs.preprocess import InputPreprocessor
         from transformers import AutoTokenizer
-        if vllm.__version__ != "0.11.1":
-            raise RuntimeError("This optional backend targets vLLM 0.11.1; use the existing FLEX inference environment")
         if max_new_tokens <= 0 or max_context_tokens <= max_new_tokens:
             raise ValueError("Invalid context/generation budgets")
         if type(max_batch_size) is not int or max_batch_size < 1:

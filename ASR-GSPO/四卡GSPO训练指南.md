@@ -16,6 +16,8 @@ source /data/yb/vens/flex-gspo-online/bin/activate
 mkdir -p logs
 ~~~
 
+此处的 GSPO 训练环境使用 vLLM `0.19.1`、Transformers `5.6.2`、tokenizers `0.22.2`、PyTorch `2.10.0+cu129`。启动计划中的 `runtime_versions` 可核对当前解释器。Web 环境和共用模型目录见 [Fourth 合并与部署](../Fourth/README.md#4-合并并启动-web)。
+
 不升级 Swift/Megatron/vLLM。没有 RapidFuzz 时 CER 用较慢的 Python 实现；需要加速可在该环境执行 python3 -m pip install rapidfuzz。
 
 ## 2. 按末尾标点与最后时间戳过滤

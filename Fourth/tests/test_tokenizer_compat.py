@@ -24,10 +24,17 @@ def test_qwen_registry_and_multimodal_roles_roundtrip(tmp_path, old_style):
     base.save(str(tmp_path / "tokenizer.json"))
     native_bytes = (tmp_path / "tokenizer.json").read_bytes()
     path = tmp_path / "tokenizer_config.json"
+    template = "<|im_start|>{{ messages[0].role }}\n<|audio_start|><|audio_pad|><|audio_end|><|im_end|>\n{% if add_generation_prompt %}<|im_start|>assistant\n{{ '' }}{% endif %}"
     config = {"tokenizer_class": "Qwen2Tokenizer", "eos_token": "<|endoftext|>", **roles,
-              "extra_special_tokens": extra, "chat_template": "{{ messages }}"}
+              "extra_special_tokens": extra}
+    legacy = tmp_path / "chat_template.json"
     if old_style:
         config.update(extra_special_tokens=roles, additional_special_tokens=extra)
+        legacy.write_text(json.dumps({"chat_template": template}), encoding="utf-8")
+    else:
+        config["chat_template"] = template
+        legacy.write_text('{"chat_template":"an older processor template"}', encoding="utf-8")
+    original_legacy = legacy.read_bytes()
     path.write_text(json.dumps(config), encoding="utf-8")
     (tmp_path / "config.json").write_text('{"model_type":"qwen2"}', encoding="utf-8")
     before = path.read_bytes()
@@ -37,12 +44,16 @@ def test_qwen_registry_and_multimodal_roles_roundtrip(tmp_path, old_style):
     normalized = path.read_bytes()
     assert not normalize_tokenizer_directory(tmp_path)
     assert path.read_bytes() == normalized
+    assert legacy.read_bytes() == original_legacy
     assert (tmp_path / "tokenizer.json").read_bytes() == native_bytes
 
     def verify(directory):
         tok = AutoTokenizer.from_pretrained(directory, local_files_only=True)
         assert tok.get_vocab() == base.get_vocab()
-        assert tok.chat_template == "{{ messages }}"
+        assert tok.chat_template == template
+        messages = [{"role": "user", "content": [{"type": "audio", "audio": "in_memory.wav"}]}]
+        rendered = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        assert rendered == "<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|><|im_end|>\n<|im_start|>assistant\n"
         for key, token in roles.items():
             assert getattr(tok, key) == token
             assert getattr(tok, key + "_id") == base.token_to_id(token)
