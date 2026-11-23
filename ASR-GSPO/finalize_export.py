@@ -3,39 +3,45 @@ import argparse
 import json
 import os
 from pathlib import Path
+import shutil
 import tempfile
 
 import asr_gspo  # expose the sibling Fourth package
 from fourth_asr.service_backend import detect_model_protocol, validate_manifest
+from fourth_asr.tokenizer_compat import check_special_token_contract, normalize_tokenizer_directory, special_token_contract
 
 
 ASSET_FILES = ("tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "added_tokens.json",
-               "vocab.json", "merges.txt", "tokenizer.model", "preprocessor_config.json", "processor_config.json",
+               "vocab.json", "merges.txt", "tokenizer.model", "preprocessor_config.json", "video_preprocessor_config.json", "processor_config.json",
                "feature_extractor_config.json", "chat_template.json", "chat_template.jinja", "generation_config.json")
 
 
-def atomic_write(path, data):
+def atomic_write(path, data, *, new_file_mode=None):
+    mode = path.stat().st_mode if path.exists() else new_file_mode
     fd, staging = tempfile.mkstemp(prefix=".export-", dir=path.parent)
     try:
         with os.fdopen(fd, "wb") as out:
             out.write(data)
+        if mode is not None:
+            os.chmod(staging, mode)
         os.replace(staging, path)
     finally:
         Path(staging).unlink(missing_ok=True)
 
 
-def restore_missing_assets(source, merged):
-    """Do not overwrite existing assets or copy model config/weights from SFT."""
-    copied = []
-    candidates = [(source / name, merged / name) for name in ASSET_FILES]
-    if (source / "chat_templates").is_dir():
-        candidates.extend((p, merged / "chat_templates" / p.name) for p in (source / "chat_templates").glob("*.jinja"))
-    for src, dest in candidates:
-        if src.is_file() and not dest.exists():
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            atomic_write(dest, src.read_bytes())
-            copied.append(dest.relative_to(merged).as_posix())
-    return copied
+def stage_assets(source, merged, stage):
+    """Prefer the RL export's files, filling holes from its exact SFT parent."""
+    names = set(ASSET_FILES)
+    for directory in (source, merged):
+        names.update(p.relative_to(directory).as_posix() for p in (directory / "chat_templates").glob("*.jinja"))
+    for name in sorted(names):
+        path = merged / name if (merged / name).is_file() else source / name
+        if path.is_file():
+            target = stage / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(path, target)
+    # Processors may look up their type from the model config. Always use the RL one.
+    shutil.copyfile(merged / "config.json", stage / "config.json")
 
 
 def verify_weights(directory, token_ids):
@@ -86,35 +92,55 @@ def finalize(source, merged):
     reference_tokenizer = AutoTokenizer.from_pretrained(source, local_files_only=True)
     validate_manifest(reference_tokenizer, manifest)
     verify_weights(merged, manifest["token_ids"].values())
-    # Verify an existing tokenizer before filling absent files; a mismatched
-    # checkpoint must never be made to appear compatible by replacing its vocab.
-    if (merged / "tokenizer_config.json").is_file() and (merged / "tokenizer.json").is_file():
-        existing = AutoTokenizer.from_pretrained(merged, local_files_only=True)
-        if existing.get_vocab() != reference_tokenizer.get_vocab():
-            raise ValueError("Existing export tokenizer differs from the exact SFT parent")
-    copied = restore_missing_assets(source, merged)
-    reference_processor = Qwen3OmniMoeProcessor.from_pretrained(source, local_files_only=True)
-    processor = Qwen3OmniMoeProcessor.from_pretrained(merged, local_files_only=True)
-    tokenizer = processor.tokenizer
-    validate_manifest(tokenizer, manifest)
-    if reference_tokenizer.get_vocab() != tokenizer.get_vocab():
-        raise ValueError("Merged tokenizer vocabulary differs from the reference checkpoint")
-    if reference_processor.chat_template != processor.chat_template:
-        raise ValueError("Merged processor chat template differs from its SFT parent")
-    if reference_processor.feature_extractor.to_dict() != processor.feature_extractor.to_dict():
-        raise ValueError("Merged audio feature extractor differs from its SFT parent")
     dest = merged / name
     if dest.exists() and json.loads(dest.read_bytes()) != manifest:
         raise ValueError(f"Conflicting protocol manifest in {merged}")
-    if not dest.exists():
-        atomic_write(dest, source_bytes)
-        copied.append(name)
     tokens = merged / "omnicommit_tokens.txt"
+    if tokens.exists() and tokens.read_text(encoding="utf-8-sig").splitlines() != manifest["tokens"]:
+        raise ValueError(f"Conflicting protocol token inventory in {merged}")
+    reference_processor = Qwen3OmniMoeProcessor.from_pretrained(source, local_files_only=True)
+    contract = special_token_contract(reference_tokenizer)
+    check_special_token_contract(contract, reference_processor.tokenizer)
+    copied, normalized = [], []
+    # Swift may reserialize the tokenizer when it saves RL weights. Check the
+    # complete portable artifact before publishing even a repaired metadata file.
+    with tempfile.TemporaryDirectory(prefix=".export-assets-", dir=merged) as tmp:
+        stage = Path(tmp)
+        stage_assets(source, merged, stage)
+        normalize_tokenizer_directory(stage)
+        exported_tokenizer = AutoTokenizer.from_pretrained(stage, local_files_only=True)
+        processor = Qwen3OmniMoeProcessor.from_pretrained(stage, local_files_only=True)
+        vocab = reference_tokenizer.get_vocab()
+        for tokenizer in (exported_tokenizer, processor.tokenizer):
+            if tokenizer.get_vocab() != vocab:
+                raise ValueError("Existing export tokenizer differs from the exact SFT parent")
+            validate_manifest(tokenizer, manifest)
+            check_special_token_contract(contract, tokenizer)
+        if reference_processor.chat_template != processor.chat_template:
+            raise ValueError("Merged processor chat template differs from its SFT parent")
+        if reference_processor.feature_extractor.to_dict() != processor.feature_extractor.to_dict():
+            raise ValueError("Merged audio feature extractor differs from its SFT parent")
+        for path in sorted(stage.rglob("*")):
+            if not path.is_file() or path == stage / "config.json":
+                continue
+            relative = path.relative_to(stage).as_posix()
+            target = merged / relative
+            data = path.read_bytes()
+            if target.exists() and target.read_bytes() == data:
+                continue
+            (normalized if target.exists() else copied).append(relative)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write(target, data, new_file_mode=(merged / "config.json").stat().st_mode)
+    if not dest.exists():
+        atomic_write(dest, source_bytes, new_file_mode=(source / name).stat().st_mode)
+        copied.append(name)
     if not tokens.exists():
-        atomic_write(tokens, ("\n".join(manifest["tokens"]) + "\n").encode("utf-8"))
-    status = dict(ready=True, protocol=detect_model_protocol(merged), sft_parent=str(source.resolve()), copied=copied)
+        atomic_write(tokens, ("\n".join(manifest["tokens"]) + "\n").encode("utf-8"),
+                     new_file_mode=dest.stat().st_mode)
+    status = dict(ready=True, protocol=detect_model_protocol(merged), sft_parent=str(source.resolve()),
+                  copied=copied, normalized=normalized)
     atomic_write(merged / "omnicommit_export_status.json", (json.dumps(status, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
-    print(f"[export] Verified Fourth HF checkpoint: {merged}; restored={copied}", flush=True)
+    print(f"[export] Verified Fourth HF checkpoint: {merged}; restored={copied}; normalized={normalized}", flush=True)
     return status
 
 

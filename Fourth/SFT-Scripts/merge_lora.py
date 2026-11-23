@@ -1,27 +1,34 @@
 #!/usr/bin/env python3
 """Export one SFT PEFT adapter plus its original HF base as a standalone model.
 
-Uses the ms-swift 3.12.1 or 4.1.3 HF export interface. No training dataset or MCore conversion
-is needed. Preserves inputs and publishes the final directory only after checks.
+Uses the ms-swift 3.x HF export interface for 3.12.1 and the project's 3.14.2
+image, or the 4.x interface for 4.1.3. Preserves inputs and publishes the final
+directory only after validating the merged HF export.
 """
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 import faulthandler
 import importlib.metadata
+import inspect
 import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from fourth_asr.service_backend import read_export_protocol
+from fourth_asr.tokenizer_compat import (
+    check_special_token_contract, normalize_tokenizer_directory, runtime_versions, special_token_contract,
+)
 
 VOCAB_KEYS = ("thinker.model.embed_tokens.weight", "thinker.lm_head.weight")
 
@@ -56,6 +63,68 @@ def diagnostic_stage(name, stack_after_seconds=60):
 def read_json(path):
     with Path(path).open(encoding="utf-8-sig") as handle:
         return json.load(handle)
+
+
+def compatible_merge_input(source, stack):
+    """Use a private tokenizer config when a read-only merge input uses another HF schema."""
+    if not (source / "tokenizer_config.json").is_file() or not normalize_tokenizer_directory(source, check_only=True):
+        return source
+    view = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="omnicommit-merge-input-")))
+    for item in source.iterdir():
+        destination = view / item.name
+        if item.name in {"tokenizer_config.json", "special_tokens_map.json", "tokenizer.json"}:
+            shutil.copyfile(item, destination)
+        elif os.name == "nt" and item.is_file() and source.drive == view.drive:
+            os.link(item, destination)
+        else:
+            destination.symlink_to(item, target_is_directory=item.is_dir())
+    normalize_tokenizer_directory(view)
+    return view
+
+
+def restore_input_paths(output, inputs):
+    """HF may serialize a temporary input directory in model/tokenizer metadata."""
+    aliases = {str(view): str(source) for view, source in inputs if view != source}
+    if not aliases:
+        return
+
+    def restore(value):
+        if isinstance(value, str):
+            return aliases.get(value, value)
+        if isinstance(value, list):
+            return [restore(v) for v in value]
+        if isinstance(value, dict):
+            return {k: restore(v) for k, v in value.items()}
+        return value
+
+    for name in ("config.json", "tokenizer_config.json", "processor_config.json", "preprocessor_config.json",
+                 "generation_config.json", "args.json"):
+        path = output / name
+        if path.is_file():
+            original = read_json(path)
+            restored = restore(original)
+            if restored != original:
+                path.write_text(json.dumps(restored, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def complete_processor_assets(output, adapter, base):
+    # Older HF readers look up processor components in separate files.
+    # Prefer the exact SFT checkpoint when it supplied a component.
+    for name in ("preprocessor_config.json", "feature_extractor_config.json", "video_preprocessor_config.json"):
+        if (output / name).exists():
+            continue
+        for source in (adapter, base):
+            if (source / name).is_file():
+                shutil.copyfile(source / name, output / name)
+                break
+    combined = output / "processor_config.json"
+    legacy = output / "preprocessor_config.json"
+    if combined.is_file() and legacy.is_file():
+        extractor = read_json(combined).get("feature_extractor") or {}
+        previous = read_json(legacy)
+        for key in ("sampling_rate", "feature_size", "hop_length", "n_fft", "dither", "padding_value"):
+            if key in extractor and key in previous and extractor[key] != previous[key]:
+                raise ValueError(f"Inconsistent audio feature extractor setting {key} between processor configs")
 
 
 def weight_inventory(directory, prefix):
@@ -129,6 +198,19 @@ def protocol_ids(tokenizer, tokens):
     return ids
 
 
+def add_training_tokens(tokenizer, tokens):
+    # HF changed both the registry name and the append argument in Transformers 5.
+    parameters = inspect.signature(tokenizer.add_special_tokens).parameters
+    if "replace_extra_special_tokens" in parameters:
+        tokenizer.add_special_tokens({"extra_special_tokens": tokens}, replace_extra_special_tokens=False)
+    elif "replace_additional_special_tokens" in parameters:
+        tokenizer.add_special_tokens({"additional_special_tokens": tokens}, replace_additional_special_tokens=False)
+    else:
+        # Older/custom tokenizer with only the token dictionary argument.
+        existing = list(getattr(tokenizer, "additional_special_tokens", ()) or ())
+        tokenizer.add_special_tokens({"additional_special_tokens": existing + [t for t in tokens if t not in existing]})
+
+
 def compare_vocab_rows(reference, actual, target, *, rows_per_read=2048):
     """Check every trained row after export's dtype conversion, using bounded CPU slices."""
     import torch
@@ -173,7 +255,7 @@ def preflight(base, adapter, tokens_file):
     with diagnostic_stage(f"Load local tokenizer: {base}"):
         tokenizer = AutoTokenizer.from_pretrained(str(base), local_files_only=True, trust_remote_code=False)
     with diagnostic_stage("Reconstruct and validate the full training token inventory"):
-        tokenizer.add_special_tokens({"additional_special_tokens": tokens})
+        add_training_tokens(tokenizer, tokens)
         ids = protocol_ids(tokenizer, tokens)
         # Older Fourth checkpoints also contain both dense tables. If their token-ID
         # sidecar is available it must identify the same tokenizer rows.
@@ -183,10 +265,12 @@ def preflight(base, adapter, tokens_file):
             if legacy.get("schema_version") != 1 or legacy.get("token_ids") != ids:
                 raise ValueError("Legacy checkpoint token IDs disagree with the training inventory")
         vocabulary = tokenizer.get_vocab()
+        contract = special_token_contract(tokenizer)
         if any((adapter / name).is_file() for name in ("tokenizer.json", "vocab.json")):
             training_tokenizer = AutoTokenizer.from_pretrained(str(adapter), local_files_only=True, trust_remote_code=False)
             if training_tokenizer.get_vocab() != vocabulary or protocol_ids(training_tokenizer, tokens) != ids:
                 raise ValueError("Checkpoint tokenizer differs from the base plus training tokens")
+            check_special_token_contract(contract, training_tokenizer)
     base_weights = weight_inventory(base, "model")
     adapter_weights = weight_inventory(adapter, "adapter_model")
     if not any("lora_A" in key for key in adapter_weights) or not any("lora_B" in key for key in adapter_weights):
@@ -210,7 +294,7 @@ def preflight(base, adapter, tokens_file):
     return {"tokens": tokens, "manifest_metadata": manifest_metadata,
             "protocol_token_ids": ids, "tokenizer_length": len(tokenizer),
             "expected_vocab_size": expected_vocab, "saved_modules": modules,
-            "vocabulary": vocabulary,
+            "vocabulary": vocabulary, "special_token_contract": contract,
             "base_tensor_shapes": {key: value["shape"] for key, value in base_weights.items()},
             "training_base_recorded": training_args.get("model"),
             "training_args_tokens_verified": True}
@@ -225,11 +309,13 @@ def verify_export(output, expected):
     if (protocol_ids(tokenizer, expected["tokens"]) != expected["protocol_token_ids"]
             or tokenizer.get_vocab() != expected["vocabulary"]):
         raise ValueError("Exported tokenizer differs from the expected training protocol tokenizer")
+    check_special_token_contract(expected["special_token_contract"], tokenizer)
     with diagnostic_stage(f"Load exported processor: {output}"):
         processor = AutoProcessor.from_pretrained(str(output), local_files_only=True, trust_remote_code=False)
     if (protocol_ids(processor.tokenizer, expected["tokens"]) != expected["protocol_token_ids"]
             or processor.tokenizer.get_vocab() != expected["vocabulary"]):
         raise ValueError("Exported processor tokenizer vocabulary mismatch")
+    check_special_token_contract(expected["special_token_contract"], processor.tokenizer)
     config = read_json(output / "config.json")
     if config.get("model_type") != "qwen3_omni_moe":
         raise ValueError("Unexpected exported model_type")
@@ -281,6 +367,7 @@ def main(argv=None):
     parser.add_argument("--check-only", action="store_true", help="Check inputs, tokens and shapes without loading full weights")
     args = parser.parse_args(argv)
     staging = None
+    views = ExitStack()
     try:
         for name in ("base", "adapter", "special_tokens"):
             setattr(args, name, getattr(args, name).resolve(strict=True))
@@ -297,10 +384,16 @@ def main(argv=None):
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
         version = importlib.metadata.version("ms-swift")
         print(f"[merge] Python: {sys.executable}\n[merge] ms-swift: {version}", flush=True)
-        if version not in {"3.12.1", "4.1.3"}:
-            print("[merge] NOTE: this recipe was source-audited for ms-swift 3.12.1 and 4.1.3.", flush=True)
+        if version.split("+", 1)[0] == "3.14.2":
+            print("[merge] Using the project's 3.14.2 image with the 3.x export CLI.", flush=True)
+        elif version.split("+", 1)[0] not in {"3.12.1", "4.1.3"}:
+            print("[merge] NOTE: upstream CLI source checked for 3.12.1 and 4.1.3; "
+                  "the project's 3.14.2 image uses the 3.x CLI.", flush=True)
         print("[merge] Checking local HF base, adapter tensors and protocol tokens...", flush=True)
-        expected = preflight(args.base, args.adapter, args.special_tokens)
+        export_args = argparse.Namespace(**vars(args))
+        export_args.base = compatible_merge_input(args.base, views)
+        export_args.adapter = compatible_merge_input(args.adapter, views)
+        expected = preflight(export_args.base, export_args.adapter, args.special_tokens)
         print(json.dumps({"input_checks_passed": True, "protocol_token_ids": expected["protocol_token_ids"],
                           "vocab_size": expected["expected_vocab_size"],
                           "training_base_recorded": expected["training_base_recorded"]}, ensure_ascii=False), flush=True)
@@ -309,7 +402,7 @@ def main(argv=None):
             return 0
         args.output.parent.mkdir(parents=True, exist_ok=True)
         staging = args.output.with_name(args.output.name + ".incomplete-" + uuid.uuid4().hex[:8])
-        command = export_command(args, staging, version)
+        command = export_command(export_args, staging, version)
         print("[merge] " + shlex.join(command), flush=True)
         started = time.monotonic()
         # Run as one process; device_map can distribute HF weights across visible GPUs.
@@ -317,10 +410,16 @@ def main(argv=None):
         for key in ("RANK", "LOCAL_RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE", "NPROC_PER_NODE", "NNODES"):
             child_env.pop(key, None)
         subprocess.run(command, env=child_env, check=True)
+        complete_processor_assets(staging, args.adapter, args.base)
+        restore_input_paths(staging, [(export_args.base, args.base), (export_args.adapter, args.adapter)])
+        with diagnostic_stage("Finalize tokenizer configuration for serving and GSPO"):
+            normalised = normalize_tokenizer_directory(staging)
         print("[merge] Export finished; verifying the full trained input and output vocabulary tables...", flush=True)
         verified = verify_export(staging, expected)
         report = {"created_utc": datetime.now(timezone.utc).isoformat(), "base": str(args.base),
                   "adapter": str(args.adapter), "output": str(args.output), "ms_swift": version,
+                  "runtime_versions": runtime_versions(),
+                  "tokenizer_metadata_normalized": normalised,
                   "elapsed_seconds": round(time.monotonic() - started, 2), **verified}
         (staging / "omnicommit_merge_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         manifest = {**expected["manifest_metadata"], "tokens": expected["tokens"],
@@ -341,6 +440,8 @@ def main(argv=None):
         if staging is not None:
             print(f"[merge] Partial/unverified export retained at: {staging}; do not use it for inference.", file=sys.stderr, flush=True)
         return 1
+    finally:
+        views.close()
 
 
 if __name__ == "__main__":

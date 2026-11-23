@@ -20,6 +20,7 @@ import subprocess
 import sys
 
 from asr_gspo.reward import REWARD_VERSION
+from fourth_asr.tokenizer_compat import runtime_versions
 
 ROOT = Path(__file__).resolve().parent
 AUDITED_SWIFT_COMMIT = "f15bb91439d756d4a366b51956d72d1f088b7af6"
@@ -254,10 +255,14 @@ def validate_local_inputs(a: argparse.Namespace) -> dict:
     token_manifest = json.loads((model / "omnicommit_tokens.json").read_text(encoding="utf-8"))
     try:
         validate_manifest(AutoTokenizer.from_pretrained(model, local_files_only=True), token_manifest)
-    except ValueError as exc:
-        if "Protocol token is not registered special:" in str(exc):
+    except (AttributeError, ValueError) as exc:
+        config_path = model / "tokenizer_config.json"
+        list_as_roles = (isinstance(exc, AttributeError) and "'list' object has no attribute 'keys'" in str(exc)
+                         and config_path.is_file()
+                         and isinstance(json.loads(config_path.read_bytes()).get("extra_special_tokens"), list))
+        if list_as_roles or "Protocol token is not registered special:" in str(exc):
             raise ValueError(
-                f"{exc}. Tokenizer registration failed before GPU training; do not change token IDs. "
+                f"{exc}. Incompatible Fourth tokenizer metadata before GPU training; do not change token IDs. "
                 f"Inspect in this same environment: python3 {shlex.quote(str(ROOT / 'repair_tokenizer.py'))} "
                 f"{shlex.quote(str(model))}. If IDs and trained vocabulary rows match, append --apply "
                 "to restore special-token metadata only."
@@ -390,7 +395,8 @@ def main(argv=None):
     try:
         cmd = build_command(a)
         env = build_environment(a)
-        plan = {"framework_commit": AUDITED_SWIFT_COMMIT, "parallelism": parallel_layout(a),
+        plan = {"framework_commit": AUDITED_SWIFT_COMMIT, "runtime_versions": runtime_versions(),
+                "parallelism": parallel_layout(a),
                 "reward_mode": a.reward_mode, "command": cmd, "group_size": a.group_size,
                 "reward_version": REWARD_VERSION,
                 "switch_grace_turns": a.switch_grace_turns,

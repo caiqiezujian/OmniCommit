@@ -1,19 +1,18 @@
-"""Diagnose or explicitly repair existing Fourth protocol-token registration.
+"""Diagnose or repair an existing Fourth HF export for inference and GSPO.
 
-No token is created, moved, or assigned a new vocabulary row. Run this with
-the same Python environment used to launch GSPO; stop other writers first.
+All edits are staged and verified before publication. No weight is rewritten.
+Run this while the model directory is offline and no other process is editing it.
 """
 import argparse
 import inspect
 import json
-import platform
-from importlib import metadata
 from pathlib import Path
 import shutil
 import tempfile
 
 import asr_gspo  # exposes the sibling Fourth package
 from fourth_asr.service_backend import _manifest_mode, validate_manifest
+from fourth_asr.tokenizer_compat import normalize_tokenizer_directory, runtime_versions
 from finalize_export import atomic_write, verify_weights
 
 
@@ -24,19 +23,10 @@ TOKENIZER_FILES = (
 )
 SUPPORT_FILES = (
     "config.json", "preprocessor_config.json", "processor_config.json",
-    "feature_extractor_config.json", "chat_template.json", "chat_template.jinja",
+    "feature_extractor_config.json", "video_preprocessor_config.json",
+    "chat_template.json", "chat_template.jinja",
 )
 FLAGS = ("single_word", "lstrip", "rstrip", "normalized", "special")
-
-
-def versions():
-    result = {"python": platform.python_version()}
-    for name in ("transformers", "tokenizers", "huggingface-hub", "safetensors", "ms-swift"):
-        try:
-            result[name] = metadata.version(name)
-        except metadata.PackageNotFoundError:
-            result[name] = "not installed"
-    return result
 
 
 def load_tokenizer(path):
@@ -96,8 +86,14 @@ def _check_preserved(tokenizer, manifest, original):
     if not original["special"].issubset(tokenizer.all_special_tokens):
         raise ValueError("Repair removed an existing special token")
     current = _snapshot(tokenizer)
-    if current["roles"] != original["roles"]:
-        raise ValueError("Repair changed a named special-token role or its AddedToken flags")
+    for name, value in original["roles"].items():
+        if current["roles"].get(name) != value:
+            raise ValueError("Repair changed a named special-token role or its AddedToken flags")
+    for name in current["roles"].keys() - original["roles"].keys():
+        token = current["roles"][name]["content"]
+        idx = original["vocab"].get(token)
+        if token not in manifest["tokens"] or name != f"omnicommit_registered_{idx}_token":
+            raise ValueError(f"Repair added an unexpected named special-token role: {name}")
     if current["chat_template"] != original["chat_template"]:
         raise ValueError("Repair changed the tokenizer chat template")
     for idx, previous in original["added"].items():
@@ -171,23 +167,20 @@ def _provenance(model):
         try:
             report = json.loads(report_path.read_bytes())
             result["merge_ms_swift"] = report.get("ms_swift")
+            if "runtime_versions" in report:
+                result["merge_runtime_versions"] = report["runtime_versions"]
         except (ValueError, AttributeError):
             result["merge_report_error"] = "Merge report is not a JSON object"
     return result
 
 
-def repair(model, apply=False):
-    model = Path(model).resolve()
-    manifest_bytes = (model / "omnicommit_tokens.json").read_bytes()
-    manifest = json.loads(manifest_bytes)
-    tokenizer = load_tokenizer(model)
-    _check_ids(tokenizer, manifest)
-    original = _snapshot(tokenizer)
+def _report(model, manifest, tokenizer, apply, format_changed):
     missing = [t for t in manifest["tokens"] if t not in tokenizer.all_special_tokens]
-    result = {
-        "model": str(model), "versions": versions(), "export_versions": _provenance(model),
+    return {
+        "model": str(model), "versions": runtime_versions(), "export_versions": _provenance(model),
         "mode": "apply" if apply else "diagnose",
         "tokenizer_length": len(tokenizer), "missing_special_registration": missing,
+        "format_repair_needed_on_input": format_changed,
         "tokens": [{"token": t, "manifest_id": manifest["token_ids"][t],
                     "encoded_ids": tokenizer.encode(t, add_special_tokens=False),
                     "registered_special": t in tokenizer.all_special_tokens,
@@ -196,36 +189,52 @@ def repair(model, apply=False):
                    for t in manifest["tokens"]],
         "files": _file_details(model, manifest["tokens"]), "changed_files": [],
     }
-    if not apply:
-        result["status"] = "registration_repair_needed" if missing else "registered"
-        result["note"] = "Read-only. --apply also checks HF weight headers and processor/tokenizer reloads."
-        return result
-    verify_weights(model, manifest["token_ids"].values())
-    if not missing:
-        _check_preserved(tokenizer, manifest, original)
-        _check_processor(model, manifest, original)
-        result["status"] = "already_valid"
-        return result
 
+
+def repair(model, apply=False):
+    model = Path(model).resolve()
+    manifest_bytes = (model / "omnicommit_tokens.json").read_bytes()
+    manifest = json.loads(manifest_bytes)
     originals = {name: (model / name).read_bytes() if (model / name).is_file() else None for name in TOKENIZER_FILES}
     support = {name: (model / name).read_bytes() for name in SUPPORT_FILES if (model / name).is_file()}
-    _register(tokenizer, manifest)
-    _check_preserved(tokenizer, manifest, original)
-    with tempfile.TemporaryDirectory(prefix=".tokenizer-registration-", dir=model.parent) as directory:
+    with tempfile.TemporaryDirectory(prefix=".tokenizer-registration-") as directory:
         stage = Path(directory)
         for name, data in {**originals, **support}.items():
             if data is not None:
                 (stage / name).write_bytes(data)
         if (model / "chat_templates").is_dir():
             shutil.copytree(model / "chat_templates", stage / "chat_templates")
-        tokenizer.save_pretrained(stage, save_jinja_files=False)
-        # Never migrate or remove an original embedded template during repair.
-        config_path = stage / "tokenizer_config.json"
-        old_config = json.loads(originals.get("tokenizer_config.json") or b"{}")
-        new_config = json.loads(config_path.read_bytes())
-        if "chat_template" in old_config:
-            new_config["chat_template"] = old_config["chat_template"]
-            config_path.write_text(json.dumps(new_config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        # Older serving images cannot instantiate a tokenizer whose
+        # extra_special_tokens is a list. Fix the staging copy *before* HF reads it.
+        format_changed = normalize_tokenizer_directory(stage)
+        tokenizer = load_tokenizer(stage)
+        _check_ids(tokenizer, manifest)
+        result = _report(model, manifest, tokenizer, apply, format_changed)
+        missing = result["missing_special_registration"]
+        if not apply:
+            if missing:
+                result["status"] = "registration_repair_needed"
+            elif format_changed:
+                result["status"] = "format_repair_needed"
+            else:
+                result["status"] = "registered"
+            result["note"] = "Read-only. --apply also checks HF weight headers and processor/tokenizer reloads."
+            return result
+        verify_weights(model, manifest["token_ids"].values())
+        original = _snapshot(tokenizer)
+        if missing:
+            _register(tokenizer, manifest)
+            _check_preserved(tokenizer, manifest, original)
+            tokenizer.save_pretrained(stage, save_jinja_files=False)
+            # Never migrate or remove an original embedded template during repair.
+            config_path = stage / "tokenizer_config.json"
+            old_config = json.loads(originals.get("tokenizer_config.json") or b"{}")
+            new_config = json.loads(config_path.read_bytes())
+            if "chat_template" in old_config:
+                new_config["chat_template"] = old_config["chat_template"]
+                config_path.write_text(json.dumps(new_config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            # save_pretrained emits the current environment's own schema again.
+            normalize_tokenizer_directory(stage)
         _check_preserved(load_tokenizer(stage), manifest, original)
         _check_processor(stage, manifest, original)
         candidates = {name: (stage / name).read_bytes() for name in TOKENIZER_FILES if (stage / name).is_file()}
@@ -261,7 +270,7 @@ def repair(model, apply=False):
                 raise RuntimeError(f"Repair failed ({exc}); rollback incomplete: {rollback_errors}") from exc
             raise RuntimeError(f"Repair failed; original tokenizer files restored: {exc}") from exc
         result["changed_files"] = list(changed)
-    result["status"] = "repaired"
+    result["status"] = "repaired" if result["changed_files"] else "already_valid"
     result["missing_special_registration"] = []
     for token in result["tokens"]:
         token["registered_special"] = True
@@ -274,12 +283,12 @@ def repair(model, apply=False):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model", type=Path, help="Existing merged Fourth HF model directory")
-    parser.add_argument("--apply", action="store_true", help="Repair registration only after all identity and weight checks")
+    parser.add_argument("--apply", action="store_true", help="Repair tokenizer metadata after identity, weight and reload checks")
     args = parser.parse_args(argv)
     try:
         report = repair(args.model, apply=args.apply)
     except Exception as exc:
-        print(json.dumps({"status": "refused", "versions": versions(), "error": str(exc)}, ensure_ascii=False, indent=2))
+        print(json.dumps({"status": "refused", "versions": runtime_versions(), "error": str(exc)}, ensure_ascii=False, indent=2))
         return 1
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0

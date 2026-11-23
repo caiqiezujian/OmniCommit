@@ -137,6 +137,28 @@ def test_preflight_registration_error_points_to_guarded_repair(tmp_path, monkeyp
     assert "do not change token IDs" in str(error.value)
 
 
+def test_preflight_reports_old_list_config_without_editing_model(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from fourth_asr.service_backend import _metadata
+
+    ids = {WAIT: 10, DIRECT: 11, SPK_CHANGE: 12}
+    manifest = dict(_metadata("speaker"), tokens=list(ids), token_ids=ids, tokenizer_length=13)
+    (tmp_path / "omnicommit_tokens.json").write_text(json.dumps(manifest), encoding="utf-8")
+    config = tmp_path / "tokenizer_config.json"
+    original = json.dumps({"extra_special_tokens": list(ids)}).encode()
+    config.write_bytes(original)
+
+    def load(*args, **kwargs):
+        json.loads(config.read_bytes())["extra_special_tokens"].keys()
+
+    loader = SimpleNamespace(from_pretrained=load)
+    monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(AutoTokenizer=loader))
+    args = train_gspo.parser().parse_args([str(tmp_path), "tasks", "out"])
+    with pytest.raises(ValueError, match="repair_tokenizer.py"):
+        train_gspo.validate_local_inputs(args)
+    assert config.read_bytes() == original
+
+
 def test_export_catches_short_heads_and_missing_audio_encoder(tmp_path):
     import numpy as np
     from safetensors.numpy import save_file

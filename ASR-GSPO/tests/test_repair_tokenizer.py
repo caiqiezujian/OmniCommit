@@ -164,11 +164,14 @@ def test_backend_only_native_special_is_retained(model):
     config_path = model / "tokenizer_config.json"
     config = json.loads(config_path.read_bytes())
     config["additional_special_tokens"] = []
+    config.pop("extra_special_tokens", None)
     config_path.write_text(json.dumps(config), encoding="utf-8")
     mapping_path = model / "special_tokens_map.json"
-    mapping = json.loads(mapping_path.read_bytes())
-    mapping.pop("additional_special_tokens", None)
-    mapping_path.write_text(json.dumps(mapping), encoding="utf-8")
+    if mapping_path.is_file():
+        mapping = json.loads(mapping_path.read_bytes())
+        mapping.pop("additional_special_tokens", None)
+        mapping.pop("extra_special_tokens", None)
+        mapping_path.write_text(json.dumps(mapping), encoding="utf-8")
     original = repair.load_tokenizer(model)
     assert "<audio>" not in original.all_special_tokens
     assert original.added_tokens_decoder[original.get_vocab()["<audio>"]].special
@@ -176,6 +179,81 @@ def test_backend_only_native_special_is_retained(model):
     fixed = repair.load_tokenizer(model)
     assert "<audio>" in fixed.all_special_tokens
     assert fixed.added_tokens_decoder[fixed.get_vocab()["<audio>"]].lstrip
+
+
+def _use_list_style_config(model, values):
+    config_path = model / "tokenizer_config.json"
+    config = json.loads(config_path.read_bytes())
+    config.pop("additional_special_tokens", None)
+    config["extra_special_tokens"] = values
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+
+def test_format_only_repair_precedes_every_hf_load_and_is_idempotent(model, monkeypatch):
+    repair.repair(model, apply=True)
+    original_vocab = repair.load_tokenizer(model).get_vocab()
+    manifest = json.loads((model / "omnicommit_tokens.json").read_bytes())
+    _use_list_style_config(model, ["<audio>", *manifest["tokens"]])
+    before = files(model)
+    loader = repair.load_tokenizer
+
+    def strict_loader(path):
+        config = json.loads((path / "tokenizer_config.json").read_bytes())
+        assert not isinstance(config.get("extra_special_tokens"), list)
+        return loader(path)
+
+    monkeypatch.setattr(repair, "load_tokenizer", strict_loader)
+    diagnose = repair.repair(model)
+    assert diagnose["status"] == "format_repair_needed" and files(model) == before
+    report = repair.repair(model, apply=True)
+    assert report["status"] == "repaired" and report["format_repair_needed_on_input"]
+    assert "tokenizer_config.json" in report["changed_files"]
+    fixed = repair.load_tokenizer(model)
+    assert fixed.get_vocab() == original_vocab
+    for token in manifest["tokens"]:
+        assert token in fixed.all_special_tokens
+    for name in ("model.safetensors", "omnicommit_tokens.json", "tokenizer.json"):
+        assert (model / name).read_bytes() == before[name]
+    after = files(model)
+    assert repair.repair(model, apply=True)["status"] == "already_valid"
+    assert files(model) == after
+
+
+def test_schema_and_registration_repaired_together_and_bad_weights_leave_originals(model, monkeypatch):
+    _use_list_style_config(model, ["<audio>"])
+    original = files(model)
+    with monkeypatch.context() as scoped:
+        def bad_weights(*args):
+            raise ValueError("bad weight headers")
+
+        scoped.setattr(repair, "verify_weights", bad_weights)
+        with pytest.raises(ValueError, match="bad weight headers"):
+            repair.repair(model, apply=True)
+        assert files(model) == original
+    result = repair.repair(model, apply=True)
+    assert result["status"] == "repaired" and result["format_repair_needed_on_input"]
+    assert all(item["registered_special"] for item in result["tokens"])
+    assert (model / "model.safetensors").read_bytes() == original["model.safetensors"]
+    assert repair.repair(model, apply=True)["status"] == "already_valid"
+
+
+def test_legacy_registration_with_named_modality_and_anonymous_actions(model):
+    path = model / "tokenizer_config.json"
+    config = json.loads(path.read_bytes())
+    config["additional_special_tokens"] = ["<audio>"]
+    config["extra_special_tokens"] = {"audio_token": "<audio>"}
+    path.write_text(json.dumps(config), encoding="utf-8")
+    manifest = json.loads((model / "omnicommit_tokens.json").read_bytes())
+    originals = files(model)
+    result = repair.repair(model, apply=True)
+    assert result["status"] == "repaired"
+    tokenizer = repair.load_tokenizer(model)
+    assert str(tokenizer.audio_token) == "<audio>"
+    assert tokenizer.audio_token_id == tokenizer.get_vocab()["<audio>"]
+    for token, idx in manifest["token_ids"].items():
+        assert token in tokenizer.all_special_tokens and tokenizer.encode(token, add_special_tokens=False) == [idx]
+    assert (model / "model.safetensors").read_bytes() == originals["model.safetensors"]
+    assert repair.repair(model, apply=True)["status"] == "already_valid"
 
 
 def test_extra_special_tokens_api_compatibility(monkeypatch):

@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sys
 
 import numpy as np
 
@@ -16,6 +17,7 @@ from . import DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_NEW_TOKENS
 from .audio_token_counter import AudioTokenCounter
 from .inference_backend import AssistantPrefixDecoder, multimodal_messages
 from ..service_backend import validate_manifest
+from ..tokenizer_compat import runtime_versions
 from .streaming import ContextBudgetError, GenerationTruncated, WAIT
 
 AUDIO_PLACEHOLDER = "<|audio_start|><|audio_pad|><|audio_end|>"
@@ -29,6 +31,7 @@ class VLLMBackend(AssistantPrefixDecoder):
                  enable_prefix_caching=True, mm_processor_cache_gb=1.0, image_slots=1, dtype="auto",
                  manifest_validator=validate_manifest, max_batch_size=1):
         os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+        print("[Fourth vLLM] " + json.dumps(runtime_versions()), file=sys.stderr, flush=True)
         import vllm
         from vllm import LLM, SamplingParams
         from vllm.inputs import TokensPrompt

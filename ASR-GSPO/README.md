@@ -56,7 +56,9 @@ CER 是主质量项。旧混合词/字符编辑路径保留作局部对齐和可
 
 ## 保存和直接部署
 
-checkpoint-N 是可续训的原生 checkpoint；checkpoint-N-merged 是部署/评测的 HF 模型。每次同步保存后，回调从**准确的 SFT 父模型**恢复缺失 tokenizer、processor、chat template 和 omnicommit_tokens.json，并校验词表、token ID、音频处理配置及权重形状。不会用 SFT 权重覆盖 RL 权重，不覆盖冲突 tokenizer。
+Fourth 的 SFT merge 完成后，GSPO 启动命令的第一个参数和 Web 启动命令可以指向同一个 HF 目录。GSPO 读取该目录中的训练词表和模型权重。
+
+GSPO 每次同步保存都会产生新权重。`checkpoint-N` 用于续训，`checkpoint-N-merged` 用于部署和评测。导出回调会从该次训练的 SFT 父目录补齐缺失的静态文件，对 Swift 重新保存的 tokenizer 执行与 SFT merge 相同的兼容处理。回调在临时目录核对 tokenizer 和 processor 的词表、协议 ID、模板及音频设置，同时检查目标权重能覆盖协议 ID，核对成功才发布服务文件。
 
 成功写 omnicommit_export_status.json，ready:true 表示静态检查通过。失败打印 [export ERROR] 和 ready:false，保留原生训练结果并继续训练；失败目录不要直接部署。已有缺文件的 Fourth RL 导出可执行：
 
@@ -66,9 +68,9 @@ python3 finalize_export.py /data/models/fourth-sft-merged /data/OmniCommit/outpu
 
 第一个目录必须是这次 RL 的准确起点，不能混拷另一个 tokenizer 版本。
 
-## 启动前特殊 token 注册失败
+## 旧版合并模型的兼容修复
 
-若出现 `[launch] Protocol token is not registered special: <|WAIT|>`，退出发生在训练前的 tokenizer 校验。对于报错的这个 token，词表长度和单 token ID 已通过检查，但当前环境的 `all_special_tokens` 没有包含它。其他协议 token 还需检查，不能直接删除这项校验或重新分配 ID。
+新 merge 的正常启动流程可直接跳过本节。旧目录可能报 `Protocol token is not registered special: <|WAIT|>`，表示 tokenizer 已能读入，该 token 的注册信息缺失。另一个可能的错误是 `special_tokens.keys()` 报 `'list' object has no attribute 'keys'`，表示加载器读取 `extra_special_tokens` 时遇到与其接口不兼容的列表。两种情况都可以对同一份已有 HF 导出运行下面的一次性修复。
 
 在同一个 FLEX-GSPO 环境检查启动命令的第一个模型目录：
 

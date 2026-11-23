@@ -183,7 +183,9 @@ python SFT-Scripts/audit_encoded_lengths.py \
 
 ## 4. 合并并启动 Web
 
-将第二个位置参数替换为实际含有 `adapter_config.json` 和适配器权重的 checkpoint 目录。传入本次训练的 token 清单。合并脚本校验 token ID，并将导出后的输入和输出词表逐行与 checkpoint 中保存的两张完整矩阵核对。
+在 `Fourth/` 目录运行下面的命令。将第二个位置参数替换为实际含有 `adapter_config.json` 和适配器权重的 checkpoint 目录，传入本次训练的 token 清单。脚本在 Swift 写完模型后统一 tokenizer 的特殊标记格式，重新加载 tokenizer 和音频 processor，并将输入和输出词表逐行与 checkpoint 中保存的两张矩阵核对。看到 `[merge] SUCCESS` 后，Web、HTTP、批量推理和 GSPO 都可以使用第三个位置参数指定的同一个 HF 目录。GSPO 使用 `speaker` 协议的 Fourth 模型。
+
+本项目当前训练镜像使用 Swift 3.14.2。Swift 3.12 和 3.14 镜像均走已有的 3.x 合并命令。合并时的实际依赖版本记录在 `omnicommit_merge_report.json` 的 `runtime_versions` 中。Web 的 vLLM 后端在启动日志输出 `[Fourth vLLM]`，GSPO 在启动计划输出自己的 `runtime_versions`。三个位置分别记录各自进程实际使用的环境。
 
 ~~~bash
 bash SFT-Scripts/merge_lora.sh \
@@ -199,6 +201,18 @@ CUDA_VISIBLE_DEVICES=0 bash start_server.sh \
   --protocol speaker --chunk-ms 1000 --port 18891 \
   --https-host 10.185.1.71 --cert-dir /data/yb/Code/OmniCommit/certs
 ~~~
+
+### 已经合并的旧模型
+
+如果启动在 `AutoTokenizer.from_pretrained` 报 `'list' object has no attribute 'keys'`，或 GSPO 报 `Protocol token is not registered special`，在仓库根目录执行一次以下命令。`MODEL` 指向已经合并的 HF 模型，运行时请让该目录处于无写入状态。
+
+~~~bash
+cd /data/yb/Code/OmniCommit
+MODEL=/data/yb/Code/OmniCommit/output/fourth-merged-1s-v2/v0-20261121-063241/sft-checkpoint-2721
+python3 ASR-GSPO/repair_tokenizer.py "$MODEL" --apply
+~~~
+
+工具先在临时目录整理特殊标记，再按 `omnicommit_tokens.json` 验证训练 ID、音频占位符、tokenizer/processor 和权重行覆盖。返回 `repaired` 或 `already_valid` 即可对同一目录运行原启动命令。省略 `--apply` 可只读诊断。此操作只发布通过校验的 tokenizer 文件，权重无须重新合并。
 
 将示例中的 `10.185.1.71` 换成访问者实际使用的内网 IP 或域名，再打开对应的 `https://10.185.1.71:18891`。首次启动需要服务器安装 OpenSSL 1.1.1 或更高版本。将生成的 `/data/yb/Code/OmniCommit/certs/root-ca.crt` 复制到访问网页的 Windows 电脑，在该文件所在目录执行 `certutil -user -addstore Root .\root-ca.crt`，重新打开浏览器。私钥留在服务器。此后使用同一个证书目录即可复用信任。
 

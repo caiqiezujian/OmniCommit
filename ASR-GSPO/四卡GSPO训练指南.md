@@ -73,9 +73,9 @@ micro batch 是每个训练 DP rank 的 micro batch；global batch 按候选轨�
 
 ## 5. 四卡训练
 
-第一项替换为本次 Fourth SFT 合并模型。目录必须包含已经训练过三种动作/换人 token 的 tokenizer 和 omnicommit_tokens.json。
+第一项替换为本次 Fourth SFT 合并模型。新 merge 生成的目录可同时供 `Fourth/start_server.sh` 和本训练入口直接使用，其中包含训练过的三个协议 token、对应 ID 和 `omnicommit_tokens.json`。
 
-若启动报 `Protocol token is not registered special: <|WAIT|>`，在本 GSPO 环境运行下列命令检查并修复已有 token 的注册；模型路径与训练第一项保持一致。第一条只读，第二条在全部 ID/词表及权重行检查通过后才写入 tokenizer 元数据，不改变权重或重新添加词表行。修复成功后重新运行原训练命令。缺 token、ID 错误时会拒绝修复，需回到正确的 Fourth 导出目录。
+仅对旧合并目录，如果启动报 `Protocol token is not registered special: <|WAIT|>` 或在 `special_tokens.keys()` 处报 `'list' object has no attribute 'keys'`，可执行下面两条命令。第一条只读，第二条核对词表、ID 和权重行后修复 tokenizer 元数据。修复成功后，Web 和 GSPO 共用该目录。
 
 ~~~bash
 python3 repair_tokenizer.py /data/yb/Code/OmniCommit/models/fourth-sft-merged
