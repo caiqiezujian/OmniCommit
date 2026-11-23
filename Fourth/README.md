@@ -209,3 +209,22 @@ CUDA_VISIBLE_DEVICES=0 bash start_server.sh \
 新协议在健康检查中显示 `action_protocol=speaker`。网页按换人标记分段显示，同一人后续提交继续接在已有正文后。标记表示发言人变化，无法判断这一位是否曾经发过言。通过 `--window-seconds`、`--discard-seconds` 配置滚动上下文，`--no-recovery` 可关闭有声 WAIT 的局部重听。推荐和训练使用相同步长。
 
 提供给其他程序的 HTTP 接口仍返回 `{"src":"本包新增正文"}`。服务命令、日志和调用方式见 [HTTP API](HTTP_API.md)。
+
+## 5. 多语种测试集批量推理
+
+在 A800 的 vLLM 0.11.1 推理环境中运行。先在 `tools/transcribe_manifests.py` 顶部设置 `ROOT`、`MODEL` 和 `FIELD`。默认测试集是 `/data/yb/Code/OmniCommit/datasets/all_audios`，模型是 `/data/yb/Code/OmniCommit/models/fourth-speaker-full-merged`，结果字段为 `OmniCommit_Fourth`。比较多个 checkpoint 时，为每个模型指定不同的字段名。
+
+每个语种目录包含 `splited_audios/` 和一份清单。例如 `de/splited_manifest.json` 是 JSON 数组，`de/splited_manifest.jsonl` 是每行一条记录。脚本自动选择存在的文件；若两者都有，设置脚本顶部的 `MANIFEST_NAME`。脚本按每条记录 `audio` 字段的文件名，在对应语种的 `splited_audios/` 下读取 WAV。
+
+~~~bash
+cd /data/yb/Code/OmniCommit/Fourth
+python tools/transcribe_manifests.py
+~~~
+
+默认 `GPU_IDS="0"`、`BATCH_SIZE=4`、`CHUNK_MS=1000`。每条 WAV 独立建会话，按 1 秒步长依次推理，多条 WAV 可以并行。将 `GPU_IDS` 改成 `"0,1"` 后，两张卡通过张量并行承载同一个模型，`BATCH_SIZE` 仍是整个引擎的并发上限。模型历史保留换人标记，写入结果字段时剥离 `<|DIRECT|>`、`<|WAIT|>` 和 `<|SPK_CHANGE|>`。评测保留模型实际生成的重复和达到 token 上限时的正文，关闭有声 WAIT 的补识别。
+
+每个语种每新增 20 条成功结果、以及处理完该语种时，脚本原子写回清单。进程被强制终止后，从上次成功落盘的位置续跑即可。已有字符串结果（包括空字符串）会跳过，失败的 WAV 可以在修复后重新运行。指定补跑名单时，TSV 每行依次填写语种、从 0 开始的原记录索引和 WAV 文件名，用制表符分隔：
+
+~~~bash
+python tools/transcribe_manifests.py --retry-list /data/yb/Code/OmniCommit/datasets/retry.tsv
+~~~
