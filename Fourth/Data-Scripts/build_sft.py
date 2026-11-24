@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
+import unicodedata
 from collections import Counter
 from contextlib import ExitStack
+from copy import deepcopy
 from pathlib import Path
 
 import soundfile as sf
@@ -16,7 +19,159 @@ from fourth_asr.annotation_tail import project_open_tail
 from fourth_asr.protocol import SPK_CHANGE, WAIT, get_protocol
 from fourth_asr.recast import build_sft_row, end_frame, validate_chunk_ms
 from fourth_asr.semantic_preparation import prepare_units
-from fourth_asr.timestamped_source import reference_spans
+from fourth_asr.timestamped_source import HEADER_TIME, TAG, reference_spans
+
+
+# Keep tabs and ordinary spaces outside line-break positions exactly as annotated.
+LINE_BREAK = re.compile(r"[\r\n\v\f\x85\u2028\u2029]")
+LAYOUT = r" \t\r\n\v\f\x85\u2028\u2029"
+BLANKS = re.compile(rf"[{LAYOUT}]+")
+MARKED_PART = re.compile(rf"(?P<tag><[^<>]+>)|(?P<gap>[{LAYOUT}]+)|(?P<body>[^<{LAYOUT}]+|<)")
+TEXT_KEYS = ("source_text", "text", "text_plain")
+
+
+def _nonlayout_text(marked):
+    return BLANKS.sub("", TAG.sub("", marked))
+
+
+def _timed_text_fields(segments, timestamps):
+    """Locate duplicate text fields by non-layout character offset in the transcript."""
+    if len(timestamps) != len(segments) or any(not isinstance(t, dict) for t in timestamps):
+        raise ValueError("Expected one timestamp per source segment")
+    if any("index" in t for t in timestamps):
+        if any(type(t.get("index")) is not int for t in timestamps):
+            raise ValueError("Invalid timestamp index")
+        timestamps = sorted(timestamps, key=lambda t: t["index"])
+    offset = 0
+    for segment, stamp in zip(segments, timestamps):
+        if not isinstance(segment, dict) or not isinstance(segment.get("source_text"), str):
+            raise ValueError("Expected source_text in each output segment")
+        yield segment, "source_text", offset
+        for key in TEXT_KEYS:
+            if isinstance(stamp.get(key), str):
+                yield stamp, key, offset
+        child_offset = offset
+        children = stamp.get("spans")
+        if isinstance(children, list):
+            for child in children:
+                if not isinstance(child, dict):
+                    raise ValueError("Invalid timed span")
+                for key in TEXT_KEYS:
+                    if isinstance(child.get(key), str):
+                        yield child, key, child_offset
+                body = child.get("text_plain", child.get("text"))
+                if not isinstance(body, str):
+                    raise ValueError("Timed span requires text or text_plain")
+                child_offset += len(_nonlayout_text(body))
+        offset += len(_nonlayout_text(segment["source_text"]))
+
+
+def _break_offsets(text, offset):
+    plain = TAG.sub("", text)
+    cursor = 0
+    for gap in BLANKS.finditer(plain):
+        offset += gap.start() - cursor
+        if LINE_BREAK.search(gap[0]):
+            yield offset
+        cursor = gap.end()
+
+
+def _english_space(letters, pos):
+    if not 0 < pos < len(letters):
+        return False
+    left, right = letters[pos-1:pos+1]
+    def word_character(ch):
+        return ch.isdecimal() or (ch.isalpha() and "LATIN" in unicodedata.name(ch, ""))
+
+    if not word_character(right):
+        return False
+    # Find the base letter of a decomposed accent at the end of an English word.
+    base = pos - 1
+    while base and unicodedata.category(letters[base]).startswith("M"):
+        base -= 1
+    if left in ".," and right.isdigit() and pos >= 2 and letters[pos-2].isdigit():
+        return False  # A decimal or grouped number can span a printed line.
+    return word_character(letters[base]) or left in ".,;:!?)]\"”"
+
+
+def _render_linebreaks(text, offset, breaks, spaces):
+    """Place a needed blank in the same attributed span as the word on its right."""
+    result = []
+    for part in MARKED_PART.finditer(text):
+        value = part[0]
+        if part.lastgroup == "body":
+            for char in value:
+                if offset in spaces:
+                    result.append(" ")
+                result.append(char)
+                offset += 1
+        elif part.lastgroup == "tag" or offset not in breaks:
+            result.append(value)
+    return "".join(result)
+
+
+def normalize_source_record(record):
+    """Return a training view. The original record, interval times and tags stay intact."""
+    messages = record.get("messages")
+    if not isinstance(messages, list):
+        raise ValueError("missing messages array")
+    answers = [(i, msg) for i, msg in enumerate(messages)
+               if isinstance(msg, dict) and msg.get("role") == "assistant"]
+    if len(answers) != 1 or not isinstance(answers[0][1].get("content"), str):
+        raise ValueError("exactly one assistant transcript is required")
+    index, source_answer = answers[0]
+    marked = HEADER_TIME.sub("", source_answer["content"])
+    raw = record.get("output")
+    annotation = json.loads(raw) if isinstance(raw, str) else raw
+    if not isinstance(annotation, dict) or not isinstance(annotation.get("segments"), list):
+        raise ValueError("Expected output.segments for direct 1s recast")
+    if not isinstance(record.get("timestamps"), list):
+        raise ValueError("Expected timestamps for direct 1s recast")
+    # JSON string annotations are already detached. Copy object annotations and
+    # timestamp metadata before editing text shared with the caller.
+    annotation = annotation if isinstance(raw, str) else deepcopy(annotation)
+    timestamps = deepcopy(record["timestamps"])
+    segments = annotation["segments"]
+    answer = {**source_answer, "content": marked}
+    fields = [(answer, "content", 0), *_timed_text_fields(segments, timestamps)]
+    if answer.get("content_original") is not None:
+        if not isinstance(answer["content_original"], str):
+            raise ValueError("content_original must be a string")
+        fields.append((answer, "content_original", 0))
+    breaks = set()
+    for item, key, offset in fields:
+        if LINE_BREAK.search(item[key]):
+            breaks.update(_break_offsets(item[key], offset))
+    if not breaks:
+        return record
+
+    letters = _nonlayout_text(marked)
+    spaces = {pos for pos in breaks if _english_space(letters, pos)}
+    # An uninterrupted spelling inside a reference or source segment is evidence
+    # for a split word (or unit, e.g. 2dB). An adjacent segment supplies no such
+    # evidence. Keep that spelling when another copy wraps it mid-word.
+    spellings = [[marked], (s["source_text"] for s in segments)]
+    if answer.get("content_original") is not None:
+        spellings.append([answer["content_original"]])
+    for texts in spellings:
+        offset = 0
+        for text in texts:
+            if not spaces:
+                break
+            for part in MARKED_PART.finditer(text):
+                if part.lastgroup == "body":
+                    end = offset + len(part[0])
+                    for pos in range(offset + 1, end):
+                        spaces.discard(pos)
+                    offset = end
+
+    for item, key, offset in fields:
+        item[key] = _render_linebreaks(item[key], offset, breaks, spaces)
+    if answer.get("content_original") is not None and answer["content_original"] != answer["content"]:
+        raise ValueError("content_original disagrees with the marked transcript")
+    messages = list(messages)
+    messages[index] = answer
+    return {**record, "messages": messages, "output": annotation, "timestamps": timestamps}
 
 
 def json_line(value):
@@ -54,6 +209,8 @@ def prepare_record(record, audio_root, steps, number_format, release_on, *, prot
     if not (isinstance(audios, list) and len(audios) == 1 and
             isinstance(audios[0], str) and audios[0].strip()):
         raise ValueError("Expected one original audio path in audios")
+    if release_on == "source-segment":
+        record = normalize_source_record(record)
     path = (audio_root / audios[0]).resolve(strict=True)
     try:
         info = sf.info(str(path))
@@ -122,7 +279,7 @@ def prepare_record(record, audio_root, steps, number_format, release_on, *, prot
 
 
 def main(argv=None, *, source_segments_only=False):
-    description = "Recast original timestamped segments directly into 1-second Fourth SFT turns."
+    description = "Clean transcript line breaks and recast original timestamped segments into 1-second Fourth SFT turns."
     parser = argparse.ArgumentParser(description=description if source_segments_only else __doc__)
     parser.add_argument("input", type=Path, help="Source JSONL with per-unit timestamps in ms")
     parser.add_argument("--output-dir", type=Path, required=True)
