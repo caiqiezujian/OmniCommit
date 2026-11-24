@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -180,6 +181,7 @@ def create_app(backend_factory, options, *, max_sessions=1, auto_reference_facto
             source_kind = init.get("source_kind", "microphone")
             if source_kind not in ("microphone", "system", "file"):
                 raise ValueError("Unknown audio source")
+            include_turn_audio = source_kind == "file" and init.get("include_turn_audio") is True
             range_keys = ("file_start_seconds", "file_end_seconds")
             if source_kind != "file" and any(key in init for key in range_keys):
                 raise ValueError("A file range requires an uploaded file session")
@@ -224,6 +226,7 @@ def create_app(backend_factory, options, *, max_sessions=1, auto_reference_facto
                 receive_task = None
                 if packet.get("type") == "websocket.disconnect":
                     break
+                raw = None  # Set only when file_next actually releases new samples.
                 binary = packet.get("bytes")
                 if binary is not None:
                     if cursor is not None:
@@ -299,6 +302,9 @@ def create_app(backend_factory, options, *, max_sessions=1, auto_reference_facto
                 result["service_seconds"] = time.perf_counter() - submitted
                 if cursor is not None:
                     result["file_complete"] = cursor.finished
+                    if include_turn_audio and raw is not None:
+                        # MediaCursor's exact 16 kHz PCM16, before the model pads a short final turn.
+                        result["audio_pcm16_b64"] = base64.b64encode(raw).decode("ascii")
                 await websocket.send_json(dict(result, type="result"))
                 if result["event"] == "end_of_audio":
                     break

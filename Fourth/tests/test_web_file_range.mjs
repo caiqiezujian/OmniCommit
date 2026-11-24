@@ -6,6 +6,7 @@ import vm from 'node:vm';
 const web = new URL('../web/meeting-v2/', import.meta.url);
 const html = readFileSync(new URL('index.html', web), 'utf8');
 const script = readFileSync(new URL('app.js', web), 'utf8');
+const audioScript = readFileSync(new URL('turn-audio.js', web), 'utf8');
 
 async function transcribe({start = '', end = '', follow = false, duration = 4,
                            source = 'file', mediaDevices, secure = true} = {}) {
@@ -38,9 +39,9 @@ async function transcribe({start = '', end = '', follow = false, duration = 4,
       queueMicrotask(() => player.dispatchEvent(new Event('seeked')));
     },
   });
-  const sent = [];
+  const sent = [], journal = [];
   let uploads = 0;
-  let heard, limit;
+  let heard, limit, from, turn = 0;
   class Socket {
     constructor() { queueMicrotask(() => this.onopen()); }
     send(packet) {
@@ -48,14 +49,18 @@ async function transcribe({start = '', end = '', follow = false, duration = 4,
       sent.push(msg);
       let row;
       if (msg.type === 'start') {
-        heard = msg.file_start_seconds ?? 0;
+        heard = from = msg.file_start_seconds ?? 0;
         limit = msg.file_end_seconds ?? duration;
         row = heard < 0 || limit > duration || heard >= limit
           ? {type: 'error', error: 'Invalid file bounds'}
           : {type: 'ready', protocol: 'fourth', chunk_seconds: 1, file_start_seconds: heard, file_end_seconds: limit};
       } else if (msg.type === 'file_next' && sent.length < 10) {
+        const old = heard;
         heard = Math.min(heard + 1, msg.release_seconds, limit);
-        row = {type: 'result', action: 'WAIT', end_seconds: heard, source_end_seconds: heard,
+        const pcm = Buffer.alloc(Math.round((heard - old) * 16000) * 2, ++turn);
+        row = {type: 'result', turn, event: 'audio', action: 'WAIT',
+          start_seconds: old - from, end_seconds: heard - from, source_end_seconds: heard,
+          audio_pcm16_b64: pcm.toString('base64'),
           generation_seconds: 0, file_complete: heard === limit};
       } else if (msg.type === 'end') {
         row = {type: 'file_end_empty'};
@@ -70,19 +75,30 @@ async function transcribe({start = '', end = '', follow = false, duration = 4,
     document: {getElementById: field, querySelectorAll: () => [], querySelector: () => ({value: source})},
     window: {isSecureContext: secure}, navigator: {mediaDevices},
     location: {protocol: 'http:', host: 'localhost'},
-    MeetingTurnLog: class { start() {} append() {} },
-    WebSocket: Socket, setTimeout, clearTimeout,
+    MeetingTurnLog: class { start() { this.currentId = 'test-session'; } append(row) { journal.push(row); } },
+    WebSocket: Socket, setTimeout, clearTimeout, Blob, atob,
     fetch: async path => {
       if (path === '/health') return {ok: true, json: async () => ({ready: true, protocol: 'fourth', chunk_seconds: 1, file_input: true})};
       uploads++;
       return {ok: true, json: async () => ({media_id: 'upload', duration_seconds: duration, sample_rate: 16000, samples: duration * 16000})};
     },
   });
+  vm.runInContext(audioScript, context);
   vm.runInContext(script, context);
   await new Promise(setImmediate);
   await field('start').onclick();
-  return {sent, playbackStarts, uploads, status: field('status').textContent};
+  return {sent, playbackStarts, uploads, journal, status: field('status').textContent,
+    audio: vm.runInContext('turnAudio', context)};
 }
+
+test('file review pairs the response PCM with its own turn and excludes PCM from the event journal', async () => {
+  const {sent, journal, audio} = await transcribe({start: '1', end: '2.125'});
+  assert.equal(sent[0].include_turn_audio, true);
+  assert.ok(journal.every(row => !('audio_pcm16_b64' in row)));
+  const wav = await audio.wav('test-session', 2, {previous: true});
+  const bytes = Buffer.from(await wav.arrayBuffer()).subarray(44);
+  assert.deepEqual(bytes, Buffer.concat([Buffer.alloc(32000, 1), Buffer.alloc(4000, 2)]));
+});
 
 test('file range and whole-file default use the source clock in continuous mode', async () => {
   for (const [fields, releases, bounds] of [

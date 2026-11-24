@@ -1,4 +1,5 @@
 """Fourth model/tokenizer, streaming state, and browser transport contracts."""
+import base64
 from io import BytesIO
 from pathlib import Path
 import shutil
@@ -45,7 +46,7 @@ def test_web_incremental_text_and_eos(kind):
         assert client.get("/health").json()["chunk_seconds"] == .8
         assert 'value="system"' in client.get("/").text
         with client.websocket_connect("/stream") as ws:
-            start(ws, kind)
+            start(ws, kind, include_turn_audio=True)
             for op in ("reference", "correct_segment", "merge_speakers", "rename_speaker"):
                 ws.send_json({"type": "control", "op": op})
                 assert ws.receive_json()["type"] == "control_error"
@@ -55,6 +56,7 @@ def test_web_incremental_text_and_eos(kind):
                 assert result["type"] == "result" and result["text"] == expected
                 assert result["action"] == ("WAIT" if expected == WAIT else "DIRECT")
                 assert result["reference_speakers"] == result["new_segments"] == []
+                assert "audio_pcm16_b64" not in result  # Live clients already hold the transmitted bytes.
             assert backend.lengths[-1] == 8000
             ws.send_json({"type": "end"})
             assert ws.receive_json()["text"] == WAIT
@@ -69,6 +71,39 @@ def test_file_chunks_release_only_after_the_full_source_frame():
     cursor = MediaCursor(upload)
     assert cursor.next_chunk(4454 / 44100, .101) is None
     assert cursor._chunk_end_offset(.101) == 4455
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="requires FFmpeg")
+@pytest.mark.parametrize("include_audio", [False, True])
+def test_file_turn_audio_matches_released_input_and_excludes_tail_padding(include_audio):
+    # Start inside the source file; both blocks have distinct, non-constant sample values.
+    samples = np.arange(16000, dtype="<i2") - 8000
+    wav = BytesIO()
+    with wave.open(wav, "wb") as audio:
+        audio.setparams((1, 2, 16000, 0, "NONE", ""))
+        audio.writeframes(samples.tobytes())
+    backend = Recorder([WAIT, "Back.", WAIT])
+    with client_for(backend) as client:
+        upload = client.post("/api/media", content=wav.getvalue()).json()
+        with client.websocket_connect("/stream") as ws:
+            opts = {"include_turn_audio": True} if include_audio else {}
+            start(ws, "file", media_id=upload["media_id"], file_start_seconds=.125, file_end_seconds=.975, **opts)
+            ws.send_json({"type": "file_next", "release_seconds": .2})
+            assert ws.receive_json() == {"type": "file_wait"}
+            for turn, (begin, end, action) in enumerate([(2000, 14800, "WAIT"), (14800, 15600, "DIRECT")], 1):
+                ws.send_json({"type": "file_next", "release_seconds": end / 16000})
+                row = ws.receive_json()
+                assert (row["turn"], row["action"]) == (turn, action)
+                assert (row["source_start_seconds"], row["source_end_seconds"]) == (begin / 16000, end / 16000)
+                assert row["start_seconds"] == pytest.approx((begin - 2000) / 16000)
+                if include_audio:
+                    assert base64.b64decode(row["audio_pcm16_b64"], validate=True) == samples[begin:end].tobytes()
+                else:
+                    assert "audio_pcm16_b64" not in row
+            assert backend.lengths[-1] == 8000  # 50 ms actual speech is padded to 500 ms at model input.
+            ws.send_json({"type": "end"})
+            eos = ws.receive_json()
+            assert eos["event"] == "end_of_audio" and "audio_pcm16_b64" not in eos
 
 
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="requires FFmpeg")

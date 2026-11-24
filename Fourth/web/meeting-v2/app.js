@@ -6,7 +6,75 @@ let health, running, mediaURL;
 let transcript = [];
 let currentParagraph = null;
 let gapCount = 0;
-const turnLog = new MeetingTurnLog($, download);
+const turnAudio = new MeetingTurnAudio();
+const reviewPlayer = $("turnReviewPlayer");
+const reviewStatus = $("turnReviewStatus");
+let reviewURL, reviewRequest = 0, mutedForReview = false;
+
+function reviewMessage(text) {
+  reviewStatus.textContent = text;
+  reviewStatus.hidden = !text;
+}
+
+function restoreFileSound() {
+  if (mutedForReview) player.muted = false;
+  mutedForReview = false;
+}
+
+function stopReview() {
+  reviewRequest++;
+  if (reviewURL) {
+    reviewPlayer.pause();
+    reviewPlayer.removeAttribute("src");
+    reviewPlayer.load();
+    URL.revokeObjectURL(reviewURL);
+    reviewURL = null;
+  }
+  reviewPlayer.hidden = true;
+  restoreFileSound();
+  reviewMessage("");
+}
+
+reviewPlayer.addEventListener("play", () => {
+  if (running?.kind === "file" && !player.paused && !player.muted) {
+    player.muted = true;
+    mutedForReview = true;
+  }
+});
+reviewPlayer.addEventListener("pause", restoreFileSound);
+reviewPlayer.addEventListener("ended", restoreFileSound);
+
+const review = {
+  available: (id, turn) => turnAudio.has(id, turn),
+  availablePair: (id, turn) => turnAudio.hasPair(id, turn),
+  stop: stopReview,
+  async play(id, turn, previous) {
+    stopReview();
+    const request = reviewRequest;
+    try {
+      const wav = await turnAudio.wav(id, turn, {previous});
+      if (request !== reviewRequest) return;
+      reviewURL = URL.createObjectURL(wav);
+      reviewPlayer.src = reviewURL;
+      reviewPlayer.hidden = false;
+      const capture = running && running.kind !== "file" ? "（采音中，扬声器或共享的电脑声音可能被再次录入）" : "";
+      reviewMessage((previous ? `第 ${turn - 1}、${turn} 轮` : `第 ${turn} 轮`) + capture);
+      await reviewPlayer.play();
+    } catch (error) {
+      if (request === reviewRequest) {
+        restoreFileSound();
+        reviewMessage(reviewURL ? "请点击回听播放器的播放按钮。" : error.message);
+      }
+    }
+  },
+  async download(id, turn) {
+    try {
+      const wav = await turnAudio.wav(id, turn);
+      download(`fourth-${id}-turn-${turn}.wav`, "audio/wav", wav);
+    } catch (error) { reviewMessage(error.message); }
+  }
+};
+const turnLog = new MeetingTurnLog($, download, review);
 
 function status(message, error = false) {
   $("status").textContent = message;
@@ -106,7 +174,7 @@ class Channel {
       this.pending = null;
       try {
         const row = JSON.parse(event.data);
-        onEvent(row);
+        onEvent(row, pending.audio);
         if (row.type === "error") throw Error(row.error);
         pending.resolve(row);
       } catch (error) { pending.reject(error); }
@@ -116,9 +184,29 @@ class Channel {
   request(packet) {
     if (this.error) return Promise.reject(this.error);
     return new Promise((resolve, reject) => {
-      this.pending = {resolve, reject};
+      this.pending = {resolve, reject, audio: packet instanceof ArrayBuffer ? packet : null};
       this.socket.send(packet instanceof ArrayBuffer ? packet : JSON.stringify(packet));
     });
+  }
+}
+
+function keepTurnAudio(id, row, liveAudio) {
+  // Keep waveforms out of JSONL, raw-turn details and the persistent text journal.
+  const fileAudio = row.audio_pcm16_b64;
+  delete row.audio_pcm16_b64;
+  if (row.type !== "result" || row.event !== "audio") return;
+  try {
+    if (liveAudio) {
+      turnAudio.put(id, row, liveAudio);
+    } else if (typeof fileAudio === "string") {
+      const bytes = atob(fileAudio);
+      const pcm = new Uint8Array(bytes.length);
+      for (let i = 0; i < bytes.length; i++) pcm[i] = bytes.charCodeAt(i);
+      turnAudio.put(id, row, pcm);
+    }
+  } catch (error) {
+    // An unavailable review clip must not interrupt live transcription.
+    console.warn("Could not retain audio for turn", row.turn, error);
   }
 }
 
@@ -349,17 +437,21 @@ $("start").onclick = async () => {
       if (!response.ok) throw Error(upload.error || "文件上传失败");
     } else await openCapture(state);
     let logStarted = false;
-    const channel = state.channel = new Channel(error => state.queue.fail(error), row => {
+    const channel = state.channel = new Channel(error => state.queue.fail(error), (row, liveAudio) => {
       if (row.type === "ready" && row.protocol === "fourth") {
         turnLog.start(state.kind, state.kind === "file" ? $("file").files[0].name : "");
+        turnAudio.start(turnLog.currentId);
         logStarted = true;
       }
-      if (logStarted) turnLog.append(row);
+      if (logStarted) {
+        keepTurnAudio(turnLog.currentId, row, liveAudio);
+        turnLog.append(row);
+      }
     });
     await channel.open;
     const ready = await channel.request({
       type: "start", sample_rate: 16000, source_kind: state.kind, media_id: upload?.media_id,
-      ...windowOptions, ...range
+      ...(upload ? {include_turn_audio: true} : {}), ...windowOptions, ...range
     });
     if (ready.type !== "ready" || ready.protocol !== "fourth") throw Error("服务未加载 Fourth 协议");
     if (upload) {

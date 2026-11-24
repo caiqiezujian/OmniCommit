@@ -5,10 +5,11 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="omnicommit-ui" content="fourth-meeting-v2">
   <title>OmniCommit Fourth · 实时会议转录</title>
-  <link rel="stylesheet" href="/web/meeting-v2/style.css?v=speaker1">
+  <link rel="stylesheet" href="/web/meeting-v2/style.css?v=turnaudio1">
   <script defer src="/web/meeting-v2/log-archive.js?v=speaker1"></script>
-  <script defer src="/web/meeting-v2/turn-log.js?v=silero1"></script>
-  <script type="module" src="/web/meeting-v2/app.js?v=silero1"></script>
+  <script defer src="/web/meeting-v2/turn-log.js?v=turnaudio1"></script>
+  <script defer src="/web/meeting-v2/turn-audio.js?v=turnaudio1"></script>
+  <script type="module" src="/web/meeting-v2/app.js?v=turnaudio1"></script>
 </head>
 <body>
   <header><strong>OmniCommit Fourth</strong><span>多语种流式转录</span></header>
@@ -89,6 +90,9 @@
           </div>
           <p id="logProgress" class="hint"></p>
           <p id="logError" class="error" hidden></p>
+          <p class="hint">试听本轮新增的音频。本轮提交的文字也可能包含前几轮听到的内容。</p>
+          <p id="turnReviewStatus" class="hint" role="status" hidden></p>
+          <audio id="turnReviewPlayer" controls preload="none" aria-label="逐轮音频回听" hidden></audio>
           <div id="events" tabindex="0" aria-label="逐轮日志内容"></div>
           <p class="hint">日志保存在当前浏览器。点开一条记录可查看完整字段。</p>
           <p class="error" id="logWarning" role="status" hidden></p>

@@ -43,10 +43,11 @@ function gapMessage(row) {
 function logHeading(row) {
   if (row.type !== 'result') return row.type;
   const fields = ['第 ' + row.turn + ' 轮'];
+  const audioLabel = row.event === 'audio' ? '本轮新增音频 · ' : '';
   if (Number.isFinite(row.source_start_seconds) && Number.isFinite(row.source_end_seconds)) {
-    fields.push('原文件 ' + row.source_start_seconds.toFixed(3) + '–' + row.source_end_seconds.toFixed(3) + ' s');
+    fields.push(audioLabel + '原文件 ' + row.source_start_seconds.toFixed(3) + '–' + row.source_end_seconds.toFixed(3) + ' s');
   } else if (Number.isFinite(row.start_seconds) && Number.isFinite(row.end_seconds)) {
-    fields.push(row.start_seconds.toFixed(2) + '–' + row.end_seconds.toFixed(2) + ' s');
+    fields.push(audioLabel + '会话 ' + row.start_seconds.toFixed(3) + '–' + row.end_seconds.toFixed(3) + ' s');
   }
   if (row.event === 'end_of_audio') fields.push('音频结束');
   const vad = row.silence_gate?.decision;
@@ -62,33 +63,78 @@ function logHeading(row) {
   return fields.join(' · ');
 }
 
-function logEntry(row) {
-  const entry = document.createElement('details');
+function turnAudioControls(review, sessionId, turn) {
+  const group = document.createElement('div');
+  group.className = 'turn-audio-controls';
+  if (!review?.available(sessionId, turn)) {
+    group.textContent = '此轮音频未保留';
+    return group;
+  }
+  function addButton(label, action, disabled = false) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = label;
+    button.setAttribute('aria-label', '第 ' + turn + ' 轮：' + label);
+    button.disabled = disabled;
+    button.onclick = action;
+    group.append(button);
+  }
+  addButton('▶ 本轮', () => review.play(sessionId, turn, false));
+  addButton('▶ 前一轮 + 本轮', () => review.play(sessionId, turn, true), !review.availablePair(sessionId, turn));
+  addButton('下载本轮 WAV', () => review.download(sessionId, turn));
+  return group;
+}
+
+function logEntry(row, review, sessionId) {
+  const entry = document.createElement('div');
   entry.className = 'log-entry';
   entry.dataset.action = row.action || '';
+  const details = document.createElement('details');
   const summary = document.createElement('summary');
   const heading = document.createElement('span');
   heading.className = 'log-meta';
   heading.textContent = logHeading(row);
-  const output = document.createElement('code');
+  const output = document.createElement('span');
   output.className = 'log-output';
-  output.textContent = row.text ?? row.error ?? row.op ?? row.action ?? '';
+  if (row.type === 'result' && row.event === 'audio') {
+    output.classList.add('log-commit');
+    const label = document.createElement('span');
+    label.className = 'log-output-label';
+    label.textContent = '本轮提交文字 · ' + (row.action || '缺口');
+    output.append(label);
+    if (row.action === 'DIRECT') {
+      for (const part of row.transcript_parts || [{text: row.display_text ?? row.text}]) {
+        if (part.speaker_change) {
+          const change = document.createElement('span');
+          change.className = 'log-speaker-change';
+          change.textContent = '换人';
+          output.append(change);
+        }
+        output.append(document.createTextNode(part.text));
+      }
+    }
+  } else {
+    output.textContent = row.text ?? row.error ?? row.op ?? row.action ?? '';
+  }
   summary.append(heading, output);
-  entry.append(summary);
-  entry.ontoggle = () => {
-    if (entry.open && entry.childElementCount === 1) {
+  details.append(summary);
+  details.ontoggle = () => {
+    if (details.open && details.childElementCount === 1) {
       const raw = document.createElement('pre');
       raw.textContent = JSON.stringify(row, null, 2);
-      entry.append(raw);
+      details.append(raw);
     }
   };
+  entry.append(details);
+  if (row.type === 'result' && row.event === 'audio') entry.append(turnAudioControls(review, sessionId, row.turn));
   return entry;
 }
 
 class MeetingTurnLog {
-  constructor(get, download) {
+  constructor(get, download, review = null) {
     this.get = get;
     this.download = download;
+    this.review = review;
     this.protocol = 'fourth';
     this.current = logHistory(this.protocol);
     this.view = this.current;
@@ -120,7 +166,7 @@ class MeetingTurnLog {
     };
     const box = get('events');
     box.onclick = event => {
-      if (event.target.closest('summary')) follow.checked = false;
+      if (event.target.closest('summary, button')) follow.checked = false;
     };
     box.onscroll = () => {
       if (follow.checked && box.scrollTop + box.clientHeight < box.scrollHeight - 4) follow.checked = false;
@@ -178,6 +224,7 @@ class MeetingTurnLog {
   }
 
   async select(id) {
+    this.review?.stop();
     this.selectedId = id;
     this.offset = 0;
     this.get('logFollow').checked = false;
@@ -219,7 +266,7 @@ class MeetingTurnLog {
     }
     this.offset = next;
     if (this.rendered < Math.min(LOG_PAGE_SIZE, entries.length - next)) {
-      box.append(logEntry(original));
+      box.append(logEntry(original, this.review, this.selectedId));
       this.rendered++;
       if (follow) box.scrollTop = box.scrollHeight;
     }
@@ -279,7 +326,7 @@ class MeetingTurnLog {
     const box = this.get('events');
     const entries = this.visible().slice(this.offset, this.offset + LOG_PAGE_SIZE);
     if (this.get('logPanel').open) {
-      box.replaceChildren(...entries.map(logEntry));
+      box.replaceChildren(...entries.map(row => logEntry(row, this.review, this.selectedId)));
       box.scrollTop = bottom ? box.scrollHeight : 0;
       this.rendered = entries.length;
     } else {

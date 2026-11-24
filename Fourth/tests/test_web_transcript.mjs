@@ -4,6 +4,7 @@ import {readFileSync} from 'node:fs';
 import vm from 'node:vm';
 
 const app = readFileSync(new URL('../web/meeting-v2/app.js', import.meta.url), 'utf8');
+const turnAudio = readFileSync(new URL('../web/meeting-v2/turn-audio.js', import.meta.url), 'utf8');
 const log = readFileSync(new URL('../web/meeting-v2/turn-log.js', import.meta.url), 'utf8');
 const fields = new Map();
 function element() {
@@ -27,6 +28,7 @@ const ctx = vm.createContext({
   save: text => { downloaded = text; }
 });
 vm.runInContext(`(() => {${log}; Object.assign(globalThis, {gapMessage, indexLogRow, logHeading, logHistory});})();`, ctx);
+vm.runInContext(turnAudio, ctx);
 vm.runInContext(app, ctx);
 vm.runInContext('download = (name, type, text) => save(text)', ctx);
 const words = field('words');
