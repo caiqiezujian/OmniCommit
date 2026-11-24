@@ -180,3 +180,50 @@ def test_speaker_recovery_preserves_only_markers_after_overlap_and_keeps_raw_his
     assert result["transcript_parts"] == [{"text": "好的。", "speaker_change": True}]
     session.step(end_of_audio=True)
     assert backend.history[-2] == DIRECT + change
+
+
+def test_short_client_silence_filters_recovered_text_in_next_prompt():
+    first = "Hello there."
+    recovered = DIRECT + first + SPK_CHANGE + "我知道。"
+    corrected = DIRECT + SPK_CHANGE + "我知道"
+    session, backend = make_session(
+        [DIRECT + first, WAIT, DIRECT + "下一句。"], [recovered],
+        protocol="speaker", recovery_voiced_seconds=.8,
+    )
+    session.step(block(.1))
+    result = session.step(block(.3), trailing_silence_ms=120)
+
+    assert result["recovery"]["status"] == "accepted"
+    assert result["recovery"]["raw_text"] == recovered
+    assert result["primary_text"] == WAIT
+    assert result["text"] == session.history[-1].reply == corrected
+    assert result["display_text"] == "我知道"
+    assert result["transcript_parts"] == [{"text": "我知道", "speaker_change": True}]
+    assert session.committed_tail == first + " 我知道"
+
+    following = session.step(block(.1))
+    assert following["display_text"] == "下一句。"
+    assert backend.history[1:] == ["<audio>", DIRECT + first, "<audio>", corrected, "<audio>"]
+    assert len(backend.calls) == 1
+
+
+def test_period_only_turn_keeps_previous_rolling_commit_watermark():
+    first = DIRECT + "我知道"
+    session, backend = make_session(
+        [first, DIRECT + "。", WAIT], [], protocol="speaker", enable_recovery=False,
+        context_policy="rolling", rolling_tail_seconds=.2,
+    )
+    session.step(block(.1))
+    previous_watermark = session.inferred_commit_seconds
+    previous_end = session.last_text_end
+    assert previous_watermark == pytest.approx(.6)
+
+    result = session.step(block(.2), trailing_silence_ms=120)
+    assert result["action"] == "WAIT" and result["display_text"] == ""
+    assert result["text"] == session.history[-1].reply == WAIT
+    assert result["transcript_parts"] == []
+    assert session.committed_tail == "我知道" and session.last_text_end == previous_end
+    assert result["inferred_commit_seconds"] == session.inferred_commit_seconds == previous_watermark
+
+    session.step(end_of_audio=True)
+    assert backend.history[1:] == ["<audio>", first, "<audio>", WAIT, "<end_of_audio>"]

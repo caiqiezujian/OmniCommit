@@ -10,6 +10,7 @@ import io
 import json
 import logging
 import math
+import sys
 import time
 import traceback
 from typing import Optional
@@ -60,7 +61,11 @@ def decode_json_audio(body, sample_limit):
     samples = np.frombuffer(raw, dtype="<f4")
     if not np.isfinite(samples).all() or np.max(np.abs(samples)) > 1.001:
         raise HTTPException(400, "Decoded float32 samples must be finite and normalized to [-1, 1]")
-    return samples
+    silence_ms = packet.get("trailing_silence_ms")
+    if "trailing_silence_ms" in packet and (
+            type(silence_ms) not in (int, float) or not 0 <= silence_ms <= sys.float_info.max):
+        raise HTTPException(400, "trailing_silence_ms must be a finite nonnegative number in milliseconds")
+    return samples, silence_ms
 
 
 async def read_packet_body(request, sample_limit):
@@ -109,7 +114,7 @@ def decode_packet(media, body, sample_limit):
         raise HTTPException(400, "Send at least one whole PCM16 sample")
     samples = np.frombuffer(body, dtype="<i2").astype(np.float32)
     samples /= 32768.0
-    return samples
+    return samples, None
 
 
 @dataclass
@@ -161,21 +166,25 @@ class Meeting:
     last_request_id: Optional[str] = None
     session_id: Optional[str] = None
     received_samples: int = 0
+    tail_silence_ms: Optional[float] = None
 
-    def step(self, trace, audio=None, *, final_chunk=False, end_of_audio=False):
+    def step(self, trace, audio=None, *, final_chunk=False, end_of_audio=False, trailing_silence_ms=None):
         session = self.session
         if trace.archive is None:
-            return session.step(audio, final_chunk=final_chunk, end_of_audio=end_of_audio)
+            return session.step(audio, final_chunk=final_chunk, end_of_audio=end_of_audio,
+                                trailing_silence_ms=trailing_silence_ms)
         turn = session.turn_count + 1
         start = round(session.heard_seconds * SAMPLE_RATE)
         trace.debug("turn_started", turn=turn, start_sample=start, end_sample=start + (0 if audio is None else len(audio)),
-                    sample_rate=SAMPLE_RATE, final_chunk=final_chunk, end_of_audio=end_of_audio)
+                    sample_rate=SAMPLE_RATE, final_chunk=final_chunk, end_of_audio=end_of_audio,
+                    trailing_silence_ms=trailing_silence_ms)
 
         # Only this meeting's worker owns this session. The underlying batched engine is shared.
         backend = session.backend
         session.backend = DebugBackend(backend, lambda event, **fields: trace.debug(event, turn=turn, **fields))
         try:
-            result = session.step(audio, final_chunk=final_chunk, end_of_audio=end_of_audio)
+            result = session.step(audio, final_chunk=final_chunk, end_of_audio=end_of_audio,
+                                  trailing_silence_ms=trailing_silence_ms)
         except Exception as exc:
             trace.debug("turn_error", turn=turn, error_type=type(exc).__name__, error=str(exc))
             raise
@@ -184,27 +193,33 @@ class Meeting:
         trace.debug("turn_finished", turn=turn, turn_result=result)
         return result
 
-    def process(self, audio, ending, trace):
+    def process(self, audio, ending, trace, trailing_silence_ms=None):
         """Worker thread only. Never submit short intermediate packets as final model turns."""
         if trace.archive is not None and not ending:
             start = self.received_samples
             self.received_samples += len(audio)
             trace.debug("packet_audio", start_sample=start, end_sample=self.received_samples,
-                        sample_rate=SAMPLE_RATE,
+                        sample_rate=SAMPLE_RATE, trailing_silence_ms=trailing_silence_ms,
                         buffered_before_samples=0 if self.tail is None else len(self.tail))
         if self.tail is not None:
+            if ending:
+                trailing_silence_ms = self.tail_silence_ms
             audio = np.concatenate((self.tail, audio))
             self.tail = None
+            self.tail_silence_ms = None
         step_samples = round(self.session.options.chunk_seconds * SAMPLE_RATE)
         offset = 0
         turns = []
         try:
             while len(audio) - offset >= step_samples or (ending and offset < len(audio)):
                 stop = min(len(audio), offset + step_samples)
-                turns.append(self.step(trace, audio[offset:stop], final_chunk=ending and stop == len(audio)))
+                at_packet_end = stop == len(audio)
+                turns.append(self.step(trace, audio[offset:stop], final_chunk=ending and at_packet_end,
+                                       trailing_silence_ms=trailing_silence_ms if at_packet_end else None))
                 offset = stop
             if offset < len(audio):
                 self.tail = audio[offset:].copy()
+                self.tail_silence_ms = trailing_silence_ms
             if ending:
                 turns.append(self.step(trace, end_of_audio=True))
             status = "ended" if ending else ("ok" if turns else "buffered")
@@ -366,10 +381,11 @@ def create_app(backend_factory, options, *, max_meetings=16, max_in_flight=8,
         reserved[key] = trace
         trace.log("request_started")
 
-    async def dispatch(meeting, pcm, ending, trace, upload_ms):
+    async def dispatch(meeting, pcm, ending, trace, upload_ms, trailing_silence_ms):
         try:
             try:
-                outcome = await asyncio.get_running_loop().run_in_executor(executor, meeting.process, pcm, ending, trace)
+                outcome = await asyncio.get_running_loop().run_in_executor(
+                    executor, meeting.process, pcm, ending, trace, trailing_silence_ms)
             except Exception as exc:
                 trace.log_processing_error(exc)
                 outcome = (500, {"meeting_id": meeting.meeting_id, "status": "error", "action": None,
@@ -405,6 +421,7 @@ def create_app(backend_factory, options, *, max_meetings=16, max_in_flight=8,
         try:
             if ending:
                 pcm = np.empty(0, dtype=np.float32)
+                trailing_silence_ms = None
                 upload_ms = 0.0
             else:
                 try:
@@ -413,7 +430,7 @@ def create_app(backend_factory, options, *, max_meetings=16, max_in_flight=8,
                     if archive is not None:
                         trace.debug("request_body", content_type=media, body_bytes=len(body),
                                     body_sha256=hashlib.sha256(body).hexdigest())
-                    pcm = decode_packet(media, body, sample_limit)
+                    pcm, trailing_silence_ms = decode_packet(media, body, sample_limit)
                     del body
                 except asyncio.TimeoutError:
                     trace.reject(408, "Upload timed out; packet not accepted", "upload_timeout")
@@ -430,7 +447,8 @@ def create_app(backend_factory, options, *, max_meetings=16, max_in_flight=8,
                                 max_context_tokens=getattr(backend, "max_context_tokens", None),
                                 max_new_tokens=getattr(backend, "max_new_tokens", None))
             trace.phase = "processing"
-            job = meeting.job = asyncio.create_task(dispatch(meeting, pcm, ending, trace, upload_ms))
+            job = meeting.job = asyncio.create_task(dispatch(meeting, pcm, ending, trace, upload_ms,
+                                                             trailing_silence_ms))
         except (ClientDisconnect, asyncio.CancelledError):
             trace.log("request_interrupted", level=logging.WARNING, phase=trace.phase, duration_ms=trace.elapsed_ms())
             raise
@@ -457,7 +475,10 @@ def create_app(backend_factory, options, *, max_meetings=16, max_in_flight=8,
                   "content": {
                       "application/json": {"schema": {"type": "object", "required": ["data"], "properties": {
                           "data": {"type": "string", "format": "byte",
-                                   "description": "Standard base64 of normalized mono float32 LE samples"}}}},
+                                   "description": "Standard base64 of normalized mono float32 LE samples"},
+                          "trailing_silence_ms": {"type": "number", "minimum": 0,
+                                  "description": "Continuous silence at the packet endpoint, in milliseconds. "
+                                                 "Below 300 suppresses a terminal period on an aligned ASR turn."}}}},
                       **{media: {"schema": {"type": "string", "format": "binary"}}
                          for media in ("audio/pcm", "audio/wav", "application/octet-stream")}}}},
               responses={200: {"description": "New transcript text for this packet, empty when nothing was emitted"},

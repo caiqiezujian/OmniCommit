@@ -22,6 +22,22 @@ Fourth 在模型历史和逐轮日志的 `text` 中保留 `<|SPK_CHANGE|>`。需
 
 整包没有新增正文时返回 `{"src":""}`。同一会议使用同一 ID，等到这一包返回后再发送下一包。一次请求包含多秒音频时，服务依序完成各个模型步长再返回。同步耗时随音频长度、GPU 负载和生成的字数变化。
 
+### 用包尾静音判断句号
+
+如果调用方能测出**截至本包最后一个采样点的连续静音时长**，可以随 JSON 音频包发送可选字段 `trailing_silence_ms`。单位为毫秒，取有限的非负数。包尾仍在说话时填 `0`。如果静音从上一包延续至今，填跨包的连续时长。只有整包累计静音时长、无法确定包尾状态时，省略此字段。PCM 和 WAV 二进制请求沿用原有格式。
+
+~~~json
+{"data":"<音频的 Base64 字符串>","trailing_silence_ms":200}
+~~~
+
+例如，模型这一轮输出“我知道。”，轮末与包末恰好对齐。传 `200` 时，服务立即返回 `{"src":"我知道"}`，下一轮的对话历史里也是“我知道”。后续包不会补发刚去掉的句号。传 `300`、更大的值或省略字段时，返回 `{"src":"我知道。"}`。这项处理仅作用于该轮末尾的普通句号，句中标点照常提交。
+
+包尾读数只对应一个时间点。以 1 秒步长为例：
+
+- 一包正好 3 秒时，读数只用于第 3 秒结束的模型轮。前两轮照常提交。
+- 连发 0.4 秒和 0.6 秒两包时，服务在第 2 包末尾完成一轮，用第 2 包的读数。若第 2 包省略此字段，该轮照常提交。
+- 一包长 1.4 秒，随后调用 `/end` 时，第 1 秒结束的轮次照常提交，剩余 0.4 秒在收尾时使用该包保存的读数。
+
 ### Python 对接示例
 
 ~~~python
@@ -30,8 +46,11 @@ import requests
 meeting = "http://服务器内网IP:18892/v1/meetings/meeting-001"
 
 # 每来一包就调用一次，audio_base64 是上游已有的字符串。
-def transcribe(audio_base64):
-    response = requests.post(meeting + "/chunks", json={"data": audio_base64}, timeout=60)
+def transcribe(audio_base64, trailing_silence_ms=None):
+    packet = {"data": audio_base64}
+    if trailing_silence_ms is not None:
+        packet["trailing_silence_ms"] = trailing_silence_ms
+    response = requests.post(meeting + "/chunks", json=packet, timeout=60)
     response.raise_for_status()
     return response.json()["src"]
 
