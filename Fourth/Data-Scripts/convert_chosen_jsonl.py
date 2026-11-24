@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """把顶层 chosen 按原有换行转换成 OmniCommit 的全 DIRECT 标注。"""
 
+import base64
 import json
 import re
 import sys
@@ -112,14 +113,40 @@ def convert_record(row):
     }
 
 
+def reject_nonstandard_number(token):
+    raise ValueError(f"非标准 JSON 数值 {token}")
+
+
+def rejected_jsonl_line(raw, number, error):
+    """Keep an ordinary rejected JSON row verbatim. Wrap damaged input so it can be inspected."""
+    detail = {"line": number, "reason": str(error)}
+    try:
+        text = raw.decode("utf-8-sig").rstrip("\r\n")
+    except UnicodeDecodeError:
+        detail["raw_base64"] = base64.b64encode(raw).decode("ascii")
+    else:
+        try:
+            json.loads(text, parse_constant=reject_nonstandard_number)
+        except (ValueError, RecursionError):
+            detail["raw_line"] = text
+        else:
+            return (text + "\n").encode("utf-8")
+    return (json_text(detail) + "\n").encode("utf-8", errors="backslashreplace")
+
+
 def convert_file(source, target):
-    if source.resolve() == target.resolve():
-        raise ValueError("输入和输出路径必须不同")
+    rejected = target.with_suffix(".rejected.jsonl")
+    if len({p.resolve() for p in (source, target, rejected)}) != 3:
+        raise ValueError("输入、成功输出和过滤输出必须使用不同路径")
+    for path in (target, rejected):
+        if path.is_dir():
+            raise IsADirectoryError(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     written = skipped = blank = 0
     with source.open("rb") as reader, TemporaryDirectory(dir=target.parent) as work:
         temporary = Path(work) / target.name
-        with temporary.open("wb") as writer:
+        rejected_temporary = Path(work) / rejected.name
+        with temporary.open("wb") as writer, rejected_temporary.open("wb") as rejected_writer:
             for number, raw in enumerate(reader, 1):
                 if not raw.strip():
                     blank += 1
@@ -127,7 +154,8 @@ def convert_file(source, target):
                 try:
                     result = convert_record(json.loads(raw))
                     encoded = (json_text(result) + "\n").encode("utf-8")
-                except ValueError as exc:
+                except (ValueError, RecursionError) as exc:
+                    rejected_writer.write(rejected_jsonl_line(raw, number, exc))
                     skipped += 1
                     if skipped <= 20:
                         print(f"[跳过] 第 {number} 行：{exc}", file=sys.stderr)
@@ -136,8 +164,11 @@ def convert_file(source, target):
                     written += 1
                 if number % 10000 == 0:
                     print(f"[进度] 已读 {number} 行，成功 {written}，异常 {skipped}", flush=True)
+        rejected_temporary.replace(rejected)
         temporary.replace(target)
-    print(f"[完成] 成功 {written}，异常跳过 {skipped}，空行 {blank}，输出 {target}")
+    print(f"[完成] 成功 {written}，已过滤 {skipped}，空行 {blank}")
+    print(f"[成功文件] {target}")
+    print(f"[过滤文件] {rejected}")
 
 
 if __name__ == "__main__":
