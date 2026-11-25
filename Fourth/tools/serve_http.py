@@ -30,6 +30,9 @@ def main(argv=None):
     parser.add_argument("--protocol", choices=("auto", "speaker", "plain", "explicit"), default="auto")
     parser.add_argument("--recovery", action=argparse.BooleanOptionalAction, default=False,
                         help="Run the optional second decode on voiced WAITs of explicit checkpoints")
+    parser.add_argument("--packet-period-to-comma", action=argparse.BooleanOptionalAction, default=False,
+                        help="Replace a packet-final sentence period with a comma when the caller reports "
+                             "less than 300 ms of packet silence (default: off)")
     parser.add_argument("--max-meetings", type=int, default=16,
                         help="Number of meeting histories kept concurrently")
     parser.add_argument("--max-in-flight", type=int, default=8,
@@ -91,6 +94,7 @@ def main(argv=None):
             print(f"[http] Meeting event logs (events.jsonl): {args.debug_dir.expanduser().absolute()}",
                   file=sys.stderr, flush=True)
         app = create_app(load_model, options, max_meetings=args.max_meetings, max_in_flight=args.max_in_flight,
+                         packet_period_to_comma=args.packet_period_to_comma,
                          idle_timeout_seconds=args.idle_timeout_seconds,
                          max_packet_seconds=args.max_packet_seconds, upload_timeout_seconds=args.upload_timeout_seconds,
                          debug_dir=args.debug_dir, debug_model=str(args.model) if args.model is not None else None)

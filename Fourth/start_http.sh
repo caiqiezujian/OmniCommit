@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
-# Usage: bash start_http.sh MERGED_HF_MODEL [--port 18892] [--batch-size 4]
+# No arguments: use http_config.sh. With a model path: use the caller's arguments.
 set -euo pipefail
-if (( $# < 1 )); then
-  echo "Usage: bash start_http.sh MERGED_HF_MODEL [HTTP service options]" >&2
-  exit 2
+if (( $# == 0 )); then
+  cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
+  source ./http_config.sh
+  export CUDA_VISIBLE_DEVICES
+  case "${PACKET_PERIOD_TO_COMMA:-false}" in
+    true) HTTP_ARGS+=(--packet-period-to-comma) ;;
+    false) ;;
+    *) echo 'PACKET_PERIOD_TO_COMMA must be true or false' >&2; exit 2 ;;
+  esac
+  exec "${PYTHON:-python3}" tools/serve_http.py --model "$ASR_MODEL" "${HTTP_ARGS[@]}"
 fi
 model="$1"
 shift

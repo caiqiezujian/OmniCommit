@@ -22,21 +22,19 @@ Fourth 在模型历史和逐轮日志的 `text` 中保留 `<|SPK_CHANGE|>`。需
 
 整包没有新增正文时返回 `{"src":""}`。同一会议使用同一 ID，等到这一包返回后再发送下一包。一次请求包含多秒音频时，服务依序完成各个模型步长再返回。同步耗时随音频长度、GPU 负载和生成的字数变化。
 
-### 用包尾静音判断句号
+### 按整包静音时长将末尾句号换成逗号
 
-如果调用方能测出**截至本包最后一个采样点的连续静音时长**，可以随 JSON 音频包发送可选字段 `trailing_silence_ms`。单位为毫秒，取有限的非负数。包尾仍在说话时填 `0`。如果静音从上一包延续至今，填跨包的连续时长。只有整包累计静音时长、无法确定包尾状态时，省略此字段。PCM 和 WAV 二进制请求沿用原有格式。
+在 `Fourth/http_config.sh` 设置 `PACKET_PERIOD_TO_COMMA=true` 并重启 HTTP 服务。默认值为 `false`。可通过 `/health` 的 `packet_period_to_comma` 查看运行状态。
+
+每个 JSON 音频包可传一次 `silence_ms`，表示**本次上传音频里所有静音加起来的毫秒数**。取有限的非负数。原对接字段名 `trailing_silence_ms` 也受支持，两个字段任选其一。只发音频时，服务保留模型原标点。
 
 ~~~json
-{"data":"<音频的 Base64 字符串>","trailing_silence_ms":200}
+{"data":"<音频的 Base64 字符串>","silence_ms":200}
 ~~~
 
-例如，模型这一轮输出“我知道。”，轮末与包末恰好对齐。传 `200` 时，服务立即返回 `{"src":"我知道"}`，下一轮的对话历史里也是“我知道”。后续包不会补发刚去掉的句号。传 `300`、更大的值或省略字段时，返回 `{"src":"我知道。"}`。这项处理仅作用于该轮末尾的普通句号，句中标点照常提交。
+例如一包 5 秒，模型按 1 秒解码，整包拼出的正文是“我听到了。我知道。”。开关开启且整包静音为 `200` 时，返回 `{"src":"我听到了。我知道，"}`。即使第 3～4 秒有停顿，服务也只在整包结束时检查一次；正文中间的句号照常保留。整包静音达到 `300` 毫秒时保留末尾句号。如果最后一个音频轮是 `WAIT`，检查本包最后一次提交的正文。整包都在等待时返回空字符串。下一个请求使用修改后的历史。
 
-包尾读数只对应一个时间点。以 1 秒步长为例：
-
-- 一包正好 3 秒时，读数只用于第 3 秒结束的模型轮。前两轮照常提交。
-- 连发 0.4 秒和 0.6 秒两包时，服务在第 2 包末尾完成一轮，用第 2 包的读数。若第 2 包省略此字段，该轮照常提交。
-- 一包长 1.4 秒，随后调用 `/end` 时，第 1 秒结束的轮次照常提交，剩余 0.4 秒在收尾时使用该包保存的读数。
+逗号根据结尾文字和标点选择，例如中文用“，”，可识别的日文用“、”，英文用“,”，阿拉伯文用“،”。问号、叹号和省略号保持原样。使用 1 秒整数倍的音频包可让包末与推理轮边界对齐。对于留有不足一步音频的包，服务暂存尾部；与下包拼接时使用新包读数，直接结束时使用暂存读数。
 
 ### Python 对接示例
 
@@ -46,10 +44,10 @@ import requests
 meeting = "http://服务器内网IP:18892/v1/meetings/meeting-001"
 
 # 每来一包就调用一次，audio_base64 是上游已有的字符串。
-def transcribe(audio_base64, trailing_silence_ms=None):
+def transcribe(audio_base64, silence_ms=None):
     packet = {"data": audio_base64}
-    if trailing_silence_ms is not None:
-        packet["trailing_silence_ms"] = trailing_silence_ms
+    if silence_ms is not None:
+        packet["silence_ms"] = silence_ms
     response = requests.post(meeting + "/chunks", json=packet, timeout=60)
     response.raise_for_status()
     return response.json()["src"]
@@ -73,20 +71,20 @@ curl -fsS -X POST http://127.0.0.1:18892/v1/meetings/demo-001/end
 
 ## 部署
 
-在现有 Fourth 的 vLLM 0.11.1 推理环境中，选择一张显存足够的 GPU。将模型路径换成此次训练合并出的完整 HF 模型目录，网页和 HTTP 都从该目录读取模型权重与 tokenizer。`--protocol speaker` 在加载权重前核对导出清单，健康检查中的 `action_protocol` 应为 `speaker`。
+在 `Flex_web` 容器中编辑 [http_config.sh](http_config.sh)。`ASR_MODEL` 填训练后合并的 HF 模型目录，`CUDA_VISIBLE_DEVICES` 填服务使用的 GPU。`HTTP_ARGS` 中的 `--port` 填调用方访问的端口。仓库配置使用 GPU 6、checkpoint 2721、端口 18892 和 1000 ms 步长。保存后从仓库根目录启动，修改配置后重启生效。
 
 ~~~bash
 cd /data/yb/Code/OmniCommit
-CUDA_VISIBLE_DEVICES=0 bash Fourth/start_http.sh \
-  /data/yb/Code/OmniCommit/models/fourth-speaker-full-merged \
-  --protocol speaker --port 18892 --chunk-ms 1000
+bash Fourth/start_http.sh
 ~~~
 
 ~~~bash
 curl -fsS http://127.0.0.1:18892/health
 ~~~
 
-HTTP 默认按 1 秒步长解码，单包最长 8 秒。如果对方每包最长 30 秒，启动时加 `--max-packet-seconds 30`。默认每轮输出上限 512 token，总上下文 4352 token，音频窗口 60 秒，每次裁剪 50 秒。默认最多保留 16 场会议、同时接收或处理 8 个请求、每批至多 4 路。前端或其他服务已在使用 GPU 时，应按 `nvidia-smi` 的实际空闲显存选卡。
+服务就绪后，健康检查中的 `action_protocol` 应为 `speaker`。显式运行 `bash Fourth/start_http.sh MODEL [参数...]` 时，使用调用方的 GPU 环境和命令行参数。网页的启动参数仍在 `Fourth/web_config.sh`。
+
+HTTP 默认按 1 秒步长解码，单包最长 8 秒。如果对方每包最长 30 秒，将配置中的 `--max-packet-seconds` 改为 `30`。默认每轮输出上限 512 token，总上下文 4352 token，音频窗口 60 秒，每次裁剪 50 秒。默认最多保留 16 场会议、同时接收或处理 8 个请求、每批至多 4 路。前端或其他服务已在使用 GPU 时，应按 `nvidia-smi` 的实际空闲显存选卡。
 
 音频格式错误或超长、同一会议重叠发包、容量已满、引擎失败，都会返回相应的非 200 状态码。网络超时时，已经接收的包可能仍在处理，重复 POST 会有重复转录的风险。部署方排查截断时可以查看服务日志或最近一包的诊断记录 `GET /v1/meetings/{meeting_id}/result`。正常对接只用两个 POST 接口。
 
@@ -118,15 +116,7 @@ jq -c --arg r '替换为请求ID' \
 
 ### 通过 events.jsonl 逐轮检查会议转录
 
-在启动命令中加 `--debug-dir`，服务就会为每场会议写一份 `events.jsonl`。这是该会议调试目录中唯一新增的文件。它保存逐轮转录正文、模型输入上下文、HTTP 响应和错误详情，音频输入用采样区间和请求体摘要记录。调用方继续使用相同的 `/chunks` 和 `/end`。
-
-~~~bash
-cd /data/yb/Code/OmniCommit
-CUDA_VISIBLE_DEVICES=0 bash Fourth/start_http.sh \
-  /data/yb/Code/OmniCommit/models/fourth-speaker-full-merged \
-  --protocol speaker --port 18892 --chunk-ms 1000 \
-  --debug-dir /data/yb/Code/OmniCommit/Fourth/logs/http-debug
-~~~
+默认 HTTP 配置已启用 `--debug-dir logs/http-debug`，每场会议写一份 `Fourth/logs/http-debug/<会议ID的SHA-256>/events.jsonl`。它保存逐轮转录正文、模型输入上下文、HTTP 响应和错误详情，音频输入以采样区间和请求体摘要记录。需要调整目录时，修改 `http_config.sh` 中的 `--debug-dir` 再重启。
 
 每个会议使用单独目录，目录名是会议 ID 的完整 SHA-256。目录中的 `events.jsonl` 按事件记录 UTC 时间、会议 ID 和请求 ID。第一包的请求 ID 同时标识这一次会话，重复使用同一会议 ID 时，可按 `session_started` 找到新的起点。
 

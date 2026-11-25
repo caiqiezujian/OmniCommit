@@ -5,40 +5,13 @@ from dataclasses import dataclass
 import logging
 import math
 import time
-import unicodedata
 
 import numpy as np
 
 from .runtime.streaming import StreamOptions, StreamSession
-from .annotation_tail import simple_period_offset
+from .packet_punctuation import replace_terminal_period
 from .protocol import SPK_CHANGE, WAIT, get_protocol
 from .recovery import VoicedWaitRecovery
-from .semantic_preparation import TRAILING
-
-
-def _remove_terminal_period(marked, previous):
-    """Edit only the final speaker's newly emitted text; keep quotes and interior punctuation."""
-    earlier, change, last = marked.rpartition(SPK_CHANGE)
-    end = len(last)
-    while end and (last[end - 1].isspace() or last[end - 1] in TRAILING):
-        end -= 1
-    if not end or last[end - 1] not in ".。．":
-        return marked
-    # The model can emit the period in a turn of its own. Include the prior
-    # committed suffix when checking abbreviations or ellipses across turns.
-    context = last[:end] if change else previous + last[:end]
-    before = context[-2:-1]
-    if (end > 1 and last[end - 2] in ".。．…") or context.endswith("..."):
-        return marked
-    if context.endswith(".") and before and (before.isalnum() or unicodedata.category(before).startswith("M")):
-        # Check the local word as well, since two separately committed replies
-        # may meet without a separating space in the stored transcript.
-        if simple_period_offset(context) is None or (end >= 2 and simple_period_offset(last[:end]) is None):
-            return marked
-    corrected = last[:end - 1] + last[end:]
-    if not corrected.strip():
-        return earlier if earlier.strip() else ""
-    return earlier + change + corrected
 
 
 @dataclass
@@ -132,9 +105,8 @@ class FourthStreamSession(StreamSession):
             return None, parsed, history
         return super()._decode_turn(history, pcm, end_of_audio)
 
-    def step(self, audio=None, *, end_of_audio=False, final_chunk=False, trailing_silence_ms=None):
+    def step(self, audio=None, *, end_of_audio=False, final_chunk=False):
         self.quiet_evicted_seconds = 0.
-        previous_watermark = self.inferred_commit_seconds
         result = super().step(audio, end_of_audio=end_of_audio, final_chunk=final_chunk)
         gate = result.get("silence_gate")
         skipped = gate is not None and gate["decision"] == "skip"
@@ -161,18 +133,6 @@ class FourthStreamSession(StreamSession):
                 result["realtime_factor"] = result["generation_seconds"] / (
                     result["end_seconds"] - result["start_seconds"])
         self.last_gated_turn = self.history[-1] if skipped else None
-        if trailing_silence_ms is not None and not end_of_audio:
-            result["trailing_silence_ms"] = trailing_silence_ms
-            if trailing_silence_ms < 300 and result["action"] == "DIRECT":
-                marked = self.protocol.parse_reply(result["text"])
-                corrected = _remove_terminal_period(marked, self.committed_tail)
-                if corrected != marked:
-                    reply = self.protocol.format_text(corrected) if corrected else WAIT
-                    result.update(self._model_reply(reply, False), terminal_period_removed=True)
-                    self.history[-1].reply = reply
-                    if not corrected and self.options.context_policy == "rolling":
-                        self.inferred_commit_seconds = previous_watermark
-                        result["inferred_commit_seconds"] = previous_watermark
         if result["action"] == "DIRECT":
             # A speaker boundary separates words for recovery overlap detection.
             marked = result["text"].removeprefix(self.protocol.prefix)
@@ -181,6 +141,24 @@ class FourthStreamSession(StreamSession):
         if self.quiet_evicted_seconds:
             result["vad_quiet_evicted_seconds"] = self.quiet_evicted_seconds
         return result
+
+    def apply_packet_comma(self, result, previous_text):
+        """Edit the packet's last commit before the next request builds its prompt."""
+        marked = self.protocol.parse_reply(result["text"])
+        corrected = replace_terminal_period(marked, previous_text)
+        if marked == corrected:
+            return False
+        reply = self.protocol.format_text(corrected)
+        result.update(text=reply, display_text=corrected.replace(SPK_CHANGE, ""),
+                      terminal_period_to_comma=True)
+        # Preserve each speaker-change flag computed at the original commit.
+        result["transcript_parts"][-1]["text"] = corrected.rsplit(SPK_CHANGE, 1)[-1]
+        self.committed_tail = (previous_text + corrected.replace(SPK_CHANGE, " "))[-2048:]
+        for turn in reversed(self.history):
+            if turn.start == result["start_seconds"]:
+                turn.reply = reply
+                break
+        return True
 
     def _pending_seconds(self, commit):
         if self.options.context_policy == "verified":
