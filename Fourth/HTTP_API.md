@@ -106,7 +106,7 @@ if response.status_code == 409:
     print(response.headers.get("X-Request-ID"), response.text)
 ~~~
 
-服务默认将请求日志按 JSONL 追加到仓库下的 `Fourth/logs/http-requests.jsonl`。可在启动命令中加 `--request-log /data/logs/fourth-http.jsonl` 指定位置。启动时会打印实际路径，目录无法写入时改写到标准错误。每条记录使用 UTC 时间，文件达到 20 MiB 后轮转，最多保留 5 个历史文件。日志中的转录统计使用字符数，会议音频和转录正文留在原有的数据通路中。
+服务默认将全局请求日志追加到仓库下的 `Fourth/logs/http-requests.jsonl`。可在启动命令中加 `--request-log /data/logs/fourth-http.jsonl` 指定位置。启动时会打印实际路径，目录无法写入时改写到标准错误。每条记录使用 UTC 时间，文件达到 20 MiB 后轮转，最多保留 5 个历史文件。用这份日志查请求号、状态码、耗时和转录字符数。要看每轮正文，打开下文的会议日志。
 
 在仓库根目录执行以下命令，按会议或请求查询。较早的记录也可能在同目录的 `.1` 至 `.5` 文件中。
 
@@ -121,30 +121,33 @@ jq -c --arg r '替换为请求ID' \
 - `reason=ended`、`failed`、`expired` 分别表示会议已经结束、处理失败、空闲过期。用 `last_request_id` 回查该会议最后一次请求，新会议分配新的 ID。空闲超时默认 600 秒，实际值见 `/health` 中的 `idle_timeout_seconds`。
 - 成功请求的 `request_finished` 给出耗时 `duration_ms` 和新增文本的字符数 `src_chars`。`src_chars=0` 是有效结果。如果前一包在客户端超时，服务器可能仍在处理，先查该会议的日志或 `GET /v1/meetings/{meeting_id}/result`。该接口返回最近一包的状态，自动重发同一包可能重复转录。
 
-### 通过 events.jsonl 逐轮检查会议转录
+### 按会议号查看逐轮转录
 
-默认 HTTP 配置已启用 `--debug-dir logs/http-debug`，每场会议写一份 `Fourth/logs/http-debug/<会议ID的SHA-256>/events.jsonl`。它保存逐轮转录正文、模型输入上下文、HTTP 响应和错误详情，音频输入以采样区间和请求体摘要记录。需要调整目录时，修改 `http_config.sh` 中的 `--debug-dir` 再重启。
+默认 HTTP 配置使用 `HTTP_EVENT_LOG_MODE=readable`。每次会话写一份 `events.jsonl`，例如
 
-每个会议使用单独目录，目录名是会议 ID 的完整 SHA-256。目录中的 `events.jsonl` 按事件记录 UTC 时间、会议 ID 和请求 ID。第一包的请求 ID 同时标识这一次会话，重复使用同一会议 ID 时，可按 `session_started` 找到新的起点。
-
-| 要检查的问题 | 查看哪些记录 |
-|---|---|
-| 是否收到了同一包数据？ | `request_received` 有请求类型和声明长度。对于完整收到且在大小限制内的受支持请求体，`request_body` 记录 `content_type`、实际字节数 `body_bytes` 和 `body_sha256`。比较两次请求的摘要即可核对请求体字节是否一致。 |
-| 这一轮到底听到了哪段？ | `packet_audio` 和 `turn_started` 都给出整场会议的 `start_sample`、`end_sample`，区间左闭右开。两个区间相交的部分就是这包贡献给这一轮的音频。除以 16000 可换算成秒。 |
-| 模型实际说了什么？ | `model_call` 记录交给后端的消息历史、各音频输入的采样点数和解码前缀。`model_reply.raw_text` 保存后端交回的原始字符串，包括动作 token。初次解码、截断重试、补识别按 `kind`、`call_id` 区分。后端抛异常时查 `model_error`。 |
-| 服务做了什么处理，最终回了什么？ | `turn_finished.turn_result` 有动作、显示正文、时间区间、耗时及该轮产生的恢复或截断信息。`response` 记录服务生成的响应码和完整响应体。客户端断线时，此记录仍可用于核对服务端结果。 |
-
-在仓库根目录执行以下命令，可以查看某场会议每轮模型的原话，再按请求检查返回的 `src`。
-
-~~~bash
-meeting='meeting-001'
-meeting_hash=$(printf '%s' "$meeting" | sha256sum | cut -d ' ' -f1)
-trace="Fourth/logs/http-debug/$meeting_hash/events.jsonl"
-jq -c 'select(.event=="model_reply") | {request_id,turn,kind,raw_text}' "$trace"
-jq -c 'select(.event=="response") | {request_id,status_code,body}' "$trace"
+~~~text
+Fourth/logs/http-debug/6424126945/2026-11-27_14-32-05_8e10cfcff830/events.jsonl
 ~~~
 
-若请求在读包前因 409 被拒绝，按同一请求 ID 查看 `request_rejected` 和 `response` 即可定位原因。升级后沿用原启动命令并重启服务即可切换到仅保存事件的格式。旧版已生成的 `.wav` 和 `.body` 文件由部署方按需清理。
+第一层是调用方的会议号，第二层是北京时间的开始时间和本次会话的短 ID。同一会议号再次开会时会生成新的场次目录。建会前就被拒绝的请求也按会议号记录。含路径分隔符等特殊字符或过长的会议号会以可读前缀加摘要保存，日志中有完整会议号。在仓库根目录用以下命令可以跟随该会议号最近写入的日志。
+
+~~~bash
+meeting=6424126945
+file=$(ls -t "Fourth/logs/http-debug/$meeting"/*/events.jsonl | head -n 1)
+tail -n 20 -f "$file"
+~~~
+
+| 事件 | 看什么 |
+|---|---|
+| 收包 | 完整收到并校验音频后、进入推理队列前写入。录音区间以秒计，上游的整包静音换算成毫秒，`null` 表示未传。 |
+| 逐轮 | 每完成一轮立即写入轮号、新增音频区间、动作和耗时。`模型正文` 是该轮提交、尚未做包末标点修正的可展示文字，可以包含前几轮暂存的内容。`WAIT` 表示这一轮没有提交文字。 |
+| 返回 | `HTTP` 为服务端响应码，成功时 `src` 是服务写入响应的字段值。若包末改了标点，同一行给出目标轮号、静音测量和阈值。遇到暂存、解码缺口或失败也在这一行注明。 |
+| 拒绝 | 写明状态码和具体原因。例如同一会议的请求重叠会记 409、占用请求号以及对方仍在上传还是转录。 |
+| 结束请求、收尾轮 | 对应 `/end`。有暂存音频时先补跑音频轮，再记录收尾轮和最终返回。 |
+
+例如第 7 包的末轮是 `WAIT` 时，可以依次看到第 19 轮提交“我觉得”、第 20 轮提交“可以。”、第 21 轮等待。若 200 ms 触发 300 ms 的句号规则，返回行同时写出 `"src":"我觉得可以，"` 和第 20 轮的修改原因。请求号对应响应头 `X-Request-ID`，可用来对照全局 `http-requests.jsonl`。包号按本场收到的音频请求依次编号，包含被拒绝的请求。
+
+需要查看原始模型回复、完整 prompt、缓存或重试时，在 `Fourth/http_config.sh` 设置 `HTTP_EVENT_LOG_MODE=detailed` 并重启。同一场次目录会额外写入 `trace.jsonl`，沿用原始事件名和 UTC 时间。此前的详细日志仍可在原 SHA-256 目录中读取。两种模式都只写文本。用 `GET /health` 的 `event_log_mode` 可查看当前模式。
 
 ## 用真实音频测延迟
 

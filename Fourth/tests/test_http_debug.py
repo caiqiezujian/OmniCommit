@@ -1,6 +1,7 @@
 """Cross-check a captured meeting against what the HTTP client and model actually saw."""
 import base64
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 import hashlib
 import json
 from pathlib import Path
@@ -26,18 +27,22 @@ URL = "/v1/meetings/replay-001"
 
 def make_app(root, replies):
     options = FourthStreamOptions(protocol="explicit", chunk_seconds=.5, enable_recovery=False)
-    return create_app(lambda: ReplayBackend(replies), options, debug_dir=root)
+    return create_app(lambda: ReplayBackend(replies), options, debug_dir=root, event_log_mode="detailed")
 
 
-def post_samples(client, samples):
+def post_samples(client, samples, **metadata):
     encoded = base64.b64encode(samples.astype("<f4").tobytes()).decode("ascii")
-    return client.post(URL + "/chunks", json={"data": encoded})
+    return client.post(URL + "/chunks", json={"data": encoded, **metadata})
 
 
 def read_archive(root):
-    events_file, = (path for path in root.rglob("*") if path.is_file())
-    assert events_file.name == "events.jsonl"
-    return [json.loads(line) for line in events_file.read_text(encoding="utf-8").splitlines()]
+    trace, = root.rglob("trace.jsonl")
+    assert set(p.name for p in trace.parent.iterdir()) == {"trace.jsonl", "events.jsonl"}
+    return [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+
+
+def read_events(path):
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
 def for_request(events, response, name):
@@ -124,6 +129,10 @@ def test_malformed_model_reply_keeps_partial_commit_and_failed_response(tmp_path
     conflict, = for_request(events, rejected, "request_rejected")
     assert conflict["reason"] == "failed"
     assert conflict["last_request_id"] == failed.headers["X-Request-ID"]
+    readable = read_events(next(tmp_path.rglob("events.jsonl")))
+    returned, = [r for r in readable if r["事件"] == "返回"]
+    assert (returned["HTTP"], returned["已提交正文"], returned["原因"]) == (500, "已经提交", failed.json()["error"])
+    assert "src" not in returned and readable[-1]["前次请求号"] == failed.headers["X-Request-ID"]
 
 
 def test_invalid_json_logs_size_and_hash_only(tmp_path):
@@ -140,6 +149,8 @@ def test_invalid_json_logs_size_and_hash_only(tmp_path):
     assert not for_request(events, invalid, "packet_audio")
     assert not for_request(events, invalid, "model_call")
     check_response(events, invalid)
+    rejection, = read_events(next(tmp_path.rglob("events.jsonl")))
+    assert (rejection["事件"], rejection["HTTP"], rejection["原因"]) == ("拒绝", 400, "音频包无效")
 
 
 def test_busy_payload_is_rejected_before_ingestion(tmp_path):
@@ -152,7 +163,7 @@ def test_busy_payload_is_rejected_before_ingestion(tmp_path):
             return super().generate(messages, audios)
 
     options = FourthStreamOptions(protocol="explicit", chunk_seconds=.5, enable_recovery=False)
-    app = create_app(lambda: GatedBackend([WAIT]), options, debug_dir=tmp_path)
+    app = create_app(lambda: GatedBackend([WAIT]), options, debug_dir=tmp_path, event_log_mode="detailed")
     block = np.full(STEP, .05, dtype="f4")
     with TestClient(app) as client, ThreadPoolExecutor(max_workers=1) as pool:
         pending = pool.submit(post_samples, client, block)
@@ -171,3 +182,80 @@ def test_busy_payload_is_rejected_before_ingestion(tmp_path):
     assert not for_request(events, busy, "packet_audio")
     assert not for_request(events, busy, "model_call")
     check_response(events, busy)
+
+
+@pytest.mark.parametrize("detailed", [False, True])
+def test_live_packet_journal_tracks_turns_conflict_and_exact_returned_src(tmp_path, detailed, monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+
+    class GatedBackend(ReplayBackend):
+        def generate(self, messages, audios):
+            if len(audios) == 3 and not entered.is_set():
+                entered.set()
+                assert release.wait(5)
+            return super().generate(messages, audios)
+
+    settings = {"event_log_mode": "detailed"} if detailed else {}
+    if not detailed:
+        # Full prompts and hashes must not be collected for the readable timeline.
+        from fourth_asr import http_service
+        monkeypatch.setattr(http_service, "DebugBackend", lambda *a: pytest.fail("verbose wrapper was installed"))
+        monkeypatch.setattr(http_service.hashlib, "sha256", lambda *a: pytest.fail("normal packet body was hashed"))
+    options = FourthStreamOptions(protocol="explicit", chunk_seconds=1, enable_recovery=False)
+    api = create_app(lambda: GatedBackend([DIRECT + "我觉得", DIRECT + "可以。", WAIT, WAIT]), options,
+                     debug_dir=tmp_path, packet_period_to_comma=True, **settings)
+    pcm = np.zeros(3 * 16000, dtype="f4")
+    with TestClient(api) as client, ThreadPoolExecutor(max_workers=1) as pool:
+        assert client.get("/health").json()["event_log_mode"] == ("detailed" if detailed else "readable")
+        pending = pool.submit(post_samples, client, pcm, tail_silence=0.2)
+        try:
+            assert entered.wait(3)
+            path, = (tmp_path / "replay-001").glob("*/events.jsonl")
+            rows = read_events(path)
+            assert [r["事件"] for r in rows] == ["收包", "逐轮", "逐轮"]
+            assert rows[0]["录音区间_s"] == [0, 3] and rows[0]["上报静音_ms"] == 200
+            assert rows[2]["模型正文"] == "可以。" and rows[2]["新增音频_s"] == [1, 2]
+            busy = post_samples(client, pcm)
+            assert busy.status_code == 409
+            rejected = read_events(path)[-1]
+            assert (rejected["事件"], rejected["HTTP"], rejected["包"]) == ("拒绝", 409, 2)
+            assert rejected["占用请求号"] == rows[0]["请求号"] and rejected["占用阶段"] == "转录中"
+        finally:
+            release.set()
+        reply = pending.result(timeout=3)
+        assert reply.json() == {"src": "我觉得可以，"}
+        assert client.post(URL + "/end").json() == {"src": ""}
+        assert client.post(URL + "/end").status_code == 409
+
+    rows = read_events(path)
+    assert list(tmp_path.rglob("events.jsonl")) == [path]
+    assert {p.name for p in path.parent.iterdir()} == ({"events.jsonl", "trace.jsonl"} if detailed else {"events.jsonl"})
+    assert all(datetime.fromisoformat(r["时间"]).utcoffset() == timedelta(hours=8) for r in rows)
+    assert path.parent.name.endswith("_" + reply.headers["X-Request-ID"][:12])
+    turns = [r for r in rows if r["事件"] == "逐轮"]
+    assert [(r["包"], r["轮"], r["动作"]) for r in turns] == [(1, 1, "DIRECT"), (1, 2, "DIRECT"), (1, 3, "WAIT")]
+    assert "模型正文" not in turns[-1]
+    response, = [r for r in rows if r["事件"] == "返回" and r.get("包") == 1]
+    assert response["src"] == reply.json()["src"] and response["请求号"] == reply.headers["X-Request-ID"]
+    assert "第2轮句号改逗号" in response["标点处理"]
+    assert [r["事件"] for r in rows[-4:]] == ["结束请求", "收尾轮", "返回", "拒绝"]
+    assert rows[-1]["原因"] == "会议已结束"
+
+
+def test_readable_journal_separates_reused_id_and_flushes_buffer(tmp_path):
+    options = FourthStreamOptions(protocol="explicit", chunk_seconds=1, enable_recovery=False)
+    api = create_app(ReplayBackend, options, debug_dir=tmp_path, max_meetings=1)
+    pcm = bytes(16000)  # half a second of PCM16
+    with TestClient(api) as client:
+        for name in ("again", "other1", "other2", "again"):
+            url = f"/v1/meetings/{name}"
+            assert client.post(url + "/chunks", content=pcm, headers={"Content-Type": "audio/pcm"}).json() == {"src": ""}
+            assert client.post(url + "/end").json() == {"src": ""}
+    runs = list((tmp_path / "again").glob("*/events.jsonl"))
+    assert len(runs) == 2
+    for file in runs:
+        packet, buffered, end, flushed, eos, reply = read_events(file)
+        assert packet["包"] == 1 and packet["上报静音_ms"] is None and packet["录音区间_s"] == [0, .5]
+        assert buffered["暂存音频_s"] == .5 and buffered["src"] == ""
+        assert end["事件"] == "结束请求" and flushed["新增音频_s"] == [0, .5]
+        assert eos["事件"] == "收尾轮" and "新增音频_s" not in eos and reply["操作"] == "结束"

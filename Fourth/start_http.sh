@@ -13,6 +13,9 @@ if (( $# == 0 )); then
   if [[ -v PACKET_PERIOD_THRESHOLD_MS ]]; then
     HTTP_ARGS+=(--packet-period-threshold-ms "$PACKET_PERIOD_THRESHOLD_MS")
   fi
+  if [[ -v HTTP_EVENT_LOG_MODE ]]; then
+    HTTP_ARGS+=(--event-log-mode "$HTTP_EVENT_LOG_MODE")
+  fi
   exec "${PYTHON:-python3}" tools/serve_http.py --model "$ASR_MODEL" "${HTTP_ARGS[@]}"
 fi
 model="$1"

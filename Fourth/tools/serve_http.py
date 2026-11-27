@@ -24,7 +24,9 @@ def main(argv=None):
     parser.add_argument("--request-log", type=Path, default=DEFAULT_REQUEST_LOG, metavar="FILE",
                         help="Rotating JSONL request log (default: Fourth/logs/http-requests.jsonl)")
     parser.add_argument("--debug-dir", type=Path, metavar="DIR",
-                        help="Write per-meeting events.jsonl with packet metadata, model calls/replies and HTTP results")
+                        help="Directory for per-session meeting logs")
+    parser.add_argument("--event-log-mode", choices=("readable", "detailed"), default="readable",
+                        help="Write a readable events.jsonl, optionally adding a full model trace in trace.jsonl")
     parser.add_argument("--chunk-ms", type=int, default=1000, help="Model audio step in milliseconds (default: 1000)")
     parser.add_argument("--window-seconds", type=float, default=FourthStreamOptions.window_seconds)
     parser.add_argument("--discard-seconds", type=float, default=FourthStreamOptions.discard_seconds)
@@ -97,14 +99,16 @@ def main(argv=None):
     # Meeting histories and one copy of the GPU engine live in this process.
     with open_request_log(args.request_log):
         if args.debug_dir is not None:
-            print(f"[http] Meeting event logs (events.jsonl): {args.debug_dir.expanduser().absolute()}",
+            print(f"[http] Meeting logs ({args.event_log_mode}): "
+                  f"{args.debug_dir.expanduser().absolute()}/<meeting>/<session>/events.jsonl",
                   file=sys.stderr, flush=True)
         app = create_app(load_model, options, max_meetings=args.max_meetings, max_in_flight=args.max_in_flight,
                          packet_period_to_comma=args.packet_period_to_comma,
                          packet_period_threshold_ms=args.packet_period_threshold_ms,
                          idle_timeout_seconds=args.idle_timeout_seconds,
                          max_packet_seconds=args.max_packet_seconds, upload_timeout_seconds=args.upload_timeout_seconds,
-                         debug_dir=args.debug_dir, debug_model=str(args.model) if args.model is not None else None)
+                         debug_dir=args.debug_dir, debug_model=str(args.model) if args.model is not None else None,
+                         event_log_mode=args.event_log_mode)
         uvicorn.run(app, host=args.host, port=args.port, workers=1)
 
 

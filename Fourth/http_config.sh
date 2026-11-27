@@ -7,6 +7,10 @@ ASR_MODEL='/data/yb/Code/OmniCommit/output/fourth-merged-1s-v2/v0-20261121-06324
 PACKET_PERIOD_TO_COMMA=false
 PACKET_PERIOD_THRESHOLD_MS=300
 
+# readable writes one events.jsonl per meeting session.
+# detailed also records model inputs, raw replies and diagnostics in trace.jsonl.
+HTTP_EVENT_LOG_MODE=readable
+
 # Relative paths in this configuration start in Fourth/.
 HTTP_ARGS=(
   --host 0.0.0.0

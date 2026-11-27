@@ -315,11 +315,11 @@ def test_length_gap_in_a_multi_turn_packet_preserves_commits_and_continues():
         assert end["turns"][-1]["end_reason"] == "gap_already_reported"
 
 
-def test_gap_only_response_and_following_end_do_not_claim_model_wait():
+def test_gap_only_response_and_following_end_do_not_claim_model_wait(tmp_path):
     class Capped:
         def generate(self, messages, audios):
             raise GenerationTruncated("vLLM", 8, 60, 8, 4096)
-    with TestClient(app(Capped())) as client:
+    with TestClient(app(Capped(), debug_dir=tmp_path)) as client:
         assert_src(audio(client, "only-gap"), "")
         row = client.get(BASE+"only-gap/result").json()
         assert (row["status"], row["action"], row["text"]) == ("partial", None, "")
@@ -327,6 +327,10 @@ def test_gap_only_response_and_following_end_do_not_claim_model_wait():
         assert_src(client.post(BASE+"only-gap/end"), "")
         end = client.get(BASE+"only-gap/result").json()
         assert end["status"] == "ended" and end["action"] is None and end["gaps"] == []
+        log, = tmp_path.rglob("events.jsonl")
+        rows = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+        assert rows[1]["动作"] == "解码缺口" and rows[2]["解码缺口轮"] == [1]
+        assert rows[-2]["动作"] == "跳过收尾（缺口已记录）"
 
 
 def test_invalid_audio_does_not_allocate_or_modify_a_meeting():
@@ -381,7 +385,7 @@ def test_slow_upload_does_not_hold_an_inference_slot_or_consume_audio():
     asyncio.run(exercise())
 
 
-def test_conflict_during_upload_links_both_requests_and_terminal_state(request_records, caplog):
+def test_conflict_during_upload_links_both_requests_and_terminal_state(request_records, caplog, tmp_path):
     import httpx
 
     async def exercise():
@@ -397,7 +401,7 @@ def test_conflict_during_upload_links_both_requests_and_terminal_state(request_r
             await release.wait()
             yield packet[50:]
 
-        api = app(ReplayBackend([transcript, WAIT]))
+        api = app(ReplayBackend([transcript, WAIT]), debug_dir=tmp_path)
         async with api.router.lifespan_context(api), httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=api), base_url="http://local") as client:
             path = BASE + "upload"
@@ -427,6 +431,10 @@ def test_conflict_during_upload_links_both_requests_and_terminal_state(request_r
             closed_log, = request_records("request_rejected", response=closed)
             assert (closed_log["reason"], closed_log["last_request_id"]) == ("ended", end.headers["X-Request-ID"])
             assert len({r.headers["X-Request-ID"] for r in (accepted, busy, end, closed)}) == 4
+            timeline, = (tmp_path / "upload").glob("*/events.jsonl")
+            rows = [json.loads(line) for line in timeline.read_text(encoding="utf-8").splitlines()]
+            rejected, = [r for r in rows if r.get("请求号") == busy.headers["X-Request-ID"]]
+            assert (rejected["占用阶段"], rejected["占用请求号"]) == ("接收上传", accepted.headers["X-Request-ID"])
         for record in caplog.records:
             if record.name == "fourth_asr.http_requests":
                 line = record.getMessage()
