@@ -26,13 +26,13 @@ Fourth 在模型历史和逐轮日志的 `text` 中保留 `<|SPK_CHANGE|>`。需
 
 在 `Fourth/http_config.sh` 设置 `PACKET_PERIOD_TO_COMMA=true` 并重启 HTTP 服务。默认值为 `false`。可通过 `/health` 的 `packet_period_to_comma` 查看运行状态。
 
-每个 JSON 音频包可传一次 `silence_ms`，表示**本次上传音频里所有静音加起来的毫秒数**。取有限的非负数。原对接字段名 `trailing_silence_ms` 也受支持，两个字段任选其一。只发音频时，服务保留模型原标点。
+每个 JSON 音频包可用 `tail_silence` 传入调用方统计的整包累计静音时长，**单位为秒**，支持非负浮点数。例如 `"tail_silence": 0.3` 表示 300 毫秒。已有调用方可继续用 `silence_ms` 或 `trailing_silence_ms` 传毫秒数。每包只传其中一个字段，只发音频时保留模型原标点。`GET /v1/meetings/{meeting_id}/result` 中的 `silence_ms` 以及调试日志统一使用毫秒。
 
 ~~~json
-{"data":"<音频的 Base64 字符串>","silence_ms":200}
+{"data":"<音频的 Base64 字符串>","tail_silence":0.2}
 ~~~
 
-例如一包 5 秒，模型按 1 秒解码，整包拼出的正文是“我听到了。我知道。”。开关开启且整包静音为 `200` 时，返回 `{"src":"我听到了。我知道，"}`。即使第 3～4 秒有停顿，服务也只在整包结束时检查一次；正文中间的句号照常保留。整包静音达到 `300` 毫秒时保留末尾句号。如果最后一个音频轮是 `WAIT`，检查本包最后一次提交的正文。整包都在等待时返回空字符串。下一个请求使用修改后的历史。
+例如一包 5 秒，模型按 1 秒解码，整包拼出的正文是“我听到了。我知道。”。开关开启且 `tail_silence` 为 `0.2` 时，返回 `{"src":"我听到了。我知道，"}`。服务只在整包结束时检查一次，正文中间的句号照常保留。`0.299` 秒触发替换，`0.3` 秒和 `0.301` 秒都保留末尾句号。如果最后一个音频轮是 `WAIT`，检查本包最后一次提交的正文。整包都在等待时返回空字符串。下一个请求使用修改后的历史。
 
 逗号根据结尾文字和标点选择，例如中文用“，”，可识别的日文用“、”，英文用“,”，阿拉伯文用“،”。问号、叹号和省略号保持原样。使用 1 秒整数倍的音频包可让包末与推理轮边界对齐。对于留有不足一步音频的包，服务暂存尾部；与下包拼接时使用新包读数，直接结束时使用暂存读数。
 
@@ -44,10 +44,10 @@ import requests
 meeting = "http://服务器内网IP:18892/v1/meetings/meeting-001"
 
 # 每来一包就调用一次，audio_base64 是上游已有的字符串。
-def transcribe(audio_base64, silence_ms=None):
+def transcribe(audio_base64, tail_silence=None):
     packet = {"data": audio_base64}
-    if silence_ms is not None:
-        packet["silence_ms"] = silence_ms
+    if tail_silence is not None:
+        packet["tail_silence"] = tail_silence  # 秒
     response = requests.post(meeting + "/chunks", json=packet, timeout=60)
     response.raise_for_status()
     return response.json()["src"]

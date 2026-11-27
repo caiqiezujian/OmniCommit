@@ -49,7 +49,7 @@ def test_disabled_by_default_even_when_clients_send_silence():
     model = Capture([DIRECT + "第一句。", DIRECT + " Second.", DIRECT + "继续。"])
     with client_for(model) as client:
         assert client.get("/health").json()["packet_period_to_comma"] is False
-        assert_src(client.post(MEETING + "/chunks", json=packet(silence_ms=0)), "第一句。")
+        assert_src(client.post(MEETING + "/chunks", json=packet(tail_silence=0.0)), "第一句。")
         assert_src(client.post(MEETING + "/chunks", json=packet(trailing_silence_ms=200)), " Second.")
         assert_src(client.post(MEETING + "/chunks", json=packet()), "继续。")
     assert model.prompts[-1][0][-4] == ("assistant", DIRECT + "第一句。")
@@ -61,7 +61,7 @@ def test_five_second_packet_edits_only_its_final_text_and_keeps_trailing_wait():
     model = Capture(replies + [WAIT, WAIT])
     with client_for(model, packet_period_to_comma=True) as client:
         assert client.get("/health").json()["packet_period_to_comma"] is True
-        response = client.post(MEETING + "/chunks", json=packet(5 * SAMPLE_RATE, silence_ms=120))
+        response = client.post(MEETING + "/chunks", json=packet(5 * SAMPLE_RATE, tail_silence=0.12))
         assert_src(response, "开始。三。知道，")
         turns = client.get(MEETING + "/result").json()["turns"]
         assert [t["text"] for t in turns] == replies[:3] + [DIRECT + "知道，", WAIT]
@@ -134,6 +134,21 @@ def test_punctuation_and_threshold(silence, text, expected):
     assert model.prompts[-1][0][-2] == ("assistant", row["text"])
 
 
+@pytest.mark.parametrize("measurement,expected_ms,expected_src", [
+    ({"tail_silence": 0.0}, 0, "收到，"),
+    ({"tail_silence": 0.299}, 299, "收到，"),
+    ({"tail_silence": 0.3}, 300, "收到。"),
+    ({"tail_silence": 0.301}, 301, "收到。"),
+    ({"silence_ms": 0.3}, 0.3, "收到，"),
+    ({"trailing_silence_ms": 0.3}, 0.3, "收到，"),
+])
+def test_json_field_controls_units_at_the_300_ms_boundary(measurement, expected_ms, expected_src):
+    with client_for(Capture([DIRECT + "收到。"]), packet_period_to_comma=True) as client:
+        assert_src(client.post(MEETING + "/chunks", json=packet(**measurement)), expected_src)
+        result = client.get(MEETING + "/result").json()
+        assert result["silence_ms"] == pytest.approx(expected_ms)
+
+
 def test_legacy_measurements_follow_model_endpoints_across_packet_splits_and_flush():
     model = Capture([DIRECT + "One.", DIRECT + " Two.", DIRECT + " Three.", DIRECT + " Four.", WAIT])
     with client_for(model, packet_period_to_comma=True) as client:
@@ -162,12 +177,19 @@ def test_invalid_measurements_do_not_consume_or_relabel_buffered_audio():
     model = Capture([DIRECT + "你好。"])
     with client_for(model, packet_period_to_comma=True) as client:
         assert_src(client.post(MEETING + "/chunks", json=packet(8000, trailing_silence_ms=100)), "")
-        for invalid in (-1, "200", True, float("nan"), float("inf")):
-            body = json.dumps(packet(8000, silence_ms=invalid)).encode()
-            response = client.post(MEETING + "/chunks", content=body, headers={"Content-Type": "application/json"})
-            assert 400 <= response.status_code < 500, response.text
-        conflict = client.post(MEETING + "/chunks", json=packet(8000, silence_ms=500, trailing_silence_ms=100))
-        assert conflict.status_code == 400, conflict.text
+        for field in ("silence_ms", "tail_silence"):
+            for invalid in (-1, "0.3", True, None, float("nan"), float("inf")):
+                body = json.dumps(packet(8000, **{field: invalid})).encode()
+                response = client.post(MEETING + "/chunks", content=body, headers={"Content-Type": "application/json"})
+                assert response.status_code == 400, response.text
+        for invalid in (
+            {"silence_ms": 500, "trailing_silence_ms": 100},
+            {"tail_silence": 0.3, "silence_ms": 300},
+            {"tail_silence": 0.3, "trailing_silence_ms": 300},
+            {"tail_silence": 1e308},  # Seconds that overflow when expressed as milliseconds.
+        ):
+            response = client.post(MEETING + "/chunks", json=packet(8000, **invalid))
+            assert response.status_code == 400, response.text
         assert not model.prompts
         # Omitting a measurement at the current endpoint keeps the punctuation.
         assert_src(client.post(MEETING + "/chunks", json=packet(8000)), "你好。")

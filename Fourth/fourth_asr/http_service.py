@@ -61,14 +61,17 @@ def decode_json_audio(body, sample_limit):
     samples = np.frombuffer(raw, dtype="<f4")
     if not np.isfinite(samples).all() or np.max(np.abs(samples)) > 1.001:
         raise HTTPException(400, "Decoded float32 samples must be finite and normalized to [-1, 1]")
-    if "silence_ms" in packet and "trailing_silence_ms" in packet:
+    silence_fields = [key for key in ("tail_silence", "silence_ms", "trailing_silence_ms") if key in packet]
+    if not silence_fields:
+        return samples, None
+    if len(silence_fields) > 1:
         raise HTTPException(400, "Provide only one silence measurement per audio packet")
-    silence_key = "silence_ms" if "silence_ms" in packet else "trailing_silence_ms"
-    silence_ms = packet.get(silence_key)
-    if silence_key in packet and (
-            type(silence_ms) not in (int, float) or not 0 <= silence_ms <= sys.float_info.max):
-        raise HTTPException(400, f"{silence_key} must be a finite nonnegative number in milliseconds")
-    return samples, silence_ms
+    key = silence_fields[0]
+    value = packet[key]
+    scale_to_ms = 1000 if key == "tail_silence" else 1
+    if type(value) not in (int, float) or not 0 <= value <= sys.float_info.max / scale_to_ms:
+        raise HTTPException(400, f"{key} must be a nonnegative number representable in finite milliseconds")
+    return samples, value * scale_to_ms
 
 
 async def read_packet_body(request, sample_limit):
@@ -492,7 +495,11 @@ def create_app(backend_factory, options, *, max_meetings=16, max_in_flight=8,
                   "content": {
                       "application/json": {"schema": {"type": "object", "required": ["data"], "properties": {
                           "data": {"type": "string", "format": "byte",
-                              "description": "Standard base64 of normalized mono float32 LE samples"},
+                                   "description": "Standard base64 of normalized mono float32 LE samples"},
+                          "tail_silence": {"type": "number", "minimum": 0,
+                                  "description": "Caller-reported silence duration for this packet in seconds. "
+                                                 "When enabled, strictly below 0.3 s permits one final period-to-comma edit. "
+                                                 "Send only one silence field per packet."},
                           "silence_ms": {"type": "number", "minimum": 0,
                                   "description": "Total silence in this audio packet (milliseconds). Optional. "
                                                  "When enabled, below 300 permits one final period-to-comma edit."},
