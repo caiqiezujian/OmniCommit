@@ -56,20 +56,21 @@ def test_disabled_by_default_even_when_clients_send_silence():
     assert model.prompts[-1][0][-2] == ("assistant", DIRECT + " Second.")
 
 
-def test_five_second_packet_edits_only_its_final_text_and_keeps_trailing_wait():
+@pytest.mark.parametrize("silence,ending", [(0.12, "知道"), (0.2, "知道，"), (0.45, "知道。")])
+def test_five_second_packet_edits_only_its_final_text_and_keeps_trailing_wait(silence, ending):
     replies = [DIRECT + "开始。", WAIT, DIRECT + "三。", DIRECT + "知道。", WAIT]
     model = Capture(replies + [WAIT, WAIT])
     with client_for(model, packet_period_to_comma=True) as client:
         assert client.get("/health").json()["packet_period_to_comma"] is True
-        response = client.post(MEETING + "/chunks", json=packet(5 * SAMPLE_RATE, tail_silence=0.12))
-        assert_src(response, "开始。三。知道，")
+        response = client.post(MEETING + "/chunks", json=packet(5 * SAMPLE_RATE, tail_silence=silence))
+        assert_src(response, "开始。三。" + ending)
         turns = client.get(MEETING + "/result").json()["turns"]
-        assert [t["text"] for t in turns] == replies[:3] + [DIRECT + "知道，", WAIT]
+        assert [t["text"] for t in turns] == replies[:3] + [DIRECT + ending, WAIT]
         # An all-WAIT packet has no text of its own, even with a short silence measurement.
         assert_src(client.post(MEETING + "/chunks", json=packet(silence_ms=0)), "")
         assert_src(client.post(MEETING + "/chunks", json=packet()), "")
     history = [text for role, text in model.prompts[-1][0] if role == "assistant"]
-    assert history == replies[:3] + [DIRECT + "知道，", WAIT, WAIT]
+    assert history == replies[:3] + [DIRECT + ending, WAIT, WAIT]
 
 
 def test_five_second_packet_leaves_internal_periods_when_last_turn_is_direct():
@@ -90,23 +91,25 @@ def test_new_packet_of_waits_cannot_change_an_already_returned_sentence():
     assert [text for role, text in model.prompts[-1][0] if role == "assistant"] == [DIRECT + "结束。", WAIT]
 
 
-def test_corrected_turn_is_the_single_source_for_client_and_next_model_prompt():
+@pytest.mark.parametrize("ms,suffix", [(149.5, ""), (150, "，"), (449.5, "，")])
+def test_corrected_turn_is_the_single_source_for_client_and_next_model_prompt(ms, suffix):
     raw = DIRECT + "他们来了。" + SPK_CHANGE + "我知道。"
-    corrected = raw[:-1] + "，"
+    corrected = raw[:-1] + suffix
     model = Capture([DIRECT + "第一句。", DIRECT + "第二句。", raw, WAIT])
     with client_for(model, packet_period_to_comma=True) as client:
         for i, metadata, expected in [
-            (1, {}, "第一句。"), (2, {"silence_ms": 300}, "第二句。"),
-            (3, {"silence_ms": 199.5}, "他们来了。我知道，"),
+            (1, {}, "第一句。"), (2, {"silence_ms": 450}, "第二句。"),
+            (3, {"silence_ms": ms}, "他们来了。我知道" + suffix),
         ]:
             assert_src(client.post(MEETING + "/chunks", json=packet(value=i / 8, **metadata)), expected)
         turn = client.get(MEETING + "/result").json()["turns"][0]
         assert turn["action"] == "DIRECT" and turn["text"] == corrected
         assert turn["transcript_parts"] == [{"text": "他们来了。", "speaker_change": False},
-                                            {"text": "我知道，", "speaker_change": True}]
+                                            {"text": "我知道" + suffix, "speaker_change": True}]
         assert_src(client.post(MEETING + "/chunks", json=packet(value=.5)), "")
 
     messages, audios = model.prompts[3]
+    assert messages[:len(model.prompts[2][0])] == model.prompts[2][0]
     assert messages[1:] == [
         ("user", "<audio>"), ("assistant", DIRECT + "第一句。"),
         ("user", "<audio>"), ("assistant", DIRECT + "第二句。"),
@@ -118,10 +121,10 @@ def test_corrected_turn_is_the_single_source_for_client_and_next_model_prompt():
 
 
 @pytest.mark.parametrize("silence,text,expected", [
-    (0, "We can.", "We can,"), (299.99, "我知道。", "我知道，"), (300, "好了。", "好了。"),
-    (310, "OK.", "OK."), (120, "Version 3.14", "Version 3.14"),
+    (0, "We can.", "We can"), (299.99, "我知道。", "我知道，"), (300, "好了。", "好了，"),
+    (450, "好了。", "好了。"), (310, "OK.", "OK."), (120, "Version 3.14", "Version 3.14"),
     (120, "Ask Dr.", "Ask Dr."), (120, "Well...", "Well..."),
-    (120, "明白吗？", "明白吗？"), (100, "“好的。”", "“好的，”"),
+    (120, "明白吗？", "明白吗？"), (100, "“好的。”", "“好的”"),
 ])
 def test_punctuation_and_threshold(silence, text, expected):
     model = Capture([DIRECT + text, WAIT])
@@ -135,14 +138,17 @@ def test_punctuation_and_threshold(silence, text, expected):
 
 
 @pytest.mark.parametrize("measurement,expected_ms,expected_src", [
-    ({"tail_silence": 0.0}, 0, "收到，"),
-    ({"tail_silence": 0.299}, 299, "收到，"),
-    ({"tail_silence": 0.3}, 300, "收到。"),
-    ({"tail_silence": 0.301}, 301, "收到。"),
-    ({"silence_ms": 0.3}, 0.3, "收到，"),
-    ({"trailing_silence_ms": 0.3}, 0.3, "收到，"),
+    ({"tail_silence": 0.0}, 0, "收到"),
+    ({"tail_silence": 0.149999}, 149.999, "收到"),
+    ({"tail_silence": 0.150}, 150, "收到，"),
+    ({"tail_silence": 0.3}, 300, "收到，"),
+    ({"tail_silence": 0.449999}, 449.999, "收到，"),
+    ({"tail_silence": 0.450}, 450, "收到。"),
+    ({"tail_silence": 0.451}, 451, "收到。"),
+    ({"silence_ms": 0.3}, 0.3, "收到"),
+    ({"trailing_silence_ms": 150}, 150, "收到，"),
 ])
-def test_json_field_controls_units_at_the_300_ms_boundary(measurement, expected_ms, expected_src):
+def test_json_field_units_at_both_thresholds(measurement, expected_ms, expected_src):
     with client_for(Capture([DIRECT + "收到。"]), packet_period_to_comma=True) as client:
         assert_src(client.post(MEETING + "/chunks", json=packet(**measurement)), expected_src)
         result = client.get(MEETING + "/result").json()
@@ -154,7 +160,7 @@ def test_json_field_controls_units_at_the_300_ms_boundary(measurement, expected_
     (500, {"tail_silence": 0.500}, "收到。"),
     (500, {"tail_silence": 0.501}, "收到。"),
     (125.5, {"silence_ms": 125.5}, "收到。"),
-    (125.5, {"trailing_silence_ms": 125}, "收到，"),
+    (125.5, {"trailing_silence_ms": 125}, "收到"),
     (1001, {"tail_silence": 1.001}, "收到。"),
     (0, {"tail_silence": 0}, "收到。"),
 ])
@@ -218,9 +224,93 @@ def test_invalid_measurements_do_not_consume_or_relabel_buffered_audio():
 
 
 @pytest.mark.parametrize("previous,period,src", [
-    ("你好", "。", "，"), ("Ask Dr", ".", "."), ("All done", ".", ","),
+    ("你好", "。", ""), ("Ask Dr", ".", "."), ("All done", ".", ""),
 ])
 def test_a_separately_decoded_period(previous, period, src):
     with client_for(Capture([DIRECT + previous, DIRECT + period]), packet_period_to_comma=True) as client:
         assert_src(client.post(MEETING + "/chunks", json=packet()), previous)
         assert_src(client.post(MEETING + "/chunks", json=packet(trailing_silence_ms=120)), src)
+
+
+@pytest.mark.parametrize("previous,following,expected", [
+    ("I know.", "what you mean", " what you mean"),
+    ("I know.", " what you mean", " what you mean"),
+    ("I know. ", " what you mean", "what you mean"),
+    ("I know.", ", actually", ", actually"),
+    ("I know.", "中文", "中文"),
+    ("We can.", "’t go", "’t go"),
+    ("I know.", SPK_CHANGE + "Hello", " Hello"),
+    ("我知道。", "这件事", "这件事"),
+])
+def test_next_visible_text_resolves_only_english_word_spacing(previous, following, expected):
+    model = Capture([DIRECT + previous, WAIT, WAIT, DIRECT + following, WAIT])
+    with client_for(model, packet_period_to_comma=True) as client:
+        first = client.post(MEETING + "/chunks", json=packet(tail_silence=0.1))
+        first_text = previous.replace(".", "").replace("。", "")
+        assert_src(first, first_text)
+        assert_src(client.post(MEETING + "/chunks", json=packet(2 * SAMPLE_RATE)), "")
+        assert_src(client.post(MEETING + "/chunks", json=packet()), expected)
+        row = client.get(MEETING + "/result").json()["turns"][0]
+        changed_speaker = following.startswith(SPK_CHANGE)
+        marked = (SPK_CHANGE if changed_speaker else "") + expected
+        assert row["text"] == DIRECT + marked
+        assert row["transcript_parts"] == [{"text": expected, "speaker_change": changed_speaker}]
+        assert_src(client.post(MEETING + "/end"), "")
+    history = [text for role, text in model.prompts[-1][0] if role == "assistant"]
+    assert history == [DIRECT + first_text, WAIT, WAIT, DIRECT + marked]
+
+
+def test_removed_standalone_period_is_a_wait_with_its_original_audio():
+    model = Capture([DIRECT + "I know", DIRECT + ".", WAIT, DIRECT + "why", WAIT])
+    with client_for(model, packet_period_to_comma=True) as client:
+        assert_src(client.post(MEETING + "/chunks", json=packet(value=.1)), "I know")
+        assert_src(client.post(MEETING + "/chunks", json=packet(2 * SAMPLE_RATE, value=.2, tail_silence=.05)), "")
+        result = client.get(MEETING + "/result").json()
+        assert result["action"] == "WAIT"
+        assert [t["text"] for t in result["turns"]] == [WAIT, WAIT]
+        assert result["turns"][0]["transcript_parts"] == []
+        assert_src(client.post(MEETING + "/chunks", json=packet(value=.3)), " why")
+        assert_src(client.post(MEETING + "/end"), "")
+    messages, audios = model.prompts[3]
+    assert [text for role, text in messages if role == "assistant"] == [DIRECT + "I know", WAIT, WAIT]
+    assert len(audios) == 4 and np.all(audios[1] == np.float32(.2))
+
+
+def test_standalone_dot_cannot_borrow_language_from_an_earlier_speaker():
+    model = Capture([DIRECT + "We know ", DIRECT + SPK_CHANGE + "Paris", DIRECT + ".", WAIT])
+    with client_for(model, packet_period_to_comma=True) as client:
+        assert_src(client.post(MEETING + "/chunks", json=packet(2 * SAMPLE_RATE)), "We know Paris")
+        assert_src(client.post(MEETING + "/chunks", json=packet(tail_silence=.05)), ",")
+        assert_src(client.post(MEETING + "/end"), "")
+
+
+def test_english_comma_followed_by_a_word_gets_one_separator():
+    model = Capture([DIRECT + "I know.", DIRECT + "what happened", WAIT])
+    with client_for(model, packet_period_to_comma=True) as client:
+        assert_src(client.post(MEETING + "/chunks", json=packet(tail_silence=.4)), "I know,")
+        assert_src(client.post(MEETING + "/chunks", json=packet()), " what happened")
+        assert_src(client.post(MEETING + "/end"), "")
+    assert model.prompts[-1][0][-2] == ("assistant", DIRECT + " what happened")
+
+
+def test_partial_packet_applies_its_measurement_before_eos():
+    model = Capture([DIRECT + "我知道。", WAIT])
+    with client_for(model, packet_period_to_comma=True) as client:
+        assert_src(client.post(MEETING + "/chunks", json=packet(8000, tail_silence=.09)), "")
+        assert_src(client.post(MEETING + "/end"), "我知道")
+    assert model.prompts[-1][0][-2] == ("assistant", DIRECT + "我知道")
+
+
+@pytest.mark.parametrize("ms,expected", [(99.99, "知道"), (100, "知道，"), (399.99, "知道，"), (400, "知道。")])
+def test_custom_remove_and_comma_thresholds(ms, expected):
+    with client_for(Capture([DIRECT + "知道。"]), packet_period_to_comma=True,
+                    packet_period_threshold_ms=400, packet_period_remove_threshold_ms=100) as client:
+        health = client.get("/health").json()
+        assert health["packet_period_threshold_ms"] == 400 and health["packet_period_remove_threshold_ms"] == 100
+        assert_src(client.post(MEETING + "/chunks", json=packet(silence_ms=ms)), expected)
+
+
+@pytest.mark.parametrize("invalid", [-1, 451, float("inf"), float("nan"), True])
+def test_invalid_remove_threshold_is_rejected(invalid):
+    with pytest.raises(ValueError, match="packet_period_remove_threshold_ms"):
+        client_for(Capture([]), packet_period_remove_threshold_ms=invalid)

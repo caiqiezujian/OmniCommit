@@ -5,7 +5,7 @@ import sys
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from fourth_asr.packet_punctuation import replace_terminal_period
+from fourth_asr.packet_punctuation import edit_packet_period, replace_terminal_period
 from fourth_asr.protocol import SPK_CHANGE
 
 
@@ -63,3 +63,40 @@ def test_terminal_period(before, after):
 ])
 def test_streamed_tail(previous, marked, expected):
     assert replace_terminal_period(marked, previous) == expected
+
+
+@pytest.mark.parametrize("previous,marked,ms,expected", [
+    ("", "我知道。", 100, "我知道"),
+    ("", "对。", 100, "对"),
+    ("", "是的。", 100, "是的"),
+    ("", "Got it.", 100, "Got it"),
+    ("", "Wir haben also Zeit.", 400, "Wir haben also Zeit."),
+    ("", "请打开 API。", 100, "请打开 API"),
+    ("", "“我知道。” ", 100, "“我知道” "),
+    ("", "你好。I know.", 449, "你好。I know,"),
+    ("", "I agree." + SPK_CHANGE + "我知道。", 80, "I agree." + SPK_CHANGE + "我知道"),
+    ("All done", ".", 80, ""),
+    ("我知道", "。", 80, ""),
+    ("请确认", "方案。", 80, "方案"),
+    ("We discussed the ", "schedule.", 80, "schedule"),
+    ("Das ist gut.", "I know.", 80, "I know"),
+    ("", "Ask Dr.", 80, "Ask Dr."),
+    ("", "I paid 3.", 80, "I paid 3."),
+    ("", "The U.S.", 80, "The U.S."),
+    ("", "Thanks...", 80, "Thanks..."),
+    ("", "Visit https://example.com.", 80, "Visit https://example.com."),
+    ("", "I know.", 450, "I know."),
+    ("", "Bonjour à tous.", 100, "Bonjour à tous,"),
+    ("Thanks.", "Guten Morgen.", 360, "Guten Morgen."),
+    ("", "Ich bin am Bahnhof.", 120, "Ich bin am Bahnhof,"),
+    ("", "Je suis sure.", 360, "Je suis sure."),
+    ("I know", SPK_CHANGE + "Paris.", 360, SPK_CHANGE + "Paris."),
+    ("", "東京。", 400, "東京。"),
+    ("", "今日は東京。", 100, "今日は東京、"),
+    ("", "알겠습니다.", 400, "알겠습니다."),
+    ("", "Спасибо.", 100, "Спасибо,"),
+    ("", "تمام۔", 100, "تمام،"),
+])
+def test_eligible_language_and_period_at_two_thresholds(previous, marked, ms, expected):
+    edit = edit_packet_period(marked, previous, ms, 450, 150)
+    assert (edit.text if edit else marked) == expected

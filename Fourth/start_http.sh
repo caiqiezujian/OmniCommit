@@ -13,6 +13,9 @@ if (( $# == 0 )); then
   if [[ -v PACKET_PERIOD_THRESHOLD_MS ]]; then
     HTTP_ARGS+=(--packet-period-threshold-ms "$PACKET_PERIOD_THRESHOLD_MS")
   fi
+  if [[ -v PACKET_PERIOD_REMOVE_THRESHOLD_MS ]]; then
+    HTTP_ARGS+=(--packet-period-remove-threshold-ms "$PACKET_PERIOD_REMOVE_THRESHOLD_MS")
+  fi
   if [[ -v HTTP_EVENT_LOG_MODE ]]; then
     HTTP_ARGS+=(--event-log-mode "$HTTP_EVENT_LOG_MODE")
   fi

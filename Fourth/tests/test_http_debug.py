@@ -185,7 +185,9 @@ def test_busy_payload_is_rejected_before_ingestion(tmp_path):
 
 
 @pytest.mark.parametrize("detailed", [False, True])
-def test_live_packet_journal_tracks_turns_conflict_and_exact_returned_src(tmp_path, detailed, monkeypatch):
+@pytest.mark.parametrize("silence,expected,note", [(0.1, "我觉得可以", "删除句号"), (0.2, "我觉得可以，", "句号改逗号")])
+def test_live_packet_journal_tracks_turns_conflict_and_exact_returned_src(tmp_path, detailed, monkeypatch,
+                                                                         silence, expected, note):
     entered, release = threading.Event(), threading.Event()
 
     class GatedBackend(ReplayBackend):
@@ -207,13 +209,13 @@ def test_live_packet_journal_tracks_turns_conflict_and_exact_returned_src(tmp_pa
     pcm = np.zeros(3 * 16000, dtype="f4")
     with TestClient(api) as client, ThreadPoolExecutor(max_workers=1) as pool:
         assert client.get("/health").json()["event_log_mode"] == ("detailed" if detailed else "readable")
-        pending = pool.submit(post_samples, client, pcm, tail_silence=0.2)
+        pending = pool.submit(post_samples, client, pcm, tail_silence=silence)
         try:
             assert entered.wait(3)
             path, = (tmp_path / "replay-001").glob("*/events.jsonl")
             rows = read_events(path)
             assert [r["事件"] for r in rows] == ["收包", "逐轮", "逐轮"]
-            assert rows[0]["录音区间_s"] == [0, 3] and rows[0]["上报静音_ms"] == 200
+            assert rows[0]["录音区间_s"] == [0, 3] and rows[0]["上报静音_ms"] == silence * 1000
             assert rows[2]["模型正文"] == "可以。" and rows[2]["新增音频_s"] == [1, 2]
             busy = post_samples(client, pcm)
             assert busy.status_code == 409
@@ -223,7 +225,7 @@ def test_live_packet_journal_tracks_turns_conflict_and_exact_returned_src(tmp_pa
         finally:
             release.set()
         reply = pending.result(timeout=3)
-        assert reply.json() == {"src": "我觉得可以，"}
+        assert reply.json() == {"src": expected}
         assert client.post(URL + "/end").json() == {"src": ""}
         assert client.post(URL + "/end").status_code == 409
 
@@ -237,7 +239,11 @@ def test_live_packet_journal_tracks_turns_conflict_and_exact_returned_src(tmp_pa
     assert "模型正文" not in turns[-1]
     response, = [r for r in rows if r["事件"] == "返回" and r.get("包") == 1]
     assert response["src"] == reply.json()["src"] and response["请求号"] == reply.headers["X-Request-ID"]
-    assert "第2轮句号改逗号" in response["标点处理"]
+    assert "第2轮" + note in response["标点处理"]
+    if detailed:
+        event = "packet_period_removed" if silence < .15 else "packet_period_to_comma"
+        edit, = [r for r in read_events(path.with_name("trace.jsonl")) if r["event"] == event]
+        assert edit["turn"] == 2 and edit["text"] == DIRECT + expected.removeprefix("我觉得")
     assert [r["事件"] for r in rows[-4:]] == ["结束请求", "收尾轮", "返回", "拒绝"]
     assert rows[-1]["原因"] == "会议已结束"
 

@@ -228,3 +228,20 @@ def test_period_only_turn_remains_a_commit_when_changed_to_comma():
 
     session.step(end_of_audio=True)
     assert backend.history[1:] == ["<audio>", first, "<audio>", DIRECT + "，", "<end_of_audio>"]
+
+
+def test_removing_standalone_period_restores_text_watermark_and_keeps_audio():
+    session, backend = make_session(
+        [DIRECT + "我知道", DIRECT + "。", WAIT], [], protocol="speaker", enable_recovery=False,
+        context_policy="rolling", rolling_tail_seconds=.2,
+    )
+    first = session.step(block(.1))
+    before = session.packet_text_state()
+    result = session.step(block(.2))
+    assert session.apply_packet_period(result, *before, silence_ms=80, comma_ms=450, remove_ms=150)
+    assert result["action"] == "WAIT" and result["transcript_parts"] == []
+    assert session.packet_text_state() == before
+    assert session.last_text_end == first["end_seconds"] and session.heard_seconds == result["end_seconds"]
+    assert [turn.reply for turn in session.history] == [DIRECT + "我知道", WAIT]
+    session.step(end_of_audio=True)
+    assert backend.history[1:] == ["<audio>", DIRECT + "我知道", "<audio>", WAIT, "<end_of_audio>"]

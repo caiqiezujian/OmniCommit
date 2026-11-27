@@ -86,7 +86,7 @@ def turn_fields(result):
     return row
 
 
-def response_fields(code, body, threshold_ms):
+def response_fields(code, body):
     row = {"HTTP": code}
     if code == 200:
         row["src"] = body["text"]
@@ -99,8 +99,10 @@ def response_fields(code, body, threshold_ms):
     if body.get("gaps"):
         row["解码缺口轮"] = [gap["turn"] for gap in body["gaps"]]
     for turn in body["turns"]:
-        if turn.get("terminal_period_to_comma"):
-            row["标点处理"] = f"第{turn['turn']}轮句号改逗号，{body['silence_ms']} ms < {threshold_ms} ms"
+        edit = turn.get("packet_period_edit")
+        if edit:
+            action = "删除句号" if edit["operation"] == "remove" else "句号改逗号"
+            row["标点处理"] = f"第{turn['turn']}轮{action}，{body['silence_ms']} ms < {edit['threshold_ms']} ms"
     return row
 
 

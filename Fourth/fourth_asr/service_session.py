@@ -9,9 +9,15 @@ import time
 import numpy as np
 
 from .runtime.streaming import StreamOptions, StreamSession
-from .packet_punctuation import replace_terminal_period
+from .packet_punctuation import DEFAULT_PACKET_PERIOD_THRESHOLD_MS, edit_packet_period, join_after_english_period
 from .protocol import SPK_CHANGE, WAIT, get_protocol
 from .recovery import VoicedWaitRecovery
+
+
+# Fourth disallows literal angle brackets in transcript text. Keep a speaker
+# boundary in one character so the 2048-character recovery tail retains its
+# original length and verbatim whitespace, including model-emitted newlines.
+_SPEAKER_BOUNDARY = ">"
 
 
 @dataclass
@@ -43,7 +49,8 @@ class FourthStreamSession(StreamSession):
         super().__init__(backend, options or FourthStreamOptions())
         self.protocol = get_protocol(self.options.protocol)
         self.recovery = None
-        self.committed_tail = ""
+        self._text_tail = ""
+        self.join_english_word = False
         self.quiet_waits = set()
         self.quiet_evicted_seconds = 0.
         self.silence_detector = silence_detector
@@ -54,6 +61,13 @@ class FourthStreamSession(StreamSession):
 
     def _context_system_prompt(self):
         return self.protocol.system_prompt(self.options.number_format)
+
+    @property
+    def committed_tail(self):
+        return self._text_tail.replace(_SPEAKER_BOUNDARY, " ")
+
+    def packet_text_state(self):
+        return self._text_tail, self.last_text_end, self.inferred_commit_seconds
 
     def _model_reply(self, reply, end_of_audio):
         text = self.protocol.parse_reply(reply)
@@ -119,7 +133,8 @@ class FourthStreamSession(StreamSession):
             result["realtime_factor"] = None if end_of_audio else elapsed / (result["end_seconds"] - result["start_seconds"])
         if result.get("truncation", {}).get("status") == "gap":
             self.quiet_waits.clear()
-            self.committed_tail = ""
+            self._text_tail = ""
+            self.join_english_word = False
             if self.recovery is not None:
                 self.recovery.on_gap()
         elif skipped:
@@ -134,31 +149,62 @@ class FourthStreamSession(StreamSession):
                     result["end_seconds"] - result["start_seconds"])
         self.last_gated_turn = self.history[-1] if skipped else None
         if result["action"] == "DIRECT":
-            # A speaker boundary separates words for recovery overlap detection.
             marked = result["text"].removeprefix(self.protocol.prefix)
-            self.committed_tail = (self.committed_tail + marked.replace(SPK_CHANGE, " "))[-2048:]
+            if self.join_english_word:
+                joined = join_after_english_period(self._text_tail, marked)
+                if joined != marked:
+                    self._rewrite_turn(result, joined)
+                marked = joined
+                self.join_english_word = False
+            # Keep speaker boundaries for punctuation evidence. Recovery reads
+            # the same bounded text with ordinary word separators.
+            self._text_tail = (self._text_tail + marked.replace(SPK_CHANGE, _SPEAKER_BOUNDARY))[-2048:]
             self.last_text_end = result["end_seconds"]
         if self.quiet_evicted_seconds:
             result["vad_quiet_evicted_seconds"] = self.quiet_evicted_seconds
         return result
 
-    def apply_packet_comma(self, result, previous_text):
-        """Edit the packet's last commit before the next request builds its prompt."""
-        marked = self.protocol.parse_reply(result["text"])
-        corrected = replace_terminal_period(marked, previous_text)
-        if marked == corrected:
-            return False
-        reply = self.protocol.format_text(corrected)
-        result.update(text=reply, display_text=corrected.replace(SPK_CHANGE, ""),
-                      terminal_period_to_comma=True)
-        # Preserve each speaker-change flag computed at the original commit.
-        result["transcript_parts"][-1]["text"] = corrected.rsplit(SPK_CHANGE, 1)[-1]
-        self.committed_tail = (previous_text + corrected.replace(SPK_CHANGE, " "))[-2048:]
+    def _rewrite_turn(self, result, marked):
+        reply = self.protocol.format_text(marked) if marked.strip() else WAIT
+        parsed = self._model_reply(reply, end_of_audio=False)
+        for old, new in zip(result["transcript_parts"], parsed["transcript_parts"]):
+            new["speaker_change"] = old["speaker_change"]
+        result.update(parsed)
+        # Change the text of the original audio/assistant pair in place. A
+        # rotated-out turn stays evicted. vLLM tokenizes this history afresh.
         for turn in reversed(self.history):
             if turn.start == result["start_seconds"]:
                 turn.reply = reply
                 break
-        return True
+
+    def apply_packet_period(self, result, previous_text, previous_end, previous_inferred, *,
+                            silence_ms, comma_ms, remove_ms):
+        marked = self.protocol.parse_reply(result["text"])
+        previous_speaker_text = previous_text.rsplit(_SPEAKER_BOUNDARY, 1)[-1]
+        edit = edit_packet_period(marked, previous_speaker_text, silence_ms, comma_ms, remove_ms)
+        if edit is None:
+            return None
+        self._rewrite_turn(result, edit.text)
+        if result["action"] == "WAIT":
+            # Only a separately emitted period disappeared. Keep its audio
+            # and the last real text watermark, without creating empty DIRECT.
+            self._text_tail = previous_text
+            self.last_text_end = previous_end
+            self.inferred_commit_seconds = previous_inferred
+            if "inferred_commit_seconds" in result:
+                result["inferred_commit_seconds"] = previous_inferred
+        else:
+            self._text_tail = (previous_text + edit.text.replace(SPK_CHANGE, _SPEAKER_BOUNDARY))[-2048:]
+        self.join_english_word = edit.language == "en"
+        result["packet_period_edit"] = {"operation": edit.operation, "language": edit.language,
+                                        "threshold_ms": edit.threshold_ms}
+        if edit.operation == "comma":
+            result["terminal_period_to_comma"] = True  # Existing /result consumers.
+        return edit
+
+    def apply_packet_comma(self, result, previous_text):
+        return self.apply_packet_period(result, previous_text, self.last_text_end, self.inferred_commit_seconds,
+                                        silence_ms=0, comma_ms=DEFAULT_PACKET_PERIOD_THRESHOLD_MS, remove_ms=0) is not None
 
     def _pending_seconds(self, commit):
         if self.options.context_policy == "verified":

@@ -1,4 +1,6 @@
-"""Choose the comma for an ordinary sentence-final period at an HTTP packet boundary."""
+"""Apply caller-reported silence to the last sentence period of one HTTP packet."""
+from dataclasses import dataclass
+import math
 import re
 import unicodedata
 
@@ -7,7 +9,9 @@ from .protocol import SPK_CHANGE
 from .semantic_preparation import TRAILING
 
 
-DEFAULT_PACKET_PERIOD_THRESHOLD_MS = 300
+DEFAULT_PACKET_PERIOD_THRESHOLD_MS = 450
+DEFAULT_PACKET_PERIOD_REMOVE_THRESHOLD_MS = 150
+LEGACY_PACKET_PERIOD_THRESHOLD_MS = 300
 PERIODS = ".。．۔"
 CLOSERS = TRAILING + "〉》〕〗〙〛"
 CLAUSE_BOUNDARIES = frozenset(".。．۔!?！？؟;；:：,，、،\n")
@@ -18,6 +22,69 @@ URL_TAIL = re.compile(
 # Additional forms used in the supported languages beyond simple_period_offset's list.
 SHORT_FORM = re.compile(r"\b(?:т\.\s*[едп]|напр|др|г|гг|ул|рис|стр|z\.\s*b|d\.\s*h|"
                         r"hr|frl|usw|p\.\s*ex|avv|dott|dra|drs|pág)\.$", re.IGNORECASE)
+
+# Fourth has no language tags at inference. Use positive evidence in the final
+# clause. Shared names, isolated Latin initials and kanji alone can be ambiguous.
+CLAUSE_BREAK = re.compile("[" + re.escape("".join(sorted(CLAUSE_BOUNDARIES))) + "]")
+ZH_CUE = re.compile(r"[你您她它这這们們吗嗎呢吧么麼咱谁沒没说听还给请谢让该预测试问进议项认过顺对嗯]"
+                    r"|我[想是会會]|知道|收到|明白了|可以|好[的了]|謝謝|開始了|结束|確認了"
+                    r"|今天|明天|早上好|现在|如果|就是|然后|因为|所以|已经|已經|是的|行了|對的|沒錯")
+WORD = re.compile(r"[^\W\d_]+(?:['’][^\W\d_]+)*")
+EN_CUES = frozenset("""
+    the this that these those we you they she your our their my his
+    have has been would should could with from there here what when where
+    which who why how because already always really
+    know think understand agree yes yeah nope right exactly hello thanks thank good morning
+    afternoon evening great done ready received please tomorrow
+    meeting approved finished see let's i'm we're
+    you're they're it's that's i'll we'll don't can't doesn't isn't
+""".split())
+EN_PHRASE = re.compile(r"\b(?:i (?:am|can|will|see|like|need|want)|it (?:is|was|works)|got it"
+                       r"|of course|for sure|all right)\b", re.I)
+
+
+@dataclass(frozen=True)
+class PeriodEdit:
+    text: str
+    operation: str
+    language: str
+    threshold_ms: float
+
+
+def resolve_remove_threshold(upper, lower):
+    if type(upper) not in (int, float) or not math.isfinite(upper) or upper < 0:
+        raise ValueError("packet_period_threshold_ms must be nonnegative and finite")
+    if lower is None:
+        return min(DEFAULT_PACKET_PERIOD_REMOVE_THRESHOLD_MS, upper)
+    if type(lower) not in (int, float) or not math.isfinite(lower) or not 0 <= lower <= upper:
+        raise ValueError("packet_period_remove_threshold_ms must be finite and between 0 and packet_period_threshold_ms")
+    return lower
+
+
+def _english_ending(clause):
+    start = len(clause)
+    while start and (not clause[start-1].isalpha() or "LATIN" in unicodedata.name(clause[start-1], "")):
+        start -= 1
+    latin = clause[start:].casefold().replace("’", "'")
+    words = WORD.findall(latin)
+    return bool(EN_CUES.intersection(words[-8:]) or EN_PHRASE.search(latin) or latin.strip() == "sure")
+
+
+def _tail_language(stem, local_stem, comma):
+    # A separately emitted dot or short continuation can finish an earlier
+    # phrase, but evidence must not cross a sentence or a speaker boundary.
+    clause = CLAUSE_BREAK.split(stem[-160:])[-1]
+    if comma == "，":
+        return "zh" if ZH_CUE.search(clause) else "other"
+    if comma != ",":
+        return "other"
+    local = CLAUSE_BREAK.split(local_stem[-160:])[-1]
+    if _english_ending(local) or (len(WORD.findall(local)) <= 1 and _english_ending(clause)):
+        return "en"
+    # E.g. Chinese carrier text followed by an acronym and an ASCII stop.
+    if ZH_CUE.search(clause) and re.search(r"[A-Z][A-Z0-9-]+$", clause):
+        return "zh"
+    return "other"
 
 
 def _comma_for(stem, period):
@@ -52,29 +119,61 @@ def _comma_for(stem, period):
     return ","
 
 
-def replace_terminal_period(marked, previous=""):
-    """Replace only the final speaker's final period, preserving all other characters."""
+def edit_packet_period(marked, previous, silence_ms, comma_ms, remove_ms):
+    """Return one packet-final edit, or None when the caller should keep the text."""
+    if silence_ms >= comma_ms:
+        return None
     _, change, last = marked.rpartition(SPK_CHANGE)
     end = len(last)
     while end and (last[end - 1].isspace() or last[end - 1] in CLOSERS):
         end -= 1
     if not end or last[end - 1] not in PERIODS:
-        return marked
+        return None
 
     local = last[:end]
-    context = local if change else previous.rpartition(SPK_CHANGE)[2] + local
+    context = local if change else previous.rpartition(SPK_CHANGE)[2].rsplit("\n", 1)[-1] + local
     period = local[-1]
     stem = context[:-1].rstrip()
     if not stem or stem[-1] in PERIODS + "…!?！？؟,，、،;；:：":
-        return marked
+        return None
     if period == ".":
         # A digit + dot at a streaming boundary may continue as a decimal or an ordinal.
         if stem[-1].isdigit() or SHORT_FORM.search(context) or URL_TAIL.search(context):
-            return marked
+            return None
         # Check both strings: older model turns sometimes omit the inter-word space.
         for text in (context, local):
             if len(text) > 1 and (text[-2].isalpha() or unicodedata.category(text[-2]).startswith("M")):
                 if simple_period_offset(text) is None or SHORT_FORM.search(text):
-                    return marked
+                    return None
     offset = len(marked) - len(last) + end - 1
-    return marked[:offset] + _comma_for(stem, period) + marked[offset + 1:]
+    comma = _comma_for(stem, period)
+    language = _tail_language(stem, local[:-1], comma)
+    if language == "zh":
+        comma = "，"
+    if language in ("zh", "en") and silence_ms < remove_ms:
+        return PeriodEdit(marked[:offset] + marked[offset + 1:], "remove", language, remove_ms)
+    threshold = min(comma_ms, LEGACY_PACKET_PERIOD_THRESHOLD_MS) if language == "other" else comma_ms
+    if silence_ms >= threshold:
+        return None
+    return PeriodEdit(marked[:offset] + comma + marked[offset + 1:], "comma", language, threshold)
+
+
+def replace_terminal_period(marked, previous=""):
+    """Unconditional comma-only compatibility entry point."""
+    edit = edit_packet_period(marked, previous, 0, DEFAULT_PACKET_PERIOD_THRESHOLD_MS, 0)
+    return edit.text if edit else marked
+
+
+def join_after_english_period(previous, marked):
+    """Resolve the word separator when the next visible text is available."""
+    change = SPK_CHANGE if marked.startswith(SPK_CHANGE) else ""
+    body = marked[len(change):]
+    right = body.lstrip(" ")
+    left = previous.rstrip(" ").rstrip(CLOSERS).removesuffix(",").rstrip(CLOSERS)
+    if not left or not right or right.casefold().startswith(("n't", "n’t")):
+        return marked
+    for char in (left[-1], right[0]):
+        if not (char.isdecimal() or char.isalpha() and "LATIN" in unicodedata.name(char, "")):
+            return marked
+    separator = "" if previous.endswith(" ") else " "
+    return change + separator + right

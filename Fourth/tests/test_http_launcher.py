@@ -12,14 +12,14 @@ from unittest.mock import Mock
 import pytest
 
 
-@pytest.mark.parametrize("protocol, extra, expected_budgets, threshold_ms", [
-    ("speaker", [], (512, 4352), 300),
+@pytest.mark.parametrize("protocol, extra, expected_budgets, threshold_ms, remove_ms", [
+    ("speaker", [], (512, 4352), 450, 150),
     ("explicit", ["--max-new-tokens", "768", "--max-context-tokens", "4608", "--response-timeout-ms", "900",
                   "--packet-period-to-comma", "--packet-period-threshold-ms", "500",
-                  "--event-log-mode", "detailed"], (768, 4608), 500),
+                  "--packet-period-remove-threshold-ms", "100", "--event-log-mode", "detailed"], (768, 4608), 500, 100),
 ])
 def test_http_launcher_uses_trained_protocol_and_sizes_model_for_batching(
-        tmp_path, monkeypatch, protocol, extra, expected_budgets, threshold_ms):
+        tmp_path, monkeypatch, protocol, extra, expected_budgets, threshold_ms, remove_ms):
     uvicorn = pytest.importorskip("uvicorn")
     pytest.importorskip("fastapi")
     path = Path(__file__).resolve().parents[1] / "tools" / "serve_http.py"
@@ -51,6 +51,7 @@ def test_http_launcher_uses_trained_protocol_and_sizes_model_for_batching(
         assert limits["max_in_flight"] == 8 and "response_timeout_ms" not in limits
         assert limits["packet_period_to_comma"] == ("--packet-period-to-comma" in extra)
         assert limits["packet_period_threshold_ms"] == threshold_ms
+        assert limits["packet_period_remove_threshold_ms"] == remove_ms
         assert limits["event_log_mode"] == ("detailed" if "--event-log-mode" in extra else "readable")
         adapter = factory()
         try:
@@ -118,7 +119,8 @@ def test_no_arguments_load_the_shipped_http_config(shell_launcher):
     assert args[args.index("--chunk-ms") + 1] == "1000"
     assert args[args.index("--debug-dir") + 1] == "logs/http-debug"
     assert "--packet-period-to-comma" not in args
-    assert args[args.index("--packet-period-threshold-ms") + 1] == "300"
+    assert args[args.index("--packet-period-threshold-ms") + 1] == "450"
+    assert args[args.index("--packet-period-remove-threshold-ms") + 1] == "150"
     assert args[args.index("--event-log-mode") + 1] == "readable"
 
 
@@ -126,12 +128,14 @@ def test_enabling_packet_punctuation_in_the_shipped_http_config(shell_launcher):
     fourth, recipe, run = shell_launcher
     config = (fourth / "http_config.sh").read_bytes()
     config = config.replace(b"PACKET_PERIOD_TO_COMMA=false", b"PACKET_PERIOD_TO_COMMA=true")
-    config = config.replace(b"PACKET_PERIOD_THRESHOLD_MS=300", b"PACKET_PERIOD_THRESHOLD_MS=500")
+    config = config.replace(b"PACKET_PERIOD_THRESHOLD_MS=450", b"PACKET_PERIOD_THRESHOLD_MS=500")
+    config = config.replace(b"PACKET_PERIOD_REMOVE_THRESHOLD_MS=150", b"PACKET_PERIOD_REMOVE_THRESHOLD_MS=100")
     config = config.replace(b"HTTP_EVENT_LOG_MODE=readable", b"HTTP_EVENT_LOG_MODE=detailed")
     (recipe / "http_config.sh").write_bytes(config)
     _, _, args = run()
     assert args.count("--packet-period-to-comma") == 1
     assert args[args.index("--packet-period-threshold-ms") + 1] == "500"
+    assert args[args.index("--packet-period-remove-threshold-ms") + 1] == "100"
     assert args[args.index("--event-log-mode") + 1] == "detailed"
 
 
