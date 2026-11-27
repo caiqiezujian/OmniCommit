@@ -50,7 +50,7 @@ def generate(folder, output_dir, count, seed, chunk_ms, number_format):
                   for name in files if Path(name).suffix.lower() in AUDIO_SUFFIXES]
     candidates.sort(key=Path.as_posix)
     random.Random(seed).shuffle(candidates)
-    print(f"[silence] {len(candidates)} candidate files | target {count} | seed {seed}", flush=True)
+    print(f"[silence] {len(candidates)} candidate files under {folder} | limit {count} | seed {seed}", flush=True)
 
     seen = set()
     kept = rejected = audio_turns = 0
@@ -82,11 +82,12 @@ def generate(folder, output_dir, count, seed, chunk_ms, number_format):
                 audio_turns += len(row["audios"])
                 seconds += frames / rate
                 if kept % 500 == 0:
-                    print(f"[silence] {kept}/{count} recordings", flush=True)
+                    print(f"[silence] {kept} recordings prepared", flush=True)
                 if kept == count:
                     break
-        if kept < count:
-            raise ValueError(f"Only {kept} usable distinct recordings for --count {count} ({rejected} invalid)")
+        if kept == 0:
+            raise ValueError(f"No usable audio recordings under {folder} "
+                             f"({len(candidates)} candidate files, {rejected} invalid)")
 
         # Match build_sft.py's two token files and publish the complete dataset last.
         inventory = ("\n".join(protocol.tokens) + "\n").encode("utf-8")
@@ -108,7 +109,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("audio_dir", type=Path, help="Directory of known non-speech audio, searched recursively")
     parser.add_argument("--output-dir", type=Path, required=True, help="Directory for train.<chunk>ms.jsonl and its token files")
-    parser.add_argument("--count", type=int, default=3000)
+    parser.add_argument("--count", type=int, default=3000,
+                        help="Use all available recordings up to this limit (default 3000)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--chunk-ms", type=int, default=1000)
     parser.add_argument("--number-format", choices=("normalized", "verbatim"), default="normalized")

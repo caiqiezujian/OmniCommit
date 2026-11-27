@@ -4,9 +4,9 @@ Fourth 从带语种、说话人和逐段时间戳的原始 JSONL 构建流式 SF
 
 ## 1. 从原始标注生成训练集
 
-### 从静音目录抽取 3000 条全 WAIT 样本
+### 从静音目录生成最多 3000 条全 WAIT 样本
 
-把已确认全程无人说话的音频放进一个目录，可以包含子目录。脚本按文件抽样，逐个检查能否解码，以真实帧数构建 Fourth 的虚拟音频引用。每条录音占一行，默认每 1000 ms 一轮，音频轮和最后的 `<end_of_audio>` 均监督 `<|WAIT|>`。例如 2.35 秒录音有 3 个音频轮和 1 个结束轮。尾块覆盖最后 0.35 秒，训练读取时按既有规则补齐输入。采样假设文件夹已按无人声筛选，生成时无需运行 VAD 或 ASR。
+传入已确认全程无人说话的音频根目录，脚本会递归查找各层子目录中的 WAV 等音频文件。每条录音占一行，按可解码的真实帧数构建 Fourth 的虚拟音频引用，默认每 1000 ms 一轮。音频轮和最后的 `<end_of_audio>` 均监督 `<|WAIT|>`。例如 2.35 秒录音有 3 个音频轮和 1 个结束轮。尾块覆盖最后 0.35 秒，训练读取时按既有规则补齐输入。采样假设文件夹已按无人声筛选，生成时无需运行 VAD 或 ASR。
 
 ~~~bash
 cd /data/yb/Code/OmniCommit
@@ -15,7 +15,7 @@ python Fourth/Data-Scripts/build_silence_sft.py /data/silence_wavs \
 python Fourth/SFT-Scripts/check_sft.py datasets/silence_3000/train.1000ms.jsonl --decode
 ~~~
 
-将 `/data/silence_wavs` 换成训练容器可持续读取的真实目录。默认 `--count 3000 --seed 42 --chunk-ms 1000 --number-format normalized`。脚本从不同源文件中抽取，遇到坏音频会继续找下一条。可用数量不足时报告实际数量，只有抽满才发布 JSONL。同一批文件和种子可以复现相同的抽样。
+将 `/data/silence_wavs` 换成训练容器可持续读取的真实目录。默认 `--count 3000 --seed 42 --chunk-ms 1000 --number-format normalized`。`--count` 是有效录音上限。有效录音不超过 3000 条时全部写入，超过时按固定种子抽取 3000 条。脚本跳过损坏、零时长的文件，同一源文件的多条链接只计一次。如果可用录音为 0，脚本会报错。
 
 输出目录包含 `train.1000ms.jsonl`、`token.txt` 和 `train.1000ms.jsonl.tokens.txt`。两个 token 文件都沿用 Fourth 的完整协议，静音样本的每个 assistant 目标只有 `<|WAIT|>`。`recast.events` 中的 `silence_only` 供数据校验使用。按下例合并到现有 1 秒语音训练集，沿用原 SFT 命令。
 

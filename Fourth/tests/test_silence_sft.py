@@ -71,16 +71,20 @@ def test_whole_recording_all_wait_and_mixed_training_preflight(tmp_path):
         validate_row(row)
 
 
-def test_sample_without_replacement_is_reproducible_and_never_publishes_a_short_set(tmp_path):
+def test_recursive_sample_keeps_all_or_a_reproducible_subset(tmp_path):
     folder = tmp_path / "sources"
-    files = [wav(folder / f"part{i}.wav", 16032 + i) for i in range(5)]
+    files = [wav(folder / f"group{i}" / "day" / "room" / "part.WAV", 16032 + i) for i in range(5)]
     os.link(files[0], folder / "alias.wav")
     (folder / "broken.wav").write_bytes(b"not audio")
     wav(folder / "empty.wav", 0)
-    output_dir = tmp_path / "negative"
-    with pytest.raises(ValueError, match="Only 5 usable distinct recordings"):
-        generate(folder, output_dir, 6, 7, 800, "verbatim")
-    assert list(output_dir.iterdir()) == []
+
+    full = generate(folder, tmp_path / "all", 3000, 7, 1000, "normalized")
+    all_rows = list(map(json.loads, full.read_text("utf-8").splitlines()))
+    assert len(all_rows) == len(files)
+    assert {os.stat(row["recast"]["source_audio"]).st_ino for row in all_rows} == {p.stat().st_ino for p in files}
+    assert check_sft([str(full), "--decode"]) == 0
+
+    output_dir = tmp_path / "subset"
     out = generate(folder, output_dir, 3, 7, 800, "verbatim")
     repeat = generate(folder, tmp_path / "repeat", 3, 7, 800, "verbatim")
     assert out.name == "train.800ms.jsonl"
@@ -90,3 +94,15 @@ def test_sample_without_replacement_is_reproducible_and_never_publishes_a_short_
     assert all(len(r["audios"]) == 2 and r["recast"]["chunk_ms"] == 800 for r in rows)
     with pytest.raises(FileExistsError):
         generate(folder, output_dir, 1, 42, 800, "normalized")
+
+
+@pytest.mark.parametrize("with_bad_file", [False, True])
+def test_no_usable_recordings_reports_error_and_publishes_no_dataset(tmp_path, with_bad_file):
+    folder = tmp_path / "sources"
+    folder.mkdir()
+    if with_bad_file:
+        (folder / "broken.wav").write_bytes(b"not audio")
+    output_dir = tmp_path / "output"
+    with pytest.raises(ValueError, match="No usable audio recordings"):
+        generate(folder, output_dir, 3000, 42, 1000, "normalized")
+    assert list(output_dir.iterdir()) == []
