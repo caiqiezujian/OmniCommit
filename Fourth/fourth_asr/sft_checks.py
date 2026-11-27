@@ -58,9 +58,9 @@ def _check_recast(meta, path, turns):
     elif by_kind["audio_end"] != {turns}:
         raise ValueError("recast.events must contain exactly one audio_end on the last audio turn")
     silence_only = bool(by_kind["silence_only"])
-    if silence_only and (by_kind["silence_only"] != {1} or len(events) != 2 or events[-1]["kind"] != "audio_end"
-                         or meta["merged_units"] != 0):
-        raise ValueError("silence_only requires a first-turn marker, zero merges and only the final audio_end")
+    if silence_only and (by_kind["silence_only"] != {1} or len(events) != 2
+                         or events[0]["kind"] != "silence_only" or meta["merged_units"] != 0):
+        raise ValueError("silence_only requires a first-turn marker, zero merges and a single final end event")
     return open_end, by_kind["speaker_change"], silence_only
 
 
@@ -109,8 +109,6 @@ def validate_row(row, token_inventory=None, decode=False):
             text = profile.parse_reply(reply)
             if silence_only and reply != WAIT:
                 raise ValueError("silence_only recordings require standalone WAIT on every audio turn")
-            if open_end and i == len(refs) - 1 and not (text and reply.startswith(DIRECT)):
-                raise ValueError("annotation_end must end with a DIRECT containing transcript text")
             if text:
                 if SPK_CHANGE in text:
                     if not has_text and text.lstrip().startswith(SPK_CHANGE):
@@ -129,8 +127,9 @@ def validate_row(row, token_inventory=None, decode=False):
                         raise ValueError("Unexpected decoded audio format or frame count")
         except (ValueError, OSError, RuntimeError) as exc:
             raise ValueError(f"audio turn {i+1}: {exc}") from exc
-    if not has_text and not silence_only:
-        raise ValueError("Recording contains no transcribed speech")
+    # A silent excerpt can end on WAIT even when its optional silence marker is absent.
+    if open_end and has_text and not reply.startswith(DIRECT):
+        raise ValueError(f"audio turn {len(refs)}: annotation_end must end with a DIRECT containing transcript text")
     if expected_switches is not None and expected_switches != set(switch_turns):
         raise ValueError("recast speaker_change events differ from the assistant replies")
     if decode:

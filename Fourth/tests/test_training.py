@@ -51,8 +51,7 @@ def test_third_check_cli_decodes_multilingual_turns(tmp_path):
     tokens.write_text(WAIT + "\n<en>\n", encoding="utf8")
     with pytest.raises(ValueError, match="exactly"):
         read_tokens(tokens)
-    with pytest.raises(ValueError, match="no transcribed speech"):
-        validate_row(row_for(audio, [WAIT]))
+    assert validate_row(row_for(audio, [WAIT, WAIT, WAIT]), decode=True) == {WAIT}
 
 
 @pytest.mark.parametrize("mode", ["plain", "explicit"])

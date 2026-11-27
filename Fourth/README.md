@@ -45,6 +45,12 @@ python SFT-Scripts/check_sft.py \
 
 默认 `--tail-policy keep` 保留原文末尾标点和完整音频。若这批也是之前的截取数据，沿用 `--tail-policy short-open`。训练文件、token 清单及 SFT 启动方式与下方配方一致。`summary.json` 中此入口的 `release_on` 为 `source-segment`。
 
+若中英文蒸馏稿还在录音中间误加了句号，可以在上述 `recast_1s.py` 命令追加 `--continuation-gap-ms 300`，并选择新的输出目录。这个选项在重铸时直接用 Python 检查同一人、同一语种的相邻原段。两段的标注间隔须在 0 到指定毫秒数之间，且文字须命中明确的接续句式。例如“从目录上。｜也能反映”会去句号，“如果明天下雨。｜我们就改线上”会改为逗号，“我知道。｜这件事我来处理”会保留句号。`｜` 代表原有段界。
+
+换人、换语种和重叠发言处保留原标点。拼接录音只处理 `synthesis.clips` 能确认属于同一素材的相邻两段。英文去句号后若两词会粘连，补一个空格。录音末尾仍由 `--tail-policy` 单独控制。
+
+结果直接写入 `train.1000ms.jsonl`。在 `summary.json` 的 `by_chunk_ms["1000"]` 中，`internal_period_candidates` 是通过间隔、归属和基本字形筛选的句号数，`internal_periods_removed` 是句中去掉的句号数，`internal_periods_to_comma` 是句中改为逗号的数量，`terminal_periods_removed` 单独统计录音末尾。
+
 ### 已跑完第一步合并的训练集
 
 `merge_timestamped_segments.py` 完成时才发布 `full_10000h_augmented.merged_v2.jsonl`。每行保留原音频路径和参考转录，`output.segments` 存新分组，`timestamps` 存对应区间。新合并组的 `timestamps[].spans` 保留细时间，`merge_source_units` 指向原段。合并阶段保留末尾标点，也没有添加录音自然结束标记。可直接把这份输出交给第二步。
@@ -178,6 +184,31 @@ python SFT-Scripts/check_sft.py \
   /data/yb/Code/OmniCommit/datasets/fourth_1s_v1/train.1000ms.jsonl \
   --rows 2 --decode
 ~~~
+
+### 从成品训练 JSONL 筛选录音
+
+已有 `train.1000ms.jsonl` 可以直接逐行过滤，无需原始分段、模型或 WAV 解码。下面的命令生成一份用于标点对照实验的训练集。保留行沿用输入里的音频引用、正文、轮次和顺序。
+
+~~~bash
+cd /data/yb/Code/OmniCommit/Fourth
+python Data-Scripts/filter_final_sft.py \
+  /data/yb/Code/OmniCommit/datasets/fourth_source_1s/train.1000ms.jsonl \
+  --output-dir /data/yb/Code/OmniCommit/datasets/fourth_filter_v1 \
+  --policy strict
+~~~
+
+两个模式均使用 Fourth 训练校验器检查动作、消息和虚拟音频引用。**每个音频轮都只输出 `<|WAIT|>` 的有效录音全部保留。** 这个判断直接读取 assistant 各轮的目标，兼容带或不带 `silence_only` 标记的样本，也兼容没有 `recast` 的旧版完整录音。带正文的录音按同一回复及相邻 DIRECT 检查句号，遇到 WAIT 或换人标记就重新计数。
+
+| 模式 | 整条录音的去向 |
+| --- | --- |
+| `conservative`（默认） | 格式错误、协议不符，或同一段连续正文至少两处命中中英文接续句式的录音进入排除文件。单处命中、连续碎句和句号两侧文字重复进入复核清单，同时留在训练集。 |
+| `strict` | 上述复核候选也整条移出训练集。例如“我知道。知道你有点问题。”会被隔离，真实口语重复也可能命中。 |
+
+“连续碎句”取至少四个连续的短陈述句，每句一至三个汉字或一至两个用 ASCII 字母拼写的词，其中至少两句不在常见简答词表中。“句号两侧重复”取前句末尾与后句开头相同的二至八个汉字，跳过词表里的简答。两项都按文字表面形式筛选，其他使用汉字或拉丁字母的语种也可能命中。成品行通常只保留音频块时间，无法还原真实词间停顿。
+
+输出目录在处理完毕后发布。`train.filtered.jsonl` 及同名的 `.tokens.txt` 供原 SFT 启动脚本使用。脚本优先读取输入训练集同名的 `.tokens.txt`。缺少该文件时，采用第一条通过筛选的有正文录音的协议。若所有保留样本均为全 WAIT，则采用其中第一条的协议。混入其他已知 Fourth 协议的全 WAIT 录音时，只调整该行的 system 指令以匹配训练协议，保留原数字格式设置、音频引用和每一轮 WAIT。
+
+终端最后打印有效全 WAIT 录音的保留数和输入数。`summary.json` 中的 `validated_before.silence_only_rows` 和 `kept_after.silence_only_rows` 应相等。`invalid_all_wait_rows` 单列能读出全 WAIT 目标但结构损坏的行数，例如音频引用无效。`rejected.jsonl` 记录原行号、原因和原数据，文本命中附轮次和上下文。`review.jsonl` 只列仍保留的候选。
 
 ## 3. 训练
 

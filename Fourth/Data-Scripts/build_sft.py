@@ -16,10 +16,11 @@ import soundfile as sf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from fourth_asr.annotation_tail import project_open_tail
+from fourth_asr.continuation_punctuation import revise_continuation_periods
 from fourth_asr.protocol import SPK_CHANGE, WAIT, get_protocol
 from fourth_asr.recast import build_sft_row, end_frame, validate_chunk_ms
 from fourth_asr.semantic_preparation import prepare_units
-from fourth_asr.timestamped_source import HEADER_TIME, TAG, reference_spans
+from fourth_asr.timestamped_source import HEADER_TIME, TAG, reference_spans, synthesis_boundaries
 
 
 # Keep tabs and ordinary spaces outside line-break positions exactly as annotated.
@@ -204,7 +205,8 @@ def checked_changes(expected, replies, protocol):
     return changed
 
 
-def prepare_record(record, audio_root, steps, number_format, release_on, *, protocol, short_ms, tail_policy="keep"):
+def prepare_record(record, audio_root, steps, number_format, release_on, *, protocol, short_ms,
+                   tail_policy="keep", continuation_gap_ms=None):
     audios = record.get("audios") if isinstance(record, dict) else None
     if not (isinstance(audios, list) and len(audios) == 1 and
             isinstance(audios[0], str) and audios[0].strip()):
@@ -237,6 +239,16 @@ def prepare_record(record, audio_root, steps, number_format, release_on, *, prot
             if short_tail:
                 units, target, stripped = project_open_tail(units, source_spans[-1][2], expected)
             frames = end_frame(max(u.end_ms for u in units), info.frames, info.samplerate)
+        if continuation_gap_ms is not None:
+            barriers = synthesis_boundaries(record, units, preparation)
+            revised, period_stats = revise_continuation_periods(units, continuation_gap_ms, protected=barriers)
+            preparation.update(period_stats)
+            if revised is not units:
+                # Verify the intact transcript before projecting the allowed edits.
+                if reference_body(s for u in units for s in u.spans) != target:
+                    raise ValueError("Timed segments disagree with the reference before internal period cleanup")
+                units = revised
+                target = reference_body(s for u in units for s in u.spans)
         row = build_sft_row(units, path, frames, info.samplerate, step, number_format, protocol=protocol,
                             audit=audit, release_completed=release_on in ("merged-unit", "source-segment"),
                             open_end=open_end)
@@ -259,6 +271,9 @@ def prepare_record(record, audio_root, steps, number_format, release_on, *, prot
         if tail_policy != "keep":
             row["recast"].update(source_frames=info.frames, supervised_frames=frames,
                                  terminal_period_removed=stripped)
+        if continuation_gap_ms is not None:
+            row["recast"].update(internal_periods_removed=period_stats["internal_periods_removed"],
+                                 internal_periods_to_comma=period_stats["internal_periods_to_comma"])
         stats = Counter(preparation)
         stats.update(audio_turns=len(real_replies), wait_audio_turns=waits,
                      direct_audio_turns=len(real_replies) - waits, speaker_change_turns=len(changes),
@@ -286,7 +301,11 @@ def main(argv=None, *, source_segments_only=False):
     parser.add_argument("--audio-root", type=Path, help="Base for relative audio paths (default: input directory)")
     if source_segments_only:
         parser.set_defaults(chunk_ms=[1000], short_ms=0, release_on="source-segment")
+        parser.add_argument("--continuation-gap-ms", type=int, metavar="MS",
+                            help="Enable conservative Chinese/English internal period edits when adjacent "
+                                 "same-speaker source segments have a 0..MS annotation gap")
     else:
+        parser.set_defaults(continuation_gap_ms=None)
         parser.add_argument("--chunk-ms", nargs="+", type=int, default=[1000], metavar="MS")
         parser.add_argument("--short-ms", type=int, default=300, help="Short-fragment merge threshold in ms")
         parser.add_argument("--release-on", choices=("semantic-unit", "timed-span", "merged-unit"), default="semantic-unit",
@@ -310,6 +329,8 @@ def main(argv=None, *, source_segments_only=False):
         parser.error("--chunk-ms values must be unique")
     if args.short_ms < 0:
         parser.error("--short-ms must be nonnegative")
+    if args.continuation_gap_ms is not None and args.continuation_gap_ms < 0:
+        parser.error("--continuation-gap-ms must be nonnegative")
     if not args.input.is_file():
         parser.error(f"Missing input file: {args.input}")
     audio_root = args.audio_root or args.input.parent
@@ -334,7 +355,8 @@ def main(argv=None, *, source_segments_only=False):
                 record = json.loads(line)
                 rows, (gap_start, gap_end) = prepare_record(
                     record, audio_root, steps, args.number_format, args.release_on,
-                    protocol=protocol, short_ms=args.short_ms, tail_policy=args.tail_policy)
+                    protocol=protocol, short_ms=args.short_ms, tail_policy=args.tail_policy,
+                    continuation_gap_ms=args.continuation_gap_ms)
             except (ValueError, KeyError, TypeError, OSError, OverflowError, RecursionError) as exc:
                 # Serialize errors as ASCII so even malformed Unicode input can be reported.
                 errors.write(json.dumps({"line": line_number, "error": str(exc)}, ensure_ascii=True) + "\n")
@@ -362,6 +384,8 @@ def main(argv=None, *, source_segments_only=False):
                   "kept": kept, "rejected": bad, "chunk_ms": steps, "by_chunk_ms": counts,
                   "longest_unannotated_gap": longest_gap}
         report.update(protocol=protocol.name, tail_policy=args.tail_policy)
+        if args.continuation_gap_ms is not None:
+            report["continuation_gap_ms"] = args.continuation_gap_ms
         if not source_segments_only:
             report["short_ms"] = args.short_ms
         with summary.open("x", encoding="utf-8", newline="\n") as handle:

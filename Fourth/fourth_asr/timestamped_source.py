@@ -228,3 +228,43 @@ def parse_record(record, duration_ms, *, release_on="semantic-unit"):
     if offset != len(reference):
         raise ValueError("semantic segments do not cover the entire reference transcript")
     return units
+
+
+def synthesis_boundaries(record, units, stats):
+    """Return boundary indices separating units that do not share a documented source clip."""
+    if "synthesis" not in record:
+        return set()
+    synthesis = record["synthesis"]
+    clips = synthesis.get("clips") if isinstance(synthesis, dict) else None
+    rate = synthesis.get("sample_rate") if isinstance(synthesis, dict) else None
+    intervals = []
+    if type(rate) is int and rate > 0 and isinstance(clips, list):
+        for clip in clips:
+            if not isinstance(clip, dict):
+                break
+            start, end = clip.get("start_frame"), clip.get("end_frame")
+            if (type(start) is not int or type(end) is not int or not 0 <= start < end
+                    or (intervals and intervals[-1][1] > start)):
+                break
+            intervals.append((start, end))
+    if not intervals or len(intervals) != len(clips):
+        stats["synthesis_rows_without_usable_clip_times"] += 1
+        return set(range(1, len(units)))
+    barriers = set()
+    pos = 0
+    previous = None
+    for i, unit in enumerate(units):
+        # Timestamps are relative to the composed recording, not the source WAV.
+        begin, end = unit.start_ms * rate, unit.end_ms * rate
+        while pos < len(intervals) and intervals[pos][1] * 1000 <= begin:
+            pos += 1
+        owner = None
+        if pos < len(intervals) and intervals[pos][0] * 1000 <= begin and end <= intervals[pos][1] * 1000:
+            owner = pos
+        if owner is None:
+            stats["units_without_unique_synthesis_clip"] += 1
+        if i and (owner is None or previous is None or previous != owner):
+            barriers.add(i)
+        previous = owner
+    stats["synthesis_boundaries_protected"] += len(barriers)
+    return barriers

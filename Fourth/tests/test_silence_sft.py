@@ -59,8 +59,7 @@ def test_whole_recording_all_wait_and_mixed_training_preflight(tmp_path):
 
     row = deepcopy(by_path[first])
     row["recast"]["events"].pop(0)
-    with pytest.raises(ValueError, match="no transcribed speech"):
-        validate_row(row)
+    assert validate_row(row, decode=True) == {WAIT}
     row = deepcopy(by_path[first])
     row["messages"][2]["content"] = DIRECT + "invented"
     with pytest.raises(ValueError, match="standalone WAIT"):

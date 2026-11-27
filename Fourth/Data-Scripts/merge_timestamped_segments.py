@@ -11,7 +11,7 @@ from tempfile import NamedTemporaryFile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from fourth_asr.semantic_preparation import STANDALONE, TRAILING, closes_clause, numeric_continuation
-from fourth_asr.timestamped_source import parse_record
+from fourth_asr.timestamped_source import parse_record, synthesis_boundaries
 
 
 INPUT = Path("/data/s50062929/FLEX/SFT_data/full_10000h_augmented.jsonl")
@@ -47,46 +47,6 @@ def end_kind(text, following, language=""):
     if body and len(body) <= 3 and following.lstrip().casefold().startswith(body):
         return None
     return "weak"
-
-
-def synthesis_boundaries(record, units, stats):
-    """Only join units wholly inside the same documented source clip."""
-    if "synthesis" not in record:
-        return set()
-    synthesis = record["synthesis"]
-    clips = synthesis.get("clips") if isinstance(synthesis, dict) else None
-    rate = synthesis.get("sample_rate") if isinstance(synthesis, dict) else None
-    intervals = []
-    if type(rate) is int and rate > 0 and isinstance(clips, list):
-        for clip in clips:
-            if not isinstance(clip, dict):
-                break
-            start, end = clip.get("start_frame"), clip.get("end_frame")
-            if (type(start) is not int or type(end) is not int or not 0 <= start < end
-                    or (intervals and intervals[-1][1] > start)):
-                break
-            intervals.append((start, end))
-    if not intervals or len(intervals) != len(clips):
-        stats["synthesis_rows_without_usable_clip_times"] += 1
-        return set(range(1, len(units)))
-    barriers = set()
-    pos = 0
-    previous = None
-    for i, unit in enumerate(units):
-        # Timestamps are relative to the composed recording, not the source WAV.
-        begin, end = unit.start_ms * rate, unit.end_ms * rate
-        while pos < len(intervals) and intervals[pos][1] * 1000 <= begin:
-            pos += 1
-        owner = None
-        if pos < len(intervals) and intervals[pos][0] * 1000 <= begin and end <= intervals[pos][1] * 1000:
-            owner = pos
-        if owner is None:
-            stats["units_without_unique_synthesis_clip"] += 1
-        if i and (owner is None or previous is None or previous != owner):
-            barriers.add(i)
-        previous = owner
-    stats["synthesis_boundaries_protected"] += len(barriers)
-    return barriers
 
 
 def group_ranges(units, barriers):
