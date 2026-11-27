@@ -560,12 +560,13 @@ def create_app(backend_factory, options, *, max_meetings=16, max_in_flight=8,
                                    "description": "Standard base64 of normalized mono float32 LE samples"},
                           "tail_silence": {"type": "number", "minimum": 0,
                                   "description": "Caller-reported silence duration for this packet in seconds. "
-                                                 "When enabled, the last committed sentence period may be removed "
-                                                 "or changed to a comma using the configured thresholds. "
+                                                 "When enabled, the last committed sentence period is removed below "
+                                                 "the lower threshold or changed to a comma below the upper threshold. "
+                                                 "The same thresholds apply in every language. "
                                                  "Send only one silence field per packet."},
                           "silence_ms": {"type": "number", "minimum": 0,
                                   "description": "Total silence in this audio packet (milliseconds). Optional. "
-                                                 "Uses the same strict threshold as tail_silence."},
+                                                 "Uses the same thresholds as tail_silence."},
                           "trailing_silence_ms": {"type": "number", "minimum": 0,
                                   "description": "Legacy measurement field accepted in place of silence_ms."}}}},
                       **{media: {"schema": {"type": "string", "format": "binary"}}

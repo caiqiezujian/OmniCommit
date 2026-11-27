@@ -56,7 +56,7 @@ def test_disabled_by_default_even_when_clients_send_silence():
     assert model.prompts[-1][0][-2] == ("assistant", DIRECT + " Second.")
 
 
-@pytest.mark.parametrize("silence,ending", [(0.12, "知道"), (0.2, "知道，"), (0.45, "知道。")])
+@pytest.mark.parametrize("silence,ending", [(0.03, "知道"), (0.13, "知道，"), (0.17, "知道。")])
 def test_five_second_packet_edits_only_its_final_text_and_keeps_trailing_wait(silence, ending):
     replies = [DIRECT + "开始。", WAIT, DIRECT + "三。", DIRECT + "知道。", WAIT]
     model = Capture(replies + [WAIT, WAIT])
@@ -76,7 +76,7 @@ def test_five_second_packet_edits_only_its_final_text_and_keeps_trailing_wait(si
 def test_five_second_packet_leaves_internal_periods_when_last_turn_is_direct():
     model = Capture([DIRECT + "开始。", WAIT, DIRECT + "好。", DIRECT + "收到。", DIRECT + "Next."])
     with client_for(model, packet_period_to_comma=True) as client:
-        response = client.post(MEETING + "/chunks", json=packet(5 * SAMPLE_RATE, silence_ms=200))
+        response = client.post(MEETING + "/chunks", json=packet(5 * SAMPLE_RATE, silence_ms=130))
         assert_src(response, "开始。好。收到。Next,")
         turns = client.get(MEETING + "/result").json()["turns"]
         assert [t.get("terminal_period_to_comma", False) for t in turns] == [False] * 4 + [True]
@@ -91,7 +91,7 @@ def test_new_packet_of_waits_cannot_change_an_already_returned_sentence():
     assert [text for role, text in model.prompts[-1][0] if role == "assistant"] == [DIRECT + "结束。", WAIT]
 
 
-@pytest.mark.parametrize("ms,suffix", [(149.5, ""), (150, "，"), (449.5, "，")])
+@pytest.mark.parametrize("ms,suffix", [(99.5, ""), (100, "，"), (149.5, "，")])
 def test_corrected_turn_is_the_single_source_for_client_and_next_model_prompt(ms, suffix):
     raw = DIRECT + "他们来了。" + SPK_CHANGE + "我知道。"
     corrected = raw[:-1] + suffix
@@ -121,10 +121,10 @@ def test_corrected_turn_is_the_single_source_for_client_and_next_model_prompt(ms
 
 
 @pytest.mark.parametrize("silence,text,expected", [
-    (0, "We can.", "We can"), (299.99, "我知道。", "我知道，"), (300, "好了。", "好了，"),
-    (450, "好了。", "好了。"), (310, "OK.", "OK."), (120, "Version 3.14", "Version 3.14"),
+    (0, "We can.", "We can"), (129.99, "我知道。", "我知道，"), (100, "好了。", "好了，"),
+    (150, "好了。", "好了。"), (170, "OK.", "OK."), (120, "Version 3.14", "Version 3.14"),
     (120, "Ask Dr.", "Ask Dr."), (120, "Well...", "Well..."),
-    (120, "明白吗？", "明白吗？"), (100, "“好的。”", "“好的”"),
+    (120, "明白吗？", "明白吗？"), (30, "“好的。”", "“好的”"),
 ])
 def test_punctuation_and_threshold(silence, text, expected):
     model = Capture([DIRECT + text, WAIT])
@@ -139,14 +139,14 @@ def test_punctuation_and_threshold(silence, text, expected):
 
 @pytest.mark.parametrize("measurement,expected_ms,expected_src", [
     ({"tail_silence": 0.0}, 0, "收到"),
-    ({"tail_silence": 0.149999}, 149.999, "收到"),
-    ({"tail_silence": 0.150}, 150, "收到，"),
-    ({"tail_silence": 0.3}, 300, "收到，"),
-    ({"tail_silence": 0.449999}, 449.999, "收到，"),
-    ({"tail_silence": 0.450}, 450, "收到。"),
-    ({"tail_silence": 0.451}, 451, "收到。"),
+    ({"tail_silence": 0.099999}, 99.999, "收到"),
+    ({"tail_silence": 0.100}, 100, "收到，"),
+    ({"tail_silence": 0.130}, 130, "收到，"),
+    ({"tail_silence": 0.149999}, 149.999, "收到，"),
+    ({"tail_silence": 0.150}, 150, "收到。"),
+    ({"tail_silence": 0.151}, 151, "收到。"),
     ({"silence_ms": 0.3}, 0.3, "收到"),
-    ({"trailing_silence_ms": 150}, 150, "收到，"),
+    ({"trailing_silence_ms": 130}, 130, "收到，"),
 ])
 def test_json_field_units_at_both_thresholds(measurement, expected_ms, expected_src):
     with client_for(Capture([DIRECT + "收到。"]), packet_period_to_comma=True) as client:
@@ -160,7 +160,8 @@ def test_json_field_units_at_both_thresholds(measurement, expected_ms, expected_
     (500, {"tail_silence": 0.500}, "收到。"),
     (500, {"tail_silence": 0.501}, "收到。"),
     (125.5, {"silence_ms": 125.5}, "收到。"),
-    (125.5, {"trailing_silence_ms": 125}, "收到"),
+    (125.5, {"trailing_silence_ms": 125}, "收到，"),
+    (80, {"trailing_silence_ms": 79.99}, "收到"),
     (1001, {"tail_silence": 1.001}, "收到。"),
     (0, {"tail_silence": 0}, "收到。"),
 ])
@@ -196,7 +197,7 @@ def test_separately_emitted_dot_completes_abbreviation_in_preceding_turn():
     model = Capture([DIRECT + "Please ask Dr", DIRECT + ".", WAIT])
     with client_for(model, packet_period_to_comma=True) as client:
         assert_src(client.post(MEETING + "/chunks", json=packet()), "Please ask Dr")
-        assert_src(client.post(MEETING + "/chunks", json=packet(trailing_silence_ms=200)), ".")
+        assert_src(client.post(MEETING + "/chunks", json=packet(trailing_silence_ms=30)), ".")
         assert_src(client.post(MEETING + "/end"), "")
     assert model.prompts[-1][0][-2] == ("assistant", DIRECT + ".")
 
@@ -229,7 +230,7 @@ def test_invalid_measurements_do_not_consume_or_relabel_buffered_audio():
 def test_a_separately_decoded_period(previous, period, src):
     with client_for(Capture([DIRECT + previous, DIRECT + period]), packet_period_to_comma=True) as client:
         assert_src(client.post(MEETING + "/chunks", json=packet()), previous)
-        assert_src(client.post(MEETING + "/chunks", json=packet(trailing_silence_ms=120)), src)
+        assert_src(client.post(MEETING + "/chunks", json=packet(trailing_silence_ms=30)), src)
 
 
 @pytest.mark.parametrize("previous,following,expected", [
@@ -241,11 +242,16 @@ def test_a_separately_decoded_period(previous, period, src):
     ("We can.", "’t go", "’t go"),
     ("I know.", SPK_CHANGE + "Hello", " Hello"),
     ("我知道。", "这件事", "这件事"),
+    ("Bonjour.", "Paris", " Paris"),
+    ("Привет.", "всем", " всем"),
+    ("شكراً.", "لك", " لك"),
+    ("わかりました。", "続けて", "続けて"),
+    ("เข้าใจแล้ว.", "ไปต่อ", "ไปต่อ"),
 ])
-def test_next_visible_text_resolves_only_english_word_spacing(previous, following, expected):
+def test_next_visible_text_resolves_word_spacing_after_a_deleted_period(previous, following, expected):
     model = Capture([DIRECT + previous, WAIT, WAIT, DIRECT + following, WAIT])
     with client_for(model, packet_period_to_comma=True) as client:
-        first = client.post(MEETING + "/chunks", json=packet(tail_silence=0.1))
+        first = client.post(MEETING + "/chunks", json=packet(tail_silence=0.03))
         first_text = previous.replace(".", "").replace("。", "")
         assert_src(first, first_text)
         assert_src(client.post(MEETING + "/chunks", json=packet(2 * SAMPLE_RATE)), "")
@@ -280,14 +286,16 @@ def test_standalone_dot_cannot_borrow_language_from_an_earlier_speaker():
     model = Capture([DIRECT + "We know ", DIRECT + SPK_CHANGE + "Paris", DIRECT + ".", WAIT])
     with client_for(model, packet_period_to_comma=True) as client:
         assert_src(client.post(MEETING + "/chunks", json=packet(2 * SAMPLE_RATE)), "We know Paris")
-        assert_src(client.post(MEETING + "/chunks", json=packet(tail_silence=.05)), ",")
+        assert_src(client.post(MEETING + "/chunks", json=packet(tail_silence=.05)), "")
+        edit = client.get(MEETING + "/result").json()["turns"][0]["packet_period_edit"]
+        assert edit["language"] == "other" and edit["operation"] == "remove"
         assert_src(client.post(MEETING + "/end"), "")
 
 
 def test_english_comma_followed_by_a_word_gets_one_separator():
     model = Capture([DIRECT + "I know.", DIRECT + "what happened", WAIT])
     with client_for(model, packet_period_to_comma=True) as client:
-        assert_src(client.post(MEETING + "/chunks", json=packet(tail_silence=.4)), "I know,")
+        assert_src(client.post(MEETING + "/chunks", json=packet(tail_silence=.13)), "I know,")
         assert_src(client.post(MEETING + "/chunks", json=packet()), " what happened")
         assert_src(client.post(MEETING + "/end"), "")
     assert model.prompts[-1][0][-2] == ("assistant", DIRECT + " what happened")
@@ -308,6 +316,30 @@ def test_custom_remove_and_comma_thresholds(ms, expected):
         health = client.get("/health").json()
         assert health["packet_period_threshold_ms"] == 400 and health["packet_period_remove_threshold_ms"] == 100
         assert_src(client.post(MEETING + "/chunks", json=packet(silence_ms=ms)), expected)
+
+
+@pytest.mark.parametrize("raw,comma", [
+    ("好。", "，"), ("方案。", "，"), ("Perfect.", ","), ("Paris.", ","),
+    ("Bonjour.", ","), ("わかりました。", "、"), ("좋습니다.", ","),
+    ("Привет.", ","), ("تمام۔", "،"), ("เข้าใจแล้ว.", ","),
+])
+def test_same_packet_timing_for_all_languages_in_response_and_model_history(raw, comma):
+    cases = [(0.030, "", "remove"), (0.100, comma, "comma"), (0.130, comma, "comma"),
+             (0.150, raw[-1], None), (0.170, raw[-1], None)]
+    model = Capture([DIRECT + raw, WAIT] * len(cases))
+    with client_for(model, packet_period_to_comma=True) as client:
+        for i, (seconds, ending, operation) in enumerate(cases):
+            url = MEETING + str(i)
+            expected = raw[:-1] + ending
+            assert_src(client.post(url + "/chunks", json=packet(tail_silence=seconds)), expected)
+            result = client.get(url + "/result").json()
+            turn, = result["turns"]
+            assert result["text"] == turn["display_text"] == expected
+            assert turn["text"] == DIRECT + expected
+            assert turn.get("packet_period_edit", {}).get("operation") == operation
+            assert_src(client.post(url + "/end"), "")
+            assert model.prompts[-1][0][-2] == ("assistant", DIRECT + expected)
+    assert len(model.prompts) == 2 * len(cases)
 
 
 @pytest.mark.parametrize("invalid", [-1, 451, float("inf"), float("nan"), True])

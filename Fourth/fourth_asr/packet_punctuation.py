@@ -9,9 +9,8 @@ from .protocol import SPK_CHANGE
 from .semantic_preparation import TRAILING
 
 
-DEFAULT_PACKET_PERIOD_THRESHOLD_MS = 450
-DEFAULT_PACKET_PERIOD_REMOVE_THRESHOLD_MS = 150
-LEGACY_PACKET_PERIOD_THRESHOLD_MS = 300
+DEFAULT_PACKET_PERIOD_THRESHOLD_MS = 150
+DEFAULT_PACKET_PERIOD_REMOVE_THRESHOLD_MS = 100
 PERIODS = ".。．۔"
 CLOSERS = TRAILING + "〉》〕〗〙〛"
 CLAUSE_BOUNDARIES = frozenset(".。．۔!?！？؟;；:：,，、،\n")
@@ -23,8 +22,8 @@ URL_TAIL = re.compile(
 SHORT_FORM = re.compile(r"\b(?:т\.\s*[едп]|напр|др|г|гг|ул|рис|стр|z\.\s*b|d\.\s*h|"
                         r"hr|frl|usw|p\.\s*ex|avv|dott|dra|drs|pág)\.$", re.IGNORECASE)
 
-# Fourth has no language tags at inference. Use positive evidence in the final
-# clause. Shared names, isolated Latin initials and kanji alone can be ambiguous.
+# This hint describes the final clause for diagnostics and mixed-script
+# typography. Whether a period is removed or replaced depends only on silence.
 CLAUSE_BREAK = re.compile("[" + re.escape("".join(sorted(CLAUSE_BOUNDARIES))) + "]")
 ZH_CUE = re.compile(r"[你您她它这這们們吗嗎呢吧么麼咱谁沒没说听还给请谢让该预测试问进议项认过顺对嗯]"
                     r"|我[想是会會]|知道|收到|明白了|可以|好[的了]|謝謝|開始了|结束|確認了"
@@ -49,6 +48,7 @@ class PeriodEdit:
     operation: str
     language: str
     threshold_ms: float
+    space_separated: bool
 
 
 def resolve_remove_threshold(upper, lower):
@@ -150,12 +150,10 @@ def edit_packet_period(marked, previous, silence_ms, comma_ms, remove_ms):
     language = _tail_language(stem, local[:-1], comma)
     if language == "zh":
         comma = "，"
-    if language in ("zh", "en") and silence_ms < remove_ms:
-        return PeriodEdit(marked[:offset] + marked[offset + 1:], "remove", language, remove_ms)
-    threshold = min(comma_ms, LEGACY_PACKET_PERIOD_THRESHOLD_MS) if language == "other" else comma_ms
-    if silence_ms >= threshold:
-        return None
-    return PeriodEdit(marked[:offset] + comma + marked[offset + 1:], "comma", language, threshold)
+    space_separated = comma in (",", "،")
+    if silence_ms < remove_ms:
+        return PeriodEdit(marked[:offset] + marked[offset + 1:], "remove", language, remove_ms, space_separated)
+    return PeriodEdit(marked[:offset] + comma + marked[offset + 1:], "comma", language, comma_ms, space_separated)
 
 
 def replace_terminal_period(marked, previous=""):
@@ -164,16 +162,21 @@ def replace_terminal_period(marked, previous=""):
     return edit.text if edit else marked
 
 
-def join_after_english_period(previous, marked):
+def join_after_packet_period(previous, marked):
     """Resolve the word separator when the next visible text is available."""
     change = SPK_CHANGE if marked.startswith(SPK_CHANGE) else ""
     body = marked[len(change):]
     right = body.lstrip(" ")
-    left = previous.rstrip(" ").rstrip(CLOSERS).removesuffix(",").rstrip(CLOSERS)
+    left = previous.rstrip(" ").rstrip(CLOSERS).rstrip(",،").rstrip(CLOSERS)
+    while left and unicodedata.category(left[-1]).startswith("M"):
+        left = left[:-1]
     if not left or not right or right.casefold().startswith(("n't", "n’t")):
         return marked
     for char in (left[-1], right[0]):
-        if not (char.isdecimal() or char.isalpha() and "LATIN" in unicodedata.name(char, "")):
+        # Infer a missing separator only for writing systems that separate
+        # words with spaces. Preserve the model's spacing in CJK and Thai.
+        if not (char.isdecimal() or char.isalpha() and unicodedata.name(char, "").startswith(
+                ("LATIN ", "CYRILLIC ", "GREEK ", "ARABIC ", "HEBREW "))):
             return marked
     separator = "" if previous.endswith(" ") else " "
     return change + separator + right

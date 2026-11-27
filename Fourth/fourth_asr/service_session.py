@@ -9,7 +9,7 @@ import time
 import numpy as np
 
 from .runtime.streaming import StreamOptions, StreamSession
-from .packet_punctuation import DEFAULT_PACKET_PERIOD_THRESHOLD_MS, edit_packet_period, join_after_english_period
+from .packet_punctuation import DEFAULT_PACKET_PERIOD_THRESHOLD_MS, edit_packet_period, join_after_packet_period
 from .protocol import SPK_CHANGE, WAIT, get_protocol
 from .recovery import VoicedWaitRecovery
 
@@ -50,7 +50,7 @@ class FourthStreamSession(StreamSession):
         self.protocol = get_protocol(self.options.protocol)
         self.recovery = None
         self._text_tail = ""
-        self.join_english_word = False
+        self.join_words_after_period = False
         self.quiet_waits = set()
         self.quiet_evicted_seconds = 0.
         self.silence_detector = silence_detector
@@ -134,7 +134,7 @@ class FourthStreamSession(StreamSession):
         if result.get("truncation", {}).get("status") == "gap":
             self.quiet_waits.clear()
             self._text_tail = ""
-            self.join_english_word = False
+            self.join_words_after_period = False
             if self.recovery is not None:
                 self.recovery.on_gap()
         elif skipped:
@@ -150,12 +150,12 @@ class FourthStreamSession(StreamSession):
         self.last_gated_turn = self.history[-1] if skipped else None
         if result["action"] == "DIRECT":
             marked = result["text"].removeprefix(self.protocol.prefix)
-            if self.join_english_word:
-                joined = join_after_english_period(self._text_tail, marked)
+            if self.join_words_after_period:
+                joined = join_after_packet_period(self._text_tail, marked)
                 if joined != marked:
                     self._rewrite_turn(result, joined)
                 marked = joined
-                self.join_english_word = False
+                self.join_words_after_period = False
             # Keep speaker boundaries for punctuation evidence. Recovery reads
             # the same bounded text with ordinary word separators.
             self._text_tail = (self._text_tail + marked.replace(SPK_CHANGE, _SPEAKER_BOUNDARY))[-2048:]
@@ -195,7 +195,7 @@ class FourthStreamSession(StreamSession):
                 result["inferred_commit_seconds"] = previous_inferred
         else:
             self._text_tail = (previous_text + edit.text.replace(SPK_CHANGE, _SPEAKER_BOUNDARY))[-2048:]
-        self.join_english_word = edit.language == "en"
+        self.join_words_after_period = edit.space_separated
         result["packet_period_edit"] = {"operation": edit.operation, "language": edit.language,
                                         "threshold_ms": edit.threshold_ms}
         if edit.operation == "comma":

@@ -185,9 +185,11 @@ def test_busy_payload_is_rejected_before_ingestion(tmp_path):
 
 
 @pytest.mark.parametrize("detailed", [False, True])
-@pytest.mark.parametrize("silence,expected,note", [(0.1, "我觉得可以", "删除句号"), (0.2, "我觉得可以，", "句号改逗号")])
+@pytest.mark.parametrize("silence,expected,note,threshold", [
+    (0.03, "我觉得可以", "删除句号", 100), (0.13, "我觉得可以，", "句号改逗号", 150),
+])
 def test_live_packet_journal_tracks_turns_conflict_and_exact_returned_src(tmp_path, detailed, monkeypatch,
-                                                                         silence, expected, note):
+                                                                         silence, expected, note, threshold):
     entered, release = threading.Event(), threading.Event()
 
     class GatedBackend(ReplayBackend):
@@ -239,10 +241,11 @@ def test_live_packet_journal_tracks_turns_conflict_and_exact_returned_src(tmp_pa
     assert "模型正文" not in turns[-1]
     response, = [r for r in rows if r["事件"] == "返回" and r.get("包") == 1]
     assert response["src"] == reply.json()["src"] and response["请求号"] == reply.headers["X-Request-ID"]
-    assert "第2轮" + note in response["标点处理"]
+    assert response["标点处理"] == f"第2轮{note}，{silence * 1000} ms < {threshold} ms"
     if detailed:
-        event = "packet_period_removed" if silence < .15 else "packet_period_to_comma"
+        event = "packet_period_removed" if silence < .1 else "packet_period_to_comma"
         edit, = [r for r in read_events(path.with_name("trace.jsonl")) if r["event"] == event]
+        assert edit["threshold_ms"] == threshold
         assert edit["turn"] == 2 and edit["text"] == DIRECT + expected.removeprefix("我觉得")
     assert [r["事件"] for r in rows[-4:]] == ["结束请求", "收尾轮", "返回", "拒绝"]
     assert rows[-1]["原因"] == "会议已结束"

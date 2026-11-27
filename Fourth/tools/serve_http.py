@@ -40,7 +40,7 @@ def main(argv=None):
                         help="Strict upper bound on packet silence for replacing the final period, "
                              "in milliseconds (default: %(default)s)")
     parser.add_argument("--packet-period-remove-threshold-ms", type=float,
-                        help=f"Remove an eligible Chinese or English period below this silence in milliseconds "
+                        help=f"Remove a packet-final sentence period in any language below this silence in milliseconds "
                              f"(default {DEFAULT_PACKET_PERIOD_REMOVE_THRESHOLD_MS}, capped at the upper threshold)")
     parser.add_argument("--max-meetings", type=int, default=16,
                         help="Number of meeting histories kept concurrently")
