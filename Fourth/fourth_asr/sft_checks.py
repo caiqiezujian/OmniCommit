@@ -35,7 +35,7 @@ def _check_recast(meta, path, turns):
         raise ValueError("recast.events must include an audio_end or annotation_end event")
     previous_turn = 0
     by_kind = {kind: set() for kind in ("speaker_change", "switch_deferred", "punctuation_deferred",
-                                         "audio_end", "annotation_end")}
+                                         "audio_end", "annotation_end", "silence_only")}
     for event in events:
         if not isinstance(event, dict):
             raise ValueError("Invalid recast.events entry")
@@ -57,7 +57,11 @@ def _check_recast(meta, path, turns):
             raise ValueError("annotation_end requires integer frame counts with 0 < supervised_frames <= source_frames")
     elif by_kind["audio_end"] != {turns}:
         raise ValueError("recast.events must contain exactly one audio_end on the last audio turn")
-    return open_end, by_kind["speaker_change"]
+    silence_only = bool(by_kind["silence_only"])
+    if silence_only and (by_kind["silence_only"] != {1} or len(events) != 2 or events[-1]["kind"] != "audio_end"
+                         or meta["merged_units"] != 0):
+        raise ValueError("silence_only requires a first-turn marker, zero merges and only the final audio_end")
+    return open_end, by_kind["speaker_change"], silence_only
 
 
 def validate_row(row, token_inventory=None, decode=False):
@@ -70,9 +74,9 @@ def validate_row(row, token_inventory=None, decode=False):
     source_path = decode_chunk_ref(refs[0])["path"]
     if not (PurePosixPath(source_path).is_absolute() or PureWindowsPath(source_path).is_absolute()):
         raise ValueError("Source audio path must be absolute on the training host")
-    open_end, expected_switches = False, None
+    open_end, expected_switches, silence_only = False, None, False
     if "recast" in row:
-        open_end, expected_switches = _check_recast(row["recast"], source_path, len(refs))
+        open_end, expected_switches, silence_only = _check_recast(row["recast"], source_path, len(refs))
     expected_pairs = len(refs) if open_end else len(refs) + 1
     if not isinstance(messages, list) or len(messages) != 1 + 2 * expected_pairs:
         raise ValueError("Expected one message pair per audio and an EOS pair only for closed recordings")
@@ -103,6 +107,8 @@ def validate_row(row, token_inventory=None, decode=False):
                 raise ValueError("Expected one live audio placeholder")
             reply = _content(messages[2 + 2*i], "assistant")
             text = profile.parse_reply(reply)
+            if silence_only and reply != WAIT:
+                raise ValueError("silence_only recordings require standalone WAIT on every audio turn")
             if open_end and i == len(refs) - 1 and not (text and reply.startswith(DIRECT)):
                 raise ValueError("annotation_end must end with a DIRECT containing transcript text")
             if text:
@@ -123,7 +129,7 @@ def validate_row(row, token_inventory=None, decode=False):
                         raise ValueError("Unexpected decoded audio format or frame count")
         except (ValueError, OSError, RuntimeError) as exc:
             raise ValueError(f"audio turn {i+1}: {exc}") from exc
-    if not has_text:
+    if not has_text and not silence_only:
         raise ValueError("Recording contains no transcribed speech")
     if expected_switches is not None and expected_switches != set(switch_turns):
         raise ValueError("recast speaker_change events differ from the assistant replies")

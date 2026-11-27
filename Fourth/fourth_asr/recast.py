@@ -63,16 +63,18 @@ def _punctuation_cut(units, cursor, ready, protected, chunk_ms):
 
 def build_sft_row(units: list[Unit], path: Path, frames: int, rate: int,
                   chunk_ms: int, number_format: str, *, protocol: FourthProtocol, audit=None,
-                  release_completed=False, open_end=False) -> dict:
+                  release_completed=False, open_end=False, silence_only=False) -> dict:
     validate_chunk_ms(chunk_ms)
-    if not units or frames <= 0 or rate <= 0:
+    if silence_only and (units or open_end):
+        raise ValueError("A silence-only sample must be a whole recording without transcript units")
+    if (not units and not silence_only) or frames <= 0 or rate <= 0:
         raise ValueError("A record needs positive-duration audio and aligned text")
     if chunk_ms * rate < 1000:
         raise ValueError("The selected chunk size contains less than one source sample")
     ends = [end_frame(unit.end_ms, frames, rate) for unit in units]
     if any(end > frames for end in ends):
         raise ValueError("Unit ends must fit the audio")
-    defer = protocol.name == "speaker" and not release_completed
+    defer = protocol.name == "speaker" and not (release_completed or silence_only)
     cuts = _switch_cuts(units, ends, frames, rate, chunk_ms) if defer else {}
     if audit is not None:
         audit.update(switch_deferred_turns=[], punctuation_deferred_turns=[])
@@ -117,4 +119,9 @@ def build_sft_row(units: list[Unit], path: Path, frames: int, rate: int,
         raise ValueError("Audio ended with uncommitted transcript units")
     if not open_end:
         messages.extend([{"role": "user", "content": EOS}, {"role": "assistant", "content": WAIT}])
-    return {"audios": refs, "messages": messages}
+    row = {"audios": refs, "messages": messages}
+    if silence_only:
+        # Use the same Arrow event schema as speech rows. This flag is never part of the prompt.
+        row["recast"] = {"source_audio": str(path), "chunk_ms": chunk_ms, "merged_units": 0,
+                         "events": [{"turn": 1, "kind": "silence_only"}, {"turn": len(refs), "kind": "audio_end"}]}
+    return row
