@@ -51,6 +51,34 @@ def test_open_and_closed_in_same_training_file(source, capsys):
     assert validate_row(closed) == {DIRECT, SPK_CHANGE, WAIT}
 
 
+def test_preflight_uses_source_header_and_unpadded_last_ref_for_missing_pair(source):
+    row = row_for(source, True)
+    for key in ("source_frames", "supervised_frames"):
+        del row["recast"][key]
+    dataset = source.with_suffix(".jsonl")
+    original = json.dumps(row).encode() + b"\n"
+    dataset.write_bytes(original)
+    Path(str(dataset) + ".tokens.txt").write_text("\n".join(get_protocol("speaker").tokens), encoding="utf-8")
+    assert main([str(dataset), "--rows", "2"]) == 0
+    assert main([str(dataset), "--decode"]) == 0
+    assert dataset.read_bytes() == original
+    # The offline text filter has no access to WAVs and keeps its strict metadata check.
+    with pytest.raises(ValueError, match="integer frame counts"):
+        validate_row(row)
+    row["recast"]["source_frames"] = 33075
+    with pytest.raises(ValueError, match="integer frame counts"):
+        validate_row(row, allow_header_lookup=True)
+
+
+@pytest.mark.parametrize("end,match", [(1.6, "integer frame counts"), (1.20001, "does not end at")])
+def test_missing_pair_cannot_hide_invalid_crop(source, end, match):
+    row = row_for(source, True)
+    del row["recast"]["source_frames"], row["recast"]["supervised_frames"]
+    row["audios"][-1] = encode_chunk_ref(str(source), 1, end, 1)
+    with pytest.raises(ValueError, match=match):
+        validate_row(row, allow_header_lookup=True)
+
+
 @pytest.mark.parametrize("field,value", [
     ("supervised_frames", 0), ("supervised_frames", 33076),
     ("supervised_frames", True), ("source_frames", None), ("source_frames", 33075.0),

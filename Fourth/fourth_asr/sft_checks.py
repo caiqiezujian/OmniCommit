@@ -51,10 +51,6 @@ def _check_recast(meta, path, turns):
     if open_end:
         if by_kind["audio_end"] or by_kind["annotation_end"] != {turns} or events[-1]["kind"] != "annotation_end":
             raise ValueError("annotation_end must be the sole end event and occur last on the final audio turn")
-        source_frames, supervised_frames = meta.get("source_frames"), meta.get("supervised_frames")
-        if (type(source_frames) is not int or type(supervised_frames) is not int
-                or not 0 < supervised_frames <= source_frames):
-            raise ValueError("annotation_end requires integer frame counts with 0 < supervised_frames <= source_frames")
     elif by_kind["audio_end"] != {turns}:
         raise ValueError("recast.events must contain exactly one audio_end on the last audio turn")
     silence_only = bool(by_kind["silence_only"])
@@ -64,7 +60,28 @@ def _check_recast(meta, path, turns):
     return open_end, by_kind["speaker_change"], silence_only
 
 
-def validate_row(row, token_inventory=None, decode=False):
+def _check_annotation_frames(meta, path, end_seconds, *, decode, allow_header_lookup):
+    missing_pair = "source_frames" not in meta and "supervised_frames" not in meta
+    source_frames = meta.get("source_frames")
+    supervised_frames = meta.get("supervised_frames")
+    if decode or (missing_pair and allow_header_lookup):
+        import soundfile as sf
+        info = sf.info(path)
+        end_frame = end_seconds * info.samplerate
+        if missing_pair:
+            # Some datasets kept the real crop boundaries but omitted both audit fields.
+            source_frames, supervised_frames = info.frames, round(end_frame)
+        if type(source_frames) is int and source_frames != info.frames:
+            raise ValueError("annotation_end source_frames differ from the original audio header")
+        if type(supervised_frames) is int and abs(end_frame - supervised_frames) > 1e-5:
+            raise ValueError("Last audio reference does not end at supervised_frames of the original audio")
+    if (type(source_frames) is not int or type(supervised_frames) is not int
+            or not 0 < supervised_frames <= source_frames):
+        raise ValueError(f"annotation_end requires integer frame counts with 0 < supervised_frames <= source_frames "
+                         f"(supervised_frames={supervised_frames!r}, source_frames={source_frames!r})")
+
+
+def validate_row(row, token_inventory=None, decode=False, *, allow_header_lookup=False):
     """Validate one recording from fresh state and return the special tokens it uses."""
     if not isinstance(row, dict) or not {"audios", "messages"} <= row.keys() <= {"audios", "messages", "recast"}:
         raise ValueError("Expected a Fourth row with audios and messages and optional recast metadata")
@@ -93,7 +110,6 @@ def validate_row(row, token_inventory=None, decode=False):
         raise ValueError("Expected final text-only end_of_audio followed by standalone WAIT")
     if decode:
         import soundfile as sf
-        source_info = sf.info(source_path)
     tokens = set() if open_end else {WAIT}
     has_text, previous_end = False, 0
     switch_turns = []
@@ -132,14 +148,12 @@ def validate_row(row, token_inventory=None, decode=False):
         raise ValueError(f"audio turn {len(refs)}: annotation_end must end with a DIRECT containing transcript text")
     if expected_switches is not None and expected_switches != set(switch_turns):
         raise ValueError("recast speaker_change events differ from the assistant replies")
-    if decode:
-        if open_end:
-            meta = row["recast"]
-            if meta["source_frames"] != source_info.frames:
-                raise ValueError("annotation_end source_frames differ from the original audio header")
-            if abs(previous_end * source_info.samplerate - meta["supervised_frames"]) > 1e-5:
-                raise ValueError("Last audio reference does not end at supervised_frames of the original audio")
-        elif round(previous_end * source_info.samplerate) != source_info.frames:
+    if open_end:
+        _check_annotation_frames(row["recast"], source_path, previous_end, decode=decode,
+                                 allow_header_lookup=allow_header_lookup)
+    elif decode:
+        source_info = sf.info(source_path)
+        if round(previous_end * source_info.samplerate) != source_info.frames:
             raise ValueError("Final audio interval ends before or beyond the source recording end")
     if token_inventory is not None and not tokens.issubset(token_inventory):
         raise ValueError(f"Tokens missing from training token file: {sorted(tokens - set(token_inventory))}")
@@ -168,7 +182,7 @@ def main(argv=None):
                     full_dataset = False
                     break
                 try:
-                    validate_row(json.loads(line), tokens, args.decode)
+                    validate_row(json.loads(line), tokens, args.decode, allow_header_lookup=True)
                 except Exception as exc:
                     raise ValueError(f"line {line_no}: {exc}") from exc
                 count += 1

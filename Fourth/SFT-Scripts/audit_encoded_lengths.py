@@ -170,7 +170,7 @@ def main(argv=None):
             count += 1
             try:
                 row = json.loads(line)
-                sft_checks.validate_row(row, decode=False, token_inventory=inventory)
+                sft_checks.validate_row(row, decode=False, token_inventory=inventory, allow_header_lookup=True)
                 encoded = template.encode({"messages": deepcopy(row["messages"]), "audios": list(row["audios"])},
                                           return_length=args.check_packing)
                 metrics = audit_encoded(encoded, args.max_length)
