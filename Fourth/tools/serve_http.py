@@ -8,6 +8,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fourth_asr.http_logging import DEFAULT_REQUEST_LOG, open_request_log
+from fourth_asr.packet_punctuation import DEFAULT_PACKET_PERIOD_THRESHOLD_MS
 from fourth_asr.runtime.stream_cli import add_runtime_arguments, runtime_options
 from fourth_asr.service_backend import build_backend, detect_model_protocol
 from fourth_asr.service_session import FourthStreamOptions
@@ -32,7 +33,10 @@ def main(argv=None):
                         help="Run the optional second decode on voiced WAITs of explicit checkpoints")
     parser.add_argument("--packet-period-to-comma", action=argparse.BooleanOptionalAction, default=False,
                         help="Replace a packet-final sentence period with a comma when the caller reports "
-                             "less than 300 ms of packet silence (default: off)")
+                             "packet silence below the configured threshold (default: off)")
+    parser.add_argument("--packet-period-threshold-ms", type=float, default=DEFAULT_PACKET_PERIOD_THRESHOLD_MS,
+                        help="Strict upper bound on packet silence for replacing the final period, "
+                             "in milliseconds (default: %(default)s)")
     parser.add_argument("--max-meetings", type=int, default=16,
                         help="Number of meeting histories kept concurrently")
     parser.add_argument("--max-in-flight", type=int, default=8,
@@ -60,8 +64,10 @@ def main(argv=None):
         value = getattr(args, name)
         if not math.isfinite(value) or value <= 0:
             parser.error("--" + name.replace("_", "-") + " must be positive and finite")
-    if not math.isfinite(args.batch_wait_ms) or args.batch_wait_ms < 0:
-        parser.error("--batch-wait-ms must be nonnegative and finite")
+    for name in ("batch_wait_ms", "packet_period_threshold_ms"):
+        value = getattr(args, name)
+        if not math.isfinite(value) or value < 0:
+            parser.error("--" + name.replace("_", "-") + " must be nonnegative and finite")
     try:
         args.chunk_seconds = args.chunk_ms / 1000
         args.max_window_seconds = args.window_seconds
@@ -95,6 +101,7 @@ def main(argv=None):
                   file=sys.stderr, flush=True)
         app = create_app(load_model, options, max_meetings=args.max_meetings, max_in_flight=args.max_in_flight,
                          packet_period_to_comma=args.packet_period_to_comma,
+                         packet_period_threshold_ms=args.packet_period_threshold_ms,
                          idle_timeout_seconds=args.idle_timeout_seconds,
                          max_packet_seconds=args.max_packet_seconds, upload_timeout_seconds=args.upload_timeout_seconds,
                          debug_dir=args.debug_dir, debug_model=str(args.model) if args.model is not None else None)

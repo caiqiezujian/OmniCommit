@@ -149,6 +149,28 @@ def test_json_field_controls_units_at_the_300_ms_boundary(measurement, expected_
         assert result["silence_ms"] == pytest.approx(expected_ms)
 
 
+@pytest.mark.parametrize("threshold_ms,measurement,expected", [
+    (500, {"tail_silence": 0.499}, "收到，"),
+    (500, {"tail_silence": 0.500}, "收到。"),
+    (500, {"tail_silence": 0.501}, "收到。"),
+    (125.5, {"silence_ms": 125.5}, "收到。"),
+    (125.5, {"trailing_silence_ms": 125}, "收到，"),
+    (1001, {"tail_silence": 1.001}, "收到。"),
+    (0, {"tail_silence": 0}, "收到。"),
+])
+def test_configured_threshold_applies_to_packet_even_when_it_ends_in_wait(threshold_ms, measurement, expected):
+    model = Capture([DIRECT + "收到。", WAIT])
+    with client_for(model, packet_period_to_comma=True, packet_period_threshold_ms=threshold_ms) as client:
+        assert client.get("/health").json()["packet_period_threshold_ms"] == threshold_ms
+        assert_src(client.post(MEETING + "/chunks", json=packet(2 * SAMPLE_RATE, **measurement)), expected)
+
+
+@pytest.mark.parametrize("invalid", [-1, float("inf"), float("nan")])
+def test_invalid_configured_threshold_is_rejected_at_startup(invalid):
+    with pytest.raises(ValueError, match="packet_period_threshold_ms"):
+        client_for(Capture([]), packet_period_threshold_ms=invalid)
+
+
 def test_legacy_measurements_follow_model_endpoints_across_packet_splits_and_flush():
     model = Capture([DIRECT + "One.", DIRECT + " Two.", DIRECT + " Three.", DIRECT + " Four.", WAIT])
     with client_for(model, packet_period_to_comma=True) as client:

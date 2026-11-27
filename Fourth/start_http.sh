@@ -10,6 +10,9 @@ if (( $# == 0 )); then
     false) ;;
     *) echo 'PACKET_PERIOD_TO_COMMA must be true or false' >&2; exit 2 ;;
   esac
+  if [[ -v PACKET_PERIOD_THRESHOLD_MS ]]; then
+    HTTP_ARGS+=(--packet-period-threshold-ms "$PACKET_PERIOD_THRESHOLD_MS")
+  fi
   exec "${PYTHON:-python3}" tools/serve_http.py --model "$ASR_MODEL" "${HTTP_ARGS[@]}"
 fi
 model="$1"

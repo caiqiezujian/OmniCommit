@@ -7,6 +7,7 @@ from .protocol import SPK_CHANGE
 from .semantic_preparation import TRAILING
 
 
+DEFAULT_PACKET_PERIOD_THRESHOLD_MS = 300
 PERIODS = ".。．۔"
 CLOSERS = TRAILING + "〉》〕〗〙〛"
 CLAUSE_BOUNDARIES = frozenset(".。．۔!?！？؟;；:：,，、،\n")

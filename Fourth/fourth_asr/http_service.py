@@ -5,6 +5,7 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field
+from decimal import Decimal
 import hashlib
 import io
 import json
@@ -27,6 +28,7 @@ from starlette.requests import ClientDisconnect
 from .debug_backend import DebugBackend
 from .http_debug import DebugArchive
 from .http_logging import request_event
+from .packet_punctuation import DEFAULT_PACKET_PERIOD_THRESHOLD_MS
 from .runtime.streaming import SAMPLE_RATE
 from .service_session import FourthStreamSession
 
@@ -71,7 +73,10 @@ def decode_json_audio(body, sample_limit):
     scale_to_ms = 1000 if key == "tail_silence" else 1
     if type(value) not in (int, float) or not 0 <= value <= sys.float_info.max / scale_to_ms:
         raise HTTPException(400, f"{key} must be a nonnegative number representable in finite milliseconds")
-    return samples, value * scale_to_ms
+    if key == "tail_silence":
+        # Decimal scaling keeps a caller's 1.001 seconds exactly at the 1001 ms boundary.
+        value = float(Decimal(str(value)) * scale_to_ms)
+    return samples, value
 
 
 async def read_packet_body(request, sample_limit):
@@ -174,6 +179,7 @@ class Meeting:
     received_samples: int = 0
     tail_silence_ms: Optional[float] = None
     packet_period_to_comma: bool = False
+    packet_period_threshold_ms: float = DEFAULT_PACKET_PERIOD_THRESHOLD_MS
 
     def step(self, trace, audio=None, *, final_chunk=False, end_of_audio=False):
         session = self.session
@@ -215,7 +221,8 @@ class Meeting:
         offset = 0
         turns = []
         last_direct = None
-        correct_period = self.packet_period_to_comma and silence_ms is not None and silence_ms < 300
+        correct_period = (self.packet_period_to_comma and silence_ms is not None
+                          and silence_ms < self.packet_period_threshold_ms)
         try:
             while len(audio) - offset >= step_samples or (ending and offset < len(audio)):
                 stop = min(len(audio), offset + step_samples)
@@ -235,7 +242,7 @@ class Meeting:
                 target, previous_text = last_direct
                 if self.session.apply_packet_comma(target, previous_text):
                     trace.debug("packet_period_to_comma", turn=target["turn"], silence_ms=silence_ms,
-                                text=target["text"])
+                                threshold_ms=self.packet_period_threshold_ms, text=target["text"])
             if ending:
                 turns.append(self.step(trace, end_of_audio=True))
             status = "ended" if ending else ("ok" if turns else "buffered")
@@ -273,7 +280,7 @@ class Meeting:
 def create_app(backend_factory, options, *, max_meetings=16, max_in_flight=8,
                idle_timeout_seconds=600, max_packet_seconds=8.0,
                upload_timeout_seconds=10, debug_dir=None, debug_model=None,
-               packet_period_to_comma=False):
+               packet_period_to_comma=False, packet_period_threshold_ms=DEFAULT_PACKET_PERIOD_THRESHOLD_MS):
     """backend_factory creates one thread-safe inference adapter, shared by all meeting workers."""
     for name, value in (("max_meetings", max_meetings), ("max_in_flight", max_in_flight)):
         if type(value) is not int or value < 1:
@@ -282,6 +289,9 @@ def create_app(backend_factory, options, *, max_meetings=16, max_in_flight=8,
                         ("max_packet_seconds", max_packet_seconds), ("upload_timeout_seconds", upload_timeout_seconds)):
         if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
             raise ValueError(f"{name} must be positive and finite")
+    if (type(packet_period_threshold_ms) not in (int, float)
+            or not math.isfinite(packet_period_threshold_ms) or packet_period_threshold_ms < 0):
+        raise ValueError("packet_period_threshold_ms must be nonnegative and finite")
     sample_limit = int(max_packet_seconds * SAMPLE_RATE)
     if sample_limit < 1:
         raise ValueError("max_packet_seconds must allow at least one PCM sample")
@@ -349,6 +359,7 @@ def create_app(backend_factory, options, *, max_meetings=16, max_in_flight=8,
     async def health():
         return {"ready": backend is not None, "service": "fourth_http",
                 "packet_period_to_comma": packet_period_to_comma,
+                "packet_period_threshold_ms": packet_period_threshold_ms,
                 "backend": getattr(backend, "backend_name", type(backend).__name__),
                 "max_new_tokens": getattr(backend, "max_new_tokens", None),
                 "max_context_tokens": getattr(backend, "max_context_tokens", None),
@@ -459,7 +470,8 @@ def create_app(backend_factory, options, *, max_meetings=16, max_in_flight=8,
             meeting = active.get(key)
             if meeting is None:
                 meeting = active[key] = Meeting(key, FourthStreamSession(backend, options), time.monotonic(),
-                                                session_id=trace.request_id, packet_period_to_comma=packet_period_to_comma)
+                                                session_id=trace.request_id, packet_period_to_comma=packet_period_to_comma,
+                                                packet_period_threshold_ms=packet_period_threshold_ms)
                 trace.session_id = meeting.session_id
                 if archive is not None:
                     trace.debug("session_started", model=debug_model, options=asdict(options),
@@ -498,11 +510,12 @@ def create_app(backend_factory, options, *, max_meetings=16, max_in_flight=8,
                                    "description": "Standard base64 of normalized mono float32 LE samples"},
                           "tail_silence": {"type": "number", "minimum": 0,
                                   "description": "Caller-reported silence duration for this packet in seconds. "
-                                                 "When enabled, strictly below 0.3 s permits one final period-to-comma edit. "
+                                                 "When enabled, values strictly below the configured threshold permit "
+                                                 "one final period-to-comma edit. "
                                                  "Send only one silence field per packet."},
                           "silence_ms": {"type": "number", "minimum": 0,
                                   "description": "Total silence in this audio packet (milliseconds). Optional. "
-                                                 "When enabled, below 300 permits one final period-to-comma edit."},
+                                                 "Uses the same strict threshold as tail_silence."},
                           "trailing_silence_ms": {"type": "number", "minimum": 0,
                                   "description": "Legacy measurement field accepted in place of silence_ms."}}}},
                       **{media: {"schema": {"type": "string", "format": "binary"}}

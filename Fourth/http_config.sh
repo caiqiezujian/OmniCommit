@@ -2,9 +2,10 @@
 CUDA_VISIBLE_DEVICES=6
 ASR_MODEL='/data/yb/Code/OmniCommit/output/fourth-merged-1s-v2/v0-20261121-063241/sft-checkpoint-2721'
 
-# Set true to replace a packet-final sentence period with a comma when the
-# caller reports less than 300 ms of silence for the packet. Audio alone is unchanged.
+# With the switch enabled, a packet-final period becomes a comma when the
+# caller's silence measurement is strictly below this threshold (milliseconds).
 PACKET_PERIOD_TO_COMMA=false
+PACKET_PERIOD_THRESHOLD_MS=300
 
 # Relative paths in this configuration start in Fourth/.
 HTTP_ARGS=(
