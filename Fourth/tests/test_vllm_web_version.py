@@ -15,6 +15,8 @@ def test_engine_accepts_the_web_release_and_cuda_build(tmp_path, monkeypatch, ve
     monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(__version__=version, LLM=object, SamplingParams=object))
     monkeypatch.setitem(sys.modules, "vllm.inputs", SimpleNamespace(TokensPrompt=dict))
     monkeypatch.setitem(sys.modules, "vllm.inputs.preprocess", SimpleNamespace(InputPreprocessor=object))
+    monkeypatch.setitem(sys.modules, "vllm.sampling_params", SimpleNamespace(RequestOutputKind=SimpleNamespace(FINAL_ONLY=2)))
+    monkeypatch.setitem(sys.modules, "vllm.v1.engine.exceptions", SimpleNamespace(EngineDeadError=RuntimeError))
     monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(AutoTokenizer=object))
     with pytest.raises(FileNotFoundError, match="omnicommit_tokens.json"):
         VLLMBackend(tmp_path)

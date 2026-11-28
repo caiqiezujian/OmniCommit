@@ -36,7 +36,8 @@ def test_http_launcher_uses_trained_protocol_and_sizes_model_for_batching(
     ids = {token: i for i, token in enumerate(tokens, start=80)}
     manifest = {**metadata, "tokens": tokens, "token_ids": ids, "tokenizer_length": 80 + len(tokens)}
     (tmp_path / "omnicommit_tokens.json").write_text(json.dumps(manifest), encoding="utf-8")
-    engine = Mock(return_value=SimpleNamespace(generate_batch=lambda calls: [], max_batch_size=6))
+    engine = Mock(return_value=SimpleNamespace(llm=SimpleNamespace(llm_engine=Mock()),
+                                               generate_batch=lambda calls: [], max_batch_size=6))
     monkeypatch.setattr(vllm_backend, "VLLMBackend", engine)
     monkeypatch.setattr(recovery, "check_recovery_dependencies", lambda: None)
     from fourth_asr.http_logging import request_event
@@ -55,7 +56,7 @@ def test_http_launcher_uses_trained_protocol_and_sizes_model_for_batching(
         assert limits["event_log_mode"] == ("detailed" if "--event-log-mode" in extra else "readable")
         adapter = factory()
         try:
-            assert adapter.max_batch_size == 6
+            assert adapter.scheduling_mode == "continuous" and adapter.max_batch_size == 6
         finally:
             adapter.close()
         return "app"

@@ -9,6 +9,7 @@ import time
 import numpy as np
 
 from ..protocol import EOS, WAIT
+from .audio_identity import snapshot_audio
 
 SAMPLE_RATE = 16000
 MAX_CHUNK_MS = 8000
@@ -244,8 +245,8 @@ class StreamSession:
         else:
             if self._short_tail:
                 raise ValueError("A partial final chunk must be followed by EOS")
-            pcm = np.array(audio, dtype=np.float32, copy=True)
-            if pcm.ndim != 1 or not len(pcm) or not np.isfinite(pcm).all():
+            pcm = snapshot_audio(audio)
+            if not len(pcm) or not np.isfinite(pcm).all():
                 raise ValueError("Audio must be finite, nonempty, mono float32 at 16000 Hz")
             if len(pcm) > round(self.options.chunk_seconds * SAMPLE_RATE):
                 raise ValueError("Audio exceeds configured chunk step")
@@ -258,7 +259,7 @@ class StreamSession:
             short_chunk = len(pcm) < round(self.options.chunk_seconds * SAMPLE_RATE)
             minimum = self._minimum_input_samples(final_chunk or short_chunk)
             if len(pcm) < minimum:
-                pcm = np.pad(pcm, (0, minimum - len(pcm)))
+                pcm = snapshot_audio(np.pad(pcm, (0, minimum - len(pcm))))
         started = time.perf_counter()
         try:
             if end_of_audio and not history:

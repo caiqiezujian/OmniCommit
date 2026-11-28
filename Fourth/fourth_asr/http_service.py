@@ -387,7 +387,8 @@ def create_app(backend_factory, options, *, max_meetings=16, max_in_flight=8,
 
     @app.get("/health")
     async def health():
-        return {"ready": backend is not None, "service": "fourth_http",
+        return {"ready": backend is not None and getattr(backend, "ready", True), "service": "fourth_http",
+                "scheduling_mode": getattr(backend, "scheduling_mode", "synchronous"),
                 "packet_period_to_comma": packet_period_to_comma,
                 "packet_period_threshold_ms": packet_period_threshold_ms,
                 "packet_period_remove_threshold_ms": packet_period_remove_threshold_ms,
@@ -423,6 +424,8 @@ def create_app(backend_factory, options, *, max_meetings=16, max_in_flight=8,
         key = trace.meeting_id
         if not key.strip() or len(key) > 256 or key in {".", ".."}:
             trace.reject(422, "Invalid meeting_id", "invalid_meeting_id")
+        if not getattr(backend, "ready", True):
+            trace.reject(503, "Model worker is unavailable", "model_unavailable")
         if key in terminal:
             closed = terminal[key]
             _, body = closed.outcome

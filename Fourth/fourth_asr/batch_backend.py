@@ -1,6 +1,7 @@
 """Synchronous Fourth session backend shared by concurrent HTTP request threads."""
 from collections import deque
 from concurrent.futures import Future
+import logging
 import math
 import threading
 import time
@@ -47,18 +48,26 @@ class BatchBackend:
             raise ValueError("An assistant prefix is required")
         return self._submit(messages, audios, prefix)
 
-    def _next_batch(self):
+    def _next_batch(self, running=0):
+        """Coalesce the first arrivals when idle. Refill free slots immediately during decoding."""
         with self._condition:
-            self._condition.wait_for(lambda: self._queue or self._closing)
-            if not self._queue:
-                return []
-            deadline = self._queue[0][0] + self.batch_wait_ms / 1000
-            while not self._closing and len(self._queue) < self.max_batch_size:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                self._condition.wait(remaining)
-            return [self._queue.popleft() for _ in range(min(self.max_batch_size, len(self._queue)))]
+            if not running:
+                self._condition.wait_for(lambda: self._queue or self._closing)
+                if not self._queue:
+                    return []
+                deadline = self._queue[0][0] + self.batch_wait_ms / 1000
+                while not self._closing and len(self._queue) < self.max_batch_size:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    self._condition.wait(remaining)
+            count = min(self.max_batch_size - running, len(self._queue))
+            return [self._queue.popleft() for _ in range(count)]
+
+    def _record_batch(self, size):
+        with self._condition:
+            self._batch_count += 1
+            self._largest_batch = max(self._largest_batch, size)
 
     def _run(self, factory, ready):
         try:
@@ -81,33 +90,9 @@ class BatchBackend:
             return
         ready.set_result(None)
         try:
-            while batch := self._next_batch():
-                try:
-                    if batch_fn is not None:
-                        replies = batch_fn([call for _, call, _ in batch])
-                        executed = getattr(backend, "last_batch_size", len(batch))
-                    else:
-                        _, (messages, audios, prefix), _ = batch[0]
-                        reply = (backend.generate_with_prefix(messages, audios, prefix) if prefix
-                                 else backend.generate(messages, audios))
-                        replies, executed = [reply], 1
-                    if len(replies) != len(batch):
-                        raise RuntimeError("Backend returned the wrong number of meeting replies")
-                    if executed:
-                        with self._condition:
-                            self._batch_count += 1
-                            self._largest_batch = max(self._largest_batch, executed)
-                except BaseException as exc:
-                    for _, _, future in batch:
-                        future.set_exception(exc)
-                    if not isinstance(exc, Exception):
-                        raise
-                    continue
-                for reply, (_, _, future) in zip(replies, batch):
-                    if isinstance(reply, Exception):
-                        future.set_exception(reply)
-                    else:
-                        future.set_result(reply)
+            self._serve(backend)
+        except Exception:
+            logging.getLogger(__name__).exception("Fourth model worker stopped")
         finally:
             with self._condition:
                 self._closing = True
@@ -117,8 +102,41 @@ class BatchBackend:
             if hasattr(backend, "close"):
                 backend.close()
 
+    def _serve(self, backend):
+        batch_fn = getattr(backend, "generate_batch", None)
+        while batch := self._next_batch():
+            try:
+                if batch_fn is not None:
+                    replies = batch_fn([call for _, call, _ in batch])
+                    executed = getattr(backend, "last_batch_size", len(batch))
+                else:
+                    _, (messages, audios, prefix), _ = batch[0]
+                    reply = (backend.generate_with_prefix(messages, audios, prefix) if prefix
+                             else backend.generate(messages, audios))
+                    replies, executed = [reply], 1
+                if len(replies) != len(batch):
+                    raise RuntimeError("Backend returned the wrong number of meeting replies")
+                if executed:
+                    self._record_batch(executed)
+            except BaseException as exc:
+                for _, _, future in batch:
+                    future.set_exception(exc)
+                if not isinstance(exc, Exception):
+                    raise
+                continue
+            for reply, (_, _, future) in zip(replies, batch):
+                if isinstance(reply, Exception):
+                    future.set_exception(reply)
+                else:
+                    future.set_result(reply)
+
+    @property
+    def ready(self):
+        with self._condition:
+            return not self._closing
+
     def stats(self):
-        """Host-side generate calls; vLLM schedules its GPU sequences internally."""
+        """Host-side batch/admission counters. GPU iteration counts are tracked by vLLM."""
         with self._condition:
             return {"model_batches": self._batch_count, "largest_batch": self._largest_batch,
                     "queued_decodes": len(self._queue)}

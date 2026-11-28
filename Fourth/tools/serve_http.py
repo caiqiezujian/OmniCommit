@@ -47,9 +47,9 @@ def main(argv=None):
     parser.add_argument("--max-in-flight", type=int, default=8,
                         help="Maximum number of simultaneous meeting operations accepted")
     parser.add_argument("--batch-size", dest="max_batch_size", type=int, default=4,
-                        help="Maximum number of different meetings in a single vLLM generate call")
+                        help="Maximum number of meeting decodes active in vLLM at once")
     parser.add_argument("--batch-wait-ms", type=float, default=2.0,
-                        help="Maximum time to wait for a batch to fill after its first job arrives")
+                        help="Maximum time an idle worker waits to group the first arrivals")
     # Accept existing deployment commands; POST now waits for the transcription.
     parser.add_argument("--response-timeout-ms", type=float, help=argparse.SUPPRESS)
     parser.add_argument("--upload-timeout-seconds", type=float, default=10,
@@ -92,12 +92,14 @@ def main(argv=None):
         parser.error(str(exc))
 
     from fourth_asr.batch_backend import BatchBackend
+    from fourth_asr.http_vllm import HttpVLLMWorker
     from fourth_asr.http_service import create_app
     import uvicorn
 
     def load_model():
-        return BatchBackend(lambda: build_backend(args), max_batch_size=args.max_batch_size,
-                            batch_wait_ms=args.batch_wait_ms)
+        worker = HttpVLLMWorker if args.backend == "vllm" else BatchBackend
+        return worker(lambda: build_backend(args), max_batch_size=args.max_batch_size,
+                      batch_wait_ms=args.batch_wait_ms)
 
     # Meeting histories and one copy of the GPU engine live in this process.
     with open_request_log(args.request_log):

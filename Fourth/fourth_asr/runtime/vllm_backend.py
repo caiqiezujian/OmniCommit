@@ -5,15 +5,13 @@ prefixes are reusable; stable audio content IDs allow processor-cache hits.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 from pathlib import Path
 import sys
 
-import numpy as np
-
 from . import DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_NEW_TOKENS
+from .audio_identity import audio_uuid
 from .audio_token_counter import AudioTokenCounter, is_supported_vllm_version
 from .inference_backend import AssistantPrefixDecoder, multimodal_messages
 from ..service_backend import validate_manifest
@@ -39,6 +37,8 @@ class VLLMBackend(AssistantPrefixDecoder):
         from vllm import LLM, SamplingParams
         from vllm.inputs import TokensPrompt
         from vllm.inputs.preprocess import InputPreprocessor
+        from vllm.sampling_params import RequestOutputKind
+        from vllm.v1.engine.exceptions import EngineDeadError
         from transformers import AutoTokenizer
         if max_new_tokens <= 0 or max_context_tokens <= max_new_tokens:
             raise ValueError("Invalid context/generation budgets")
@@ -49,6 +49,7 @@ class VLLMBackend(AssistantPrefixDecoder):
         self.tokenizer = AutoTokenizer.from_pretrained(str(path), local_files_only=True)
         self.allowed_tokens = manifest_validator(self.tokenizer, manifest)
         self.TokensPrompt = TokensPrompt
+        self.engine_dead_error = EngineDeadError
         self.max_context_tokens = max_context_tokens
         self.max_new_tokens = max_new_tokens
         self.max_audio_turns = max_audio_turns
@@ -84,7 +85,8 @@ class VLLMBackend(AssistantPrefixDecoder):
             vllm_version=vllm.__version__, max_entries=64)
         self.sampling = SamplingParams(temperature=0.0, top_p=1.0, top_k=-1,
             max_tokens=max_new_tokens, stop_token_ids=self.stop_ids+[self.wait_id],
-            skip_special_tokens=False, include_stop_str_in_output=True)
+            skip_special_tokens=False, include_stop_str_in_output=True,
+            output_kind=RequestOutputKind.FINAL_ONLY)
 
     def _encode(self, text):
         return self.tokenizer.encode(text, add_special_tokens=False)
@@ -113,8 +115,7 @@ class VLLMBackend(AssistantPrefixDecoder):
         expected = len(ids)+extra
         if expected+self.max_new_tokens>self.max_context_tokens:
             raise ContextBudgetError("Expanded prompt plus generation reserve exceeds context budget")
-        uuids = ["omnicommit-16k-"+hashlib.sha256(np.asarray(a,dtype="<f4").tobytes()).hexdigest()
-                 for a in audios]
+        uuids = [audio_uuid(audio) for audio in audios]
         request = self.TokensPrompt(prompt_token_ids=ids, multi_modal_data={"audio":audios},
                                    multi_modal_uuids={"audio":uuids})
         return request, expected
@@ -151,6 +152,19 @@ class VLLMBackend(AssistantPrefixDecoder):
         output, = self._run_requests([request])
         return self._decode_reply(output, expected)
 
+    def prepare_decode(self, messages, audios, prefix):
+        """Build one vLLM prompt and its matching final-output decoder."""
+        if prefix and (prefix != "<|DIRECT|>" or prefix not in self.allowed_tokens):
+            raise ValueError("Forced decoding requires a trained DIRECT token")
+        request, expected = self._prepare_request(messages, audios, prefix)
+
+        def decode(output):
+            reply = self._decode_reply(output, expected)
+            reply["text"] = prefix + reply["text"]
+            return reply
+
+        return request, decode
+
     def generate_batch(self, calls):
         """One offline vLLM generate call for independent Fourth meetings.
 
@@ -163,22 +177,18 @@ class VLLMBackend(AssistantPrefixDecoder):
         self.last_batch_size = 0
         for index, (messages, audios, prefix) in enumerate(calls):
             try:
-                if prefix and (prefix != "<|DIRECT|>" or prefix not in self.allowed_tokens):
-                    raise ValueError("Forced decoding requires a trained DIRECT token")
-                request, expected = self._prepare_request(messages, audios, prefix)
+                request, decode = self.prepare_decode(messages, audios, prefix)
             except Exception as exc:
                 replies[index] = exc
                 continue
             requests.append(request)
-            pending.append((index, expected, prefix))
+            pending.append((index, decode))
         if requests:
             # vLLM 0.11.1 LLM.generate returns outputs in input prompt order.
             outputs = self._run_requests(requests)
-            for output, (index, expected, prefix) in zip(outputs, pending):
+            for output, (index, decode) in zip(outputs, pending):
                 try:
-                    decoded = self._decode_reply(output, expected)
-                    decoded["text"] = prefix + decoded["text"]
-                    replies[index] = decoded
+                    replies[index] = decode(output)
                 except Exception as exc:
                     replies[index] = exc
         return replies
